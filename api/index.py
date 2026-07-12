@@ -34,15 +34,23 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text.strip()  # 공백 제거
+    
+    # 👇 맨 앞에 '/'가 없으면 챗봇이 아무 반응도 하지 않고 종료하도록 예외 처리 추가!
+    if not user_message.startswith("/"):
+        return
+
+    # '/'를 제외한 실제 명령어만 추출 (예: "/확인" -> "확인")
+    command = user_message[1:].strip()
     reply_text = ""
 
-    # 1. 키워드별 고정 답변 분기 처리
-    if "닉변" in user_message:
-        reply_text = "닉넴 복붙하셔서 변경해주시고요\n프사는 도용사진이 아닌 본인사진 또는  아무사진이나 설정부탁드립니다\n \n\n그리고 헤르패스 확진판정 받으신적 있으실까요?"
-    elif "개인정보" in user_message:
-        reply_text = "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n읽고 확인해주세요
-   # 👇 여기에 이 코드를 새로 추가하거나 기존 '확인'을 수정해 주세요!
-    elif "확인" in user_message:
+    # 1. 키워드별 고정 답변 분기 처리 (기존 user_message 대신 command 변수를 사용합니다)
+    if "닉변" in command:
+        reply_text = "닉넴 복붙하셔서 변경해주시고요 \n 프사는 도용사진이 아닌 본인사진 또는 아무사진이나 설정부탁드립니다 \n \n \n 그리고 헤르패스 확진판정 받으신적 있으실까요?"
+        
+    elif "개인정보" in command:
+        reply_text = "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요 \n \n 방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다 \n \n 읽고 확인해주세요"
+        
+    elif "확인" in command:
         reply_text = (
             "네 확인했습니다.\n\n"
             "⚠️ 도용이거나 인증과정에서 거짓이 발견되면 경고 없이 킥 조치되오니 이 점 유의하여 주세요!\n\n"
@@ -51,12 +59,13 @@ def handle_message(event):
             "입장하시면 족보 먼저 작성 부탁드리고 공지사항도 꼭 숙지 부탁드립니다.\n\n"
             "인증방은 나가기 해주시면 본방 초대해 드리겠습니다."
         )
-    elif "안녕하세요" in user_message or "하이" in user_message:
-        reply_text = "안녕하세요! 👋 무엇을 도와드릴까요?\n아래 키워드를 입력하시면 안내를 도와드립니다.\n👉 [위치], [영업시간], [가격]"
+        
+    elif "안녕하세요" in command or "하이" in command:
+        reply_text = "안녕하세요! 👋 무엇을 도와드릴까요? \n 아래 키워드를 입력하시면 안내를 도와드립니다. \n 👉 [위치], [영업시간], [가격]"
         
     else:
-        # 2. 지정되지 않은 키워드가 입력되었을 때 기본 답변
-        reply_text = f"죄송합니다. '{user_message}'에 대한 답변을 찾지 못했습니다. 😢\n\n'위치', '영업시간', '가격' 등 필요한 키워드를 정확히 입력해주세요!"
+        # 2. 지정되지 않은 명령어가 입력되었을 때 기본 답변
+        reply_text = f"죄송합니다. '{command}'에 대한 답변을 찾지 못했습니다. 😢\n\n'위치', '영업시간', '가격' 등 필요한 키워드를 정확히 입력해주세요!"
 
     # 3. LINE 메시지 전송 실행
     with ApiClient(configuration) as api_client:
