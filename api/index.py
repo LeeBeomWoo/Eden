@@ -10,11 +10,17 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = Flask(__name__)
 
-# 환경변수 로드
-configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
-handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
+# 1. 여기에 웹 브라우저 접속용 기본 루트(/) 경로를 추가합니다!
+@app.route("/")
+def home():
+    return "Eden LINE Bot Server is Running!"
 
-@app.route("/api", methods=['POST'])
+# 환경변수 로드
+configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")) #
+handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET")) #
+
+# 기존 LINE 웹훅 주소 (이 경로는 라인 개발자 센터의 Webhook URL에 등록해야 합니다)
+@app.route("/api", methods=['POST']) #
 def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
