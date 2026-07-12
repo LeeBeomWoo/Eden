@@ -60,7 +60,7 @@ def handle_message(event):
             "인증방은 나가기 해주시면 본방 초대해 드리겠습니다."
         )
         
-    elif "안녕하세요" in command or "하이" in command:
+    elif "입장" in command:
         reply_text = "안녕하세요! 👋 무엇을 도와드릴까요? \n 아래 키워드를 입력하시면 안내를 도와드립니다. \n 👉 [위치], [영업시간], [가격]"
         
     else:
