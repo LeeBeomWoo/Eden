@@ -37,12 +37,10 @@ def handle_message(event):
     reply_text = ""
 
     # 1. 키워드별 고정 답변 분기 처리
-    if "위치" in user_message or "주소" in user_message:
-        reply_text = "📍 매장 위치 안내\n서울시 강남구 테헤란로 123 4층입니다.\n(주차 가능, 역삼역 2번 출구 도보 3분)"
-        
-    elif "시간" in user_message or "영업" in user_message:
-        reply_text = "🕒 영업시간 안내\n- 평일: 09:00 ~ 18:00\n- 주말 및 공휴일은 휴무입니다.\n(점심시간: 12:00 ~ 13:00)"
-        
+    if "위치" in user_message or "닉변" in user_message:
+        reply_text = "닉넴 복붙하셔서 변경해주시고요\n프사는 도용사진이 아닌 본인사진 또는  아무사진이나 설정부탁드립니다\n \n\n그리고 헤르패스 확진판정 받으신적 있으실까요?"
+    elif "시간" in user_message or "개인정보" in user_message:
+        reply_text = "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n읽고 확인해주세요
     elif "가격" in user_message or "비용" in user_message:
         reply_text = "💰 이용 금액 안내\n- 기본 플랜: 월 19,000원\n- 프로 플랜: 월 49,000원\n자세한 내용은 홈페이지를 참고해주세요!"
         
