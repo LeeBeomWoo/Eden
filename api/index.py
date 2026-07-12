@@ -12,10 +12,10 @@ def home():
 
 # 환경변수 로드
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
-handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET")) # 👈 주석 해제!
+handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
 
 @app.route("/api", methods=['POST'])
-def callback(): # 👈 주석 해제!
+def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     try:
