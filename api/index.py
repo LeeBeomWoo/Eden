@@ -58,6 +58,10 @@ def handle_message(event):
             "입장하시면 족보 먼저 작성 부탁드리고 공지사항도 꼭 숙지 부탁드립니다.\n\n"
             "인증방은 나가기 해주시면 본방 초대해 드리겠습니다."
         )
+        # handle_message(event) 내부 elif 명령어 분기에 추가
+    elif command in ["id", "내정보", "아이디"]:
+        user_id = event.source.user_id
+        reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
     elif "입장" in command:
         reply_text = (
             "안녕하세요\n"
