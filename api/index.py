@@ -38,7 +38,16 @@ def search_keyword(keyword):
             # 일치하면 B열(출력)의 데이터를 반환합니다.
             return row.get('출력')
     return None
-
+    
+def get_all_keywords():
+    try:
+        # A열(첫 번째 열)의 모든 값을 가져옵니다.
+        values = sheet.col_values(1)
+        # 첫 번째 줄(제목 '인증')을 제외하고 빈칸이 아닌 값들만 모읍니다.
+        keywords = [str(val).strip() for val in values[1:] if str(val).strip()]
+        return keywords
+    except Exception as e:
+        return []
 @app.route("/api", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature')
@@ -78,6 +87,15 @@ def handle_message(event):
         else:
             # 못 찾았을 때의 답변
             reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+    elif command == "목록":
+        keywords = get_all_keywords()
+        
+        if keywords:
+            # 가져온 목록을 줄바꿈(- 항목명) 형태로 깔끔하게 나열합니다.
+            list_text = "\n".join(f"- {k}" for k in keywords)
+            reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
+        else:
+            reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
     elif command in ["id", "내정보", "아이디"]:
         user_id = event.source.user_id
         reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
