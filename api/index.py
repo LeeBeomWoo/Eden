@@ -29,15 +29,23 @@ client = gspread.authorize(creds)
 sheet = client.open("인증멘트").worksheet("멘트")
 
 def search_keyword(keyword):
-    # 첫 번째 줄(A1, B1)을 제목으로 인식하여 데이터를 가져옵니다.
+    # 첫 번째 줄을 제목으로 인식하여 데이터를 가져옵니다.
     data = sheet.get_all_records()
     for row in data:
-        # A열(인증)에 검색어가 포함되어 있는지 확인합니다.
-        # 빈칸 에러 방지를 위해 str()과 .get()을 사용해 안전하게 가져옵니다.
-        if keyword in str(row.get('인증', '')):
-            # 일치하면 B열(출력)의 데이터를 반환합니다.
+        # A열(인증)에 적힌 텍스트를 가져옵니다.
+        cell_value = str(row.get('인증', '')).strip()
+        
+        # 콤마(,)를 기준으로 단어들을 쪼개고, 각 단어 앞뒤의 띄어쓰기(공백)를 깔끔하게 지워 리스트로 만듭니다.
+        # 예: "홍길동, 김철수 ,이영희" -> ['홍길동', '김철수', '이영희']
+        keywords_in_cell = [k.strip() for k in cell_value.split(',') if k.strip()]
+        
+        # 사용자가 입력한 검색어가 이 리스트 안에 정확히 존재하는지 확인합니다.
+        if keyword in keywords_in_cell:
+            # 존재한다면 B열(출력)의 데이터를 반환합니다.
             return row.get('출력')
+            
     return None
+
     
 def get_all_keywords():
     try:
