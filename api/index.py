@@ -65,14 +65,22 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
+# 파일 상단 핸들러 등록부 아래나, handle_message 함수 바로 위에 추가하세요.
+# 유저가 대기 안내를 받았는지 기억하는 상자입니다. (서버가 켜져있는 동안 유지)
+notified_users = {}
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
+    user_id = event.source.user_id  # 메시지를 보낸 유저의 고유 ID
     user_message = event.message.text.strip()
     reply_text = ""
 
     # 1. 신입 인증 양식 검사 로직 (제일 먼저 수행)
-    if "닉네임(두글자)" in user_message and "년생" in user_message and "군필여부" in user_message:
+    if "닉네임" in user_message and "년생" in user_message and "성별" in user_message:
+        # 양식을 새로 제출하면 대기 상태를 초기화하여 나중에 다시 "확인"했을 때 안내가 나가도록 합니다.
+        if user_id in notified_users:
+            del notified_users[user_id]
+            
         lines = user_message.split("\n")
         missing_fields = []
         
@@ -125,9 +133,16 @@ def handle_message(event):
         return
 
     # 1-2. 개인정보 규정 안내를 받고 사용자가 "확인" 대답을 했을 때 처리하는 로직
-    # (주의: 명령어 '/확인'과 구분하기 위해 '/'가 없을 때 작동하게 합니다)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인했어요", "넹", "네"]):
+        
+        # 💡 [핵심] 이미 대기 안내를 보낸 유저라면 봇이 대답하지 않고 무시(return)합니다.
+        if notified_users.get(user_id) is True:
+            return
+            
         reply_text = "인증자가 확인중이니 잠시 대기하여 주세요"
+        
+        # 안내를 발송했음을 기록(True)합니다.
+        notified_users[user_id] = True
         
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -136,6 +151,7 @@ def handle_message(event):
             )
         return
 
+    # 2. 기존의 '/'로 시작하는 명령어 처리 로직 (이하는 기존 코드 유지)
     # 2. 기존의 '/'로 시작하는 명령어 처리 로직
     if not user_message.startswith("/"):
         return
