@@ -228,11 +228,38 @@ def handle_message(event):
                 print(f"중복 필터링 시스템 에러: {filter_err}")
 
             # 📊 시트 구조 순서대로 행 삽입 (A~F열 순서 유지, 신입은 기본 블랙사유 빈칸)
+                        # 📊 [수정된 로직] 중복 판정 및 재시도 횟수 업데이트
             try:
-                row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, ""]
-                validation_sheet.append_row(row_to_insert)
+                # 1. 시트 전체 데이터 확인
+                all_data = validation_sheet.get_all_values() # 헤더 포함 전체 행
+                found_row_index = -1
+                current_retry_count = 0
+
+                # 2. 아이디(E열=5번째)가 일치하는 행 찾기
+                for idx, row in enumerate(all_data):
+                    if len(row) >= 5 and str(row[4]).strip() == str(user_id).strip():
+                        found_row_index = idx + 1 # 1부터 시작하는 행 번호
+                        # H열(8번째)의 기존 숫자 가져오기 (없으면 0)
+                        try:
+                            count_val = row[7] if len(row) >= 8 else "0"
+                            current_retry_count = int(count_val) if count_val.isdigit() else 0
+                        except:
+                            current_retry_count = 0
+                        break
+
+                if found_row_index != -1:
+                    # [재시도 시] 기존 행 덮어쓰기 + 횟수 +1 증가
+                    new_count = current_retry_count + 1
+                    update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
+                    # A열부터 H열까지 한 번에 업데이트
+                    validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
+                else:
+                    # [최초 입장 시] 새 행 추가
+                    row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
+                    validation_sheet.append_row(row_to_insert)
+
             except Exception as sheet_err:
-                print(f"구글 시트 입력 실패: {sheet_err}")
+                print(f"구글 시트 입력/수정 실패: {sheet_err}")
 
             reply_text = ("저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
                           "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
