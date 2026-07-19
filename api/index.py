@@ -5,7 +5,7 @@ import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
 
-# ✨ Line SDK v3 컴포넌트들을 정확히 import 합니다. (FollowEvent, PushMessageRequest 추가 완료)
+# ✨ Line SDK v3 필수 컴포넌트들을 정확히 import 합니다.
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -15,9 +15,8 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEv
 
 app = Flask(__name__)
 
-# ⚙️ 인증자방(관리자 그룹방) ID 설정
-# 배포 후 봇이 있는 방에 /여긴어디? 를 치고 나오는 Group ID 값을 여기에 붙여넣으세요.
-ADMIN_GROUP_CHAT_ID = "YOUR_ADMIN_GROUP_CHAT_ID"
+# ⚙️ 인증자방(관리자 그룹방) ID 고정 설정 완료
+ADMIN_GROUP_CHAT_ID = "C1fdb3b771a6bd0686fa7dbf1b5145a70"
 
 # 환경변수 설정 및 핸들러 초기화
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
@@ -270,7 +269,7 @@ def handle_message(event):
 
 
 # ==========================================
-# [핸들러 2] 유저 입장 시 처리 핸들러 (중복 검사)
+# [핸들러 2] 유저 입장 시 처리 핸들러 (중복 검사 및 기존 닉네임 출력)
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
@@ -296,26 +295,29 @@ def handle_member_joined(event):
         " - 다른 방에서 킥을 당한적 있는지(있다면 사유도) :"
     )
     
-    # 웰컴 메시지 발송
+    # 신입 유저에게 환영 메시지 전송
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_text)])
         )
         
-    # 🔍 기존 '검증' 시트 내역을 비교하여 인증자방으로 중복 경고 알림 전송
+    # 🔍 기존 '검증' 시트 내역을 실시간 비교하여 인증자방으로 중복 경고 알림 전송
     try:
         all_records = validation_sheet.get_all_records()
         match_count = 0
         matched_nicknames = []
         
         for record in all_records:
-            if str(record.get("아이디")) == str(user_id):
+            # 시트의 '아이디' 열과 신입 유저의 ID가 일치하는지 비교
+            if str(record.get("아이디", "")).strip() == str(user_id).strip():
                 match_count += 1
+                # '닉네임(두글자)' 또는 '닉네임' 컬럼에서 값을 추출
                 name = record.get("닉네임(두글자)") or record.get("닉네임")
                 if name:
-                    matched_nicknames.append(str(name))
+                    matched_nicknames.append(str(name).strip())
 
+        # 중복 기록이 최소 1회 이상 있는 유저라면 알림 작동
         if match_count > 0:
             status = ""
             color_emoji = ""
@@ -327,10 +329,11 @@ def handle_member_joined(event):
                 status = "⚠️ [황색 경고] 의심 유저"
                 color_emoji = "🟡"
             else:
-                status = "👀 [주의] 재입장 유저"
-                color_emoji = "🔵"
+                status = "🔵 [주의] 재입장 유저"
+                color_emoji = "🟦"
                 
-            nicknames_str = ", ".join(matched_nicknames)
+            # 기존 닉네임 리스트를 콤마(,)로 연결하여 가독성 있게 정돈
+            nicknames_str = ", ".join(set(matched_nicknames)) if matched_nicknames else "없음(기록 누락)"
             
             alert_text = (
                 f"{color_emoji} 신입 입장 중복 알림\n\n"
@@ -341,15 +344,14 @@ def handle_member_joined(event):
                 f"💡 해당 유저의 인증 절차 진행 시 주의하시기 바랍니다."
             )
             
-            # 인증자방으로 관리자 경고 강제 Push
-            if ADMIN_GROUP_CHAT_ID != "YOUR_ADMIN_GROUP_CHAT_ID":
-                with ApiClient(configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.push_message(
-                        PushMessageRequest(
-                            to=ADMIN_GROUP_CHAT_ID,
-                            messages=[TextMessage(text=alert_text)]
-                        )
+            # 인증자방으로 관리자 경고 강제 Push 발송
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=ADMIN_GROUP_CHAT_ID,
+                        messages=[TextMessage(text=alert_text)]
                     )
+                )
     except Exception as e:
         print(f"입장 유저 중복 검사 중 오류 발생: {e}")
