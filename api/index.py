@@ -135,20 +135,20 @@ def handle_message(event):
                 missing_fields.append(display_name)
                 
         if not missing_fields:
-            # 양식 검사 성공 시 데이터 가공
             nickname = extracted_data["닉네임(두글자)"].strip()
             birth_year = extracted_data["년생"].strip()
             gender = extracted_data["성별"].strip()
             region = extracted_data["지역"].strip()
             current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-            # 🔍 구글 시트 내역 전체와 정밀 비교 (년생 포함 및 시트 컬럼 기준 일치)
+            # 🔍 구글 시트 내역 전체 정밀 비교 + 블랙 사유 추출
             try:
                 all_records = validation_sheet.get_all_records()
                 
                 is_id_matched = False
                 alert_status = ""
                 color_emoji = ""
+                found_black_reasons = [] # 발견된 블랙 사유 저장용
                 
                 for record in all_records:
                     rec_id = str(record.get("아이디", "")).strip()
@@ -156,48 +156,64 @@ def handle_message(event):
                     rec_year = str(record.get("년생", "")).strip()
                     rec_gender = str(record.get("성별", "")).strip()
                     rec_region = str(record.get("사는지역", "")).strip()
+                    rec_black = str(record.get("블랙사유", "")).strip()
                     
-                    # 고유 라인 ID 일치 체크
+                    # 1. 고유 ID 또는 닉네임이 매칭될 때 해당 행에 블랙사유가 적혀있으면 수집
+                    if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
+                        if rec_black:
+                            found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
+
+                    # 2. 고유 라인 ID 일치 체크 (재입장 여부)
                     if rec_id and rec_id == str(user_id).strip():
                         is_id_matched = True
 
-                    # 닉네임이 같을 때 데이터 유사성 판정
+                    # 3. 닉네임 일치 기반 정보 중복 판정
                     if rec_name == nickname:
                         match_score = 0
                         if rec_year == birth_year: match_score += 1
                         if rec_gender == gender: match_score += 1
                         if rec_region == region: match_score += 1
 
-                        # 4가지 전체 일치 (적색경고)
                         if match_score == 3:
                             alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
                             color_emoji = "🔴"
-                            break
-                        # 닉네임 + 정보 1~2개 일치 (황색경고)
+                            # 적색경고여도 블랙사유를 끝까지 다 찾아야 하므로 break하지 않고 계속 돕니다.
                         elif match_score in [1, 2]:
                             if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
                                 alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
                                 color_emoji = "🟡"
-                        # 닉네임만 일치 (주의)
                         else:
                             if not alert_status:
                                 alert_status = "🔵 [주의] 닉네임 일치 유저"
                                 color_emoji = "🟦"
 
-                # 재입장 유저 판정 (정보 중복 경고가 없고 아이디만 매칭될 때)
+                # 4. 재입장 유저 판정 (정보 중복이 없고 ID만 매칭될 때)
                 if is_id_matched and not alert_status:
                     alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
                     color_emoji = "🟪"
 
-                # 경고 또는 알림이 트리거되었을 때 알림 발송
+                # 5. [핵심] 블랙리스트 기록이 한 건이라도 발견된 경우 분류 상태를 강제로 '블랙 유저 감지'로 격상시킵니다.
+                if found_black_reasons:
+                    alert_status = "💀 [위험] 블랙리스트 유저 감지"
+                    color_emoji = "⚫"
+
+                # 경고/알림/블랙이 트리거되었을 때 알림 발송
                 if alert_status:
+                    black_section = ""
+                    if found_black_reasons:
+                        # 중복된 사유가 들어올 수 있으므로 깔끔하게 정렬 및 고유화
+                        unique_reasons = list(set(found_black_reasons))
+                        reasons_str = "\n".join(unique_reasons)
+                        black_section = f"⚠️ [시트 내역 블랙 사유]\n{reasons_str}\n\n"
+
                     alert_text = (
                         f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
                         f"📌 분류 상태: {alert_status}\n"
                         f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
                         f"📍 입력 지역/성별: {region} / {gender}\n"
                         f"🆔 유저 고유 ID:\n{user_id}\n\n"
-                        f"💡 관리자분들께서는 위 경고 내용을 기반으로 승인 절차를 진행하시기 바랍니다."
+                        f"{black_section}"
+                        f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
                     )
                     
                     with ApiClient(configuration) as api_client:
@@ -211,9 +227,9 @@ def handle_message(event):
             except Exception as filter_err:
                 print(f"중복 필터링 시스템 에러: {filter_err}")
 
-            # 📊 시트 구조 순서대로 행 삽입 (A: 닉네임, B: 성별, C: 사는지역, D: 년생, E: 아이디, F: 마지막 들어온 날짜)
+            # 📊 시트 구조 순서대로 행 삽입 (A~F열 순서 유지, 신입은 기본 블랙사유 빈칸)
             try:
-                row_to_insert = [nickname, gender, region, birth_year, user_id, current_date]
+                row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, ""]
                 validation_sheet.append_row(row_to_insert)
             except Exception as sheet_err:
                 print(f"구글 시트 입력 실패: {sheet_err}")
@@ -285,6 +301,8 @@ def handle_message(event):
             reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
         else:
             reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
+    elif command in ["id", "내정보", "아이디"]:
+        reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
     elif "입장" in command:
         reply_text = ("안녕하세요\n"
                       "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
