@@ -238,6 +238,14 @@ def handle_message(event):
                           "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
                           "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
                           "읽고 확인해주세요")
+            # 👇 [여기에 추가!] 유저 ID와 '입장대기' 상태를 검증 시트에 기록
+            try:
+                col_k = validation_sheet.col_values(11) # K열(인증중인 아이디)
+                next_row = len(col_k) + 1
+                validation_sheet.update_acell(f'K{next_row}', user_id)
+                validation_sheet.update_acell(f'L{next_row}', '입장대기')
+            except Exception as e:
+                print(f"시트 업데이트 에러: {e}")
         else:
             fields_str = "\n".join(f"- {f}" for f in missing_fields)
             reply_text = ("⚠️ 작성 내용 중 누락되었거나 비어있는 항목이 있습니다!\n\n"
@@ -252,24 +260,38 @@ def handle_message(event):
                 )
         return
 
-    # 🤝 3. 안내 확인 답변 처리
-    if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인했어요", "넹", "네"]):
-        global last_joined_user_id
-        if user_id != last_joined_user_id:
-            return
-        if notified_users.get(user_id) is True:
-            return
-
-        reply_text = "인증자가 확인중이니 잠시 대기하여 주세요"
-        notified_users[user_id] = True
-        
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-            )
-        return
-
+    # 🤝 3. 안내 확인 답변 처리 (수정된 섹션)
+    if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
+        try:
+            # 시트 전체를 가져오는 대신, 유저 ID를 검색하는 효율적인 방식 권장
+            # 여기서는 기존 로직의 흐름을 유지하며 들여쓰기만 교정합니다.
+            col_k = validation_sheet.col_values(11) 
+            
+            if user_id in col_k:
+                row_index = col_k.index(user_id) + 1
+                current_status = validation_sheet.acell(f'L{row_index}').value
+                
+                if current_status == '입장대기':
+                    validation_sheet.update_acell(f'L{row_index}', '입장확인')
+                    reply_text = "인증자가 확인중이니 잠시 대기하여 주세요"
+                    
+                    with ApiClient(configuration) as api_client:
+                        line_bot_api = MessagingApi(api_client)
+                        line_bot_api.reply_message_with_http_info(
+                            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                        )
+            else:
+                # 리스트에 없는 경우에 대한 예외 처리
+                reply_text = "작성하신 양식이 확인되지 않습니다. 양식을 먼저 작성해주세요."
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                    )
+        except Exception as e:
+            print(f"시트 조회/수정 에러: {e}")
+            
+        return # 이 return은 if문 블록 내에 위치해야 합니다.
     # 📂 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
