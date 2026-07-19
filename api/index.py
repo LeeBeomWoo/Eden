@@ -67,7 +67,6 @@ def callback():
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessageContent)
-@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
