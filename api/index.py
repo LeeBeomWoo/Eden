@@ -24,6 +24,10 @@ json_key_dict = json.loads(json_key_str)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope)
 client = gspread.authorize(creds)
+# 유저가 대기 안내를 받았는지 기억하는 상자입니다. (서버가 켜져있는 동안 유지)
+notified_users = {}
+# 가장 마지막에 방에 입장한 유저의 ID를 기억하는 상자입니다.
+last_joined_user_id = None
 
 # 1. 시트 연결: 파일명 "인증멘트"의 "멘트" 탭을 엽니다.
 sheet = client.open("인증멘트").worksheet("멘트")
@@ -132,13 +136,18 @@ def handle_message(event):
                 )
         return
 
-    # 1-2. 개인정보 규정 안내를 받고 사용자가 "확인" 대답을 했을 때 처리하는 로직
+   # 1-2. 개인정보 규정 안내를 받고 사용자가 "확인" 대답을 했을 때 처리하는 로직
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인했어요", "넹", "네"]):
+        global last_joined_user_id
         
-        # 💡 [핵심] 이미 대기 안내를 보낸 유저라면 봇이 대답하지 않고 무시(return)합니다.
-        if notified_users.get(user_id) is True:
+        # 💡 [핵심 추가] 메시지를 보낸 사람이 '가장 마지막에 온 사람'이 아니라면 아예 무시(대답 안 함)
+        if user_id != last_joined_user_id:
             return
             
+        # 이미 대기 안내를 보낸 유저라면 봇이 대답하지 않고 무시(return)합니다.
+        if notified_users.get(user_id) is True:
+            return
+
         reply_text = "인증자가 확인중이니 잠시 대기하여 주세요"
         
         # 안내를 발송했음을 기록(True)합니다.
@@ -150,7 +159,6 @@ def handle_message(event):
                 ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
             )
         return
-
     # 2. 기존의 '/'로 시작하는 명령어 처리 로직 (이하는 기존 코드 유지)
     # 2. 기존의 '/'로 시작하는 명령어 처리 로직
     if not user_message.startswith("/"):
@@ -239,6 +247,8 @@ from linebot.v3.webhooks import MemberJoinedEvent, JoinEvent
 # 상황 1: 새로운 사람이 방에 들어왔을 때 (인증방에 유저가 입장)
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
+    global last_joined_user_id
+    last_joined_user_id = event.source.user_id  # 가장 마지막에 온 사람의 ID 저장
     welcome_text = (
         "안녕하세요\n"
         "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
