@@ -5,31 +5,31 @@ import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
 
-# ✨ Line SDK v3 필수 컴포넌트들을 정확히 import 합니다.
+# Line SDK v3 컴포넌트
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEvent, FollowEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEvent
 
 app = Flask(__name__)
 
-# ⚙️ 인증자방(관리자 그룹방) ID 고정 설정 완료
+# 인증자방(관리자 그룹방) ID 고정 설정
 ADMIN_GROUP_CHAT_ID = "C1fdb3b771a6bd0686fa7dbf1b5145a70"
 
 # 환경변수 설정 및 핸들러 초기화
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
 
-# 환경변수에서 JSON 문자열을 가져와서 인증 객체 생성
+# 구글 서비스 계정 인증
 json_key_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 json_key_dict = json.loads(json_key_str)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope)
 client = gspread.authorize(creds)
 
-# 유저 상태 기억용 전역 상자
+# 유저 상태 기억용 전역 변수
 notified_users = {}
 last_joined_user_id = None
 
@@ -74,7 +74,7 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 🛠️ 1. 그룹/룸 고유 아이디 확인 명령어 (최우선 수행)
+    # 🛠️ 1. 그룹/룸 고유 아이디 확인 명령어
     if user_message == "/여긴어디?":
         source_type = event.source.type
         current_id = ""
@@ -135,13 +135,14 @@ def handle_message(event):
                 missing_fields.append(display_name)
                 
         if not missing_fields:
-            # ⭕ 양식 성공 시 -> 데이터 가공
+            # 양식 검사 성공 시 데이터 가공
             nickname = extracted_data["닉네임(두글자)"].strip()
+            birth_year = extracted_data["년생"].strip()
             gender = extracted_data["성별"].strip()
             region = extracted_data["지역"].strip()
             current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-            # 🔍 [필터링 시스템 고도화] 구글 시트 내역 전체와 실시간 정밀 비교
+            # 🔍 구글 시트 내역 전체와 정밀 비교 (년생 포함 및 시트 컬럼 기준 일치)
             try:
                 all_records = validation_sheet.get_all_records()
                 
@@ -151,43 +152,49 @@ def handle_message(event):
                 
                 for record in all_records:
                     rec_id = str(record.get("아이디", "")).strip()
-                    rec_name = str(record.get("닉네임(두글자)", "") or record.get("닉네임", "")).strip()
+                    rec_name = str(record.get("닉네임", "")).strip()
+                    rec_year = str(record.get("년생", "")).strip()
                     rec_gender = str(record.get("성별", "")).strip()
-                    rec_region = str(record.get("지역", "")).strip()
+                    rec_region = str(record.get("사는지역", "")).strip()
                     
-                    # 아이디가 같은 이력이 있는지 기록
+                    # 고유 라인 ID 일치 체크
                     if rec_id and rec_id == str(user_id).strip():
                         is_id_matched = True
 
-                    # 닉네임이 같을 때의 경고 조건 상세 분석
+                    # 닉네임이 같을 때 데이터 유사성 판정
                     if rec_name == nickname:
-                        # 닉네임 일치 + 지역/성별 둘 다 일치 (3가지 조건 모두 일치)
-                        if rec_region == region and rec_gender == gender:
-                            alert_status = "🚨 [적색 경고] 3가지 정보 모두 일치"
+                        match_score = 0
+                        if rec_year == birth_year: match_score += 1
+                        if rec_gender == gender: match_score += 1
+                        if rec_region == region: match_score += 1
+
+                        # 4가지 전체 일치 (적색경고)
+                        if match_score == 3:
+                            alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
                             color_emoji = "🔴"
-                            break  # 가장 높은 등급이 나왔으므로 탐색 중단
-                        # 닉네임 일치 + (지역 또는 성별 중 1가지 일치)
-                        elif rec_region == region or rec_gender == gender:
-                            if alert_status != "🚨 [적색 경고] 3가지 정보 모두 일치":
+                            break
+                        # 닉네임 + 정보 1~2개 일치 (황색경고)
+                        elif match_score in [1, 2]:
+                            if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
                                 alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
                                 color_emoji = "🟡"
-                        # 닉네임만 일치하고 나머지는 다름
+                        # 닉네임만 일치 (주의)
                         else:
                             if not alert_status:
                                 alert_status = "🔵 [주의] 닉네임 일치 유저"
                                 color_emoji = "🟦"
 
-                # 아이디가 같은 재입장 유저 케이스인 경우 멘트 추가 조정
+                # 재입장 유저 판정 (정보 중복 경고가 없고 아이디만 매칭될 때)
                 if is_id_matched and not alert_status:
                     alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
                     color_emoji = "🟪"
 
-                # 일치 조건 경고가 발생했을 때 인증자방으로 Push 발송
+                # 경고 또는 알림이 트리거되었을 때 알림 발송
                 if alert_status:
                     alert_text = (
                         f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
                         f"📌 분류 상태: {alert_status}\n"
-                        f"👤 입력 닉네임: {nickname}\n"
+                        f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
                         f"📍 입력 지역/성별: {region} / {gender}\n"
                         f"🆔 유저 고유 ID:\n{user_id}\n\n"
                         f"💡 관리자분들께서는 위 경고 내용을 기반으로 승인 절차를 진행하시기 바랍니다."
@@ -204,9 +211,9 @@ def handle_message(event):
             except Exception as filter_err:
                 print(f"중복 필터링 시스템 에러: {filter_err}")
 
-            # 구글 시트 '검증' 탭에 데이터 최종 입력
+            # 📊 시트 구조 순서대로 행 삽입 (A: 닉네임, B: 성별, C: 사는지역, D: 년생, E: 아이디, F: 마지막 들어온 날짜)
             try:
-                row_to_insert = [nickname, current_date, gender, region, user_id]
+                row_to_insert = [nickname, gender, region, birth_year, user_id, current_date]
                 validation_sheet.append_row(row_to_insert)
             except Exception as sheet_err:
                 print(f"구글 시트 입력 실패: {sheet_err}")
@@ -216,7 +223,6 @@ def handle_message(event):
                           "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
                           "읽고 확인해주세요")
         else:
-            # ❌ 빈칸이 있을 시 -> 안내 멘트
             fields_str = "\n".join(f"- {f}" for f in missing_fields)
             reply_text = ("⚠️ 작성 내용 중 누락되었거나 비어있는 항목이 있습니다!\n\n"
                           f"📝 다시 채워주셔야 할 항목:\n{fields_str}\n\n"
@@ -230,13 +236,11 @@ def handle_message(event):
                 )
         return
 
-    # 🤝 3. 개인정보 규정 안내를 받고 사용자가 "확인" 대답을 했을 때 처리하는 로직
+    # 🤝 3. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인했어요", "넹", "네"]):
         global last_joined_user_id
-        
         if user_id != last_joined_user_id:
             return
-            
         if notified_users.get(user_id) is True:
             return
 
@@ -250,7 +254,7 @@ def handle_message(event):
             )
         return
 
-    # 📂 4. 기존의 '/'로 시작하는 명령어 처리 로직
+    # 📂 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
 
@@ -281,8 +285,6 @@ def handle_message(event):
             reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
         else:
             reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
-    elif command in ["id", "내정보", "아이디"]:
-        reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
     elif "입장" in command:
         reply_text = ("안녕하세요\n"
                       "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
@@ -332,13 +334,13 @@ def handle_message(event):
 
 
 # ==========================================
-# [핸들러 2] 유저 입장 시 처리 핸들러 (단순 환영 안내)
+# [핸들러 2] 유저 입장 시 처리 핸들러
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
     global last_joined_user_id
     user_id = event.source.user_id
-    last_joined_user_id = user_id  # 가장 마지막에 온 사람의 ID 저장
+    last_joined_user_id = user_id
     
     welcome_text = (
         "안녕하세요\n"
