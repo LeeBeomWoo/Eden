@@ -99,7 +99,7 @@ def handle_message(event):
             )
         return
 
-    # 📝 2. 신입 인증 양식 검사 로직
+    # 📝 2. 신입 인증 양식 검사 및 중복 데이터 필터링 로직
     if "닉네임" in user_message and "년생" in user_message and "성별" in user_message:
         if user_id in notified_users:
             del notified_users[user_id]
@@ -135,15 +135,78 @@ def handle_message(event):
                 missing_fields.append(display_name)
                 
         if not missing_fields:
-            # ⭕ 양식 성공 시 -> 구글 시트 '검증' 탭에 데이터 입력
+            # ⭕ 양식 성공 시 -> 데이터 가공
+            nickname = extracted_data["닉네임(두글자)"].strip()
+            gender = extracted_data["성별"].strip()
+            region = extracted_data["지역"].strip()
+            current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+            # 🔍 [필터링 시스템 고도화] 구글 시트 내역 전체와 실시간 정밀 비교
             try:
-                nickname = extracted_data["닉네임(두글자)"]
-                gender = extracted_data["성별"]
-                region = extracted_data["지역"]
+                all_records = validation_sheet.get_all_records()
                 
-                current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                is_id_matched = False
+                alert_status = ""
+                color_emoji = ""
+                
+                for record in all_records:
+                    rec_id = str(record.get("아이디", "")).strip()
+                    rec_name = str(record.get("닉네임(두글자)", "") or record.get("닉네임", "")).strip()
+                    rec_gender = str(record.get("성별", "")).strip()
+                    rec_region = str(record.get("지역", "")).strip()
+                    
+                    # 아이디가 같은 이력이 있는지 기록
+                    if rec_id and rec_id == str(user_id).strip():
+                        is_id_matched = True
+
+                    # 닉네임이 같을 때의 경고 조건 상세 분석
+                    if rec_name == nickname:
+                        # 닉네임 일치 + 지역/성별 둘 다 일치 (3가지 조건 모두 일치)
+                        if rec_region == region and rec_gender == gender:
+                            alert_status = "🚨 [적색 경고] 3가지 정보 모두 일치"
+                            color_emoji = "🔴"
+                            break  # 가장 높은 등급이 나왔으므로 탐색 중단
+                        # 닉네임 일치 + (지역 또는 성별 중 1가지 일치)
+                        elif rec_region == region or rec_gender == gender:
+                            if alert_status != "🚨 [적색 경고] 3가지 정보 모두 일치":
+                                alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
+                                color_emoji = "🟡"
+                        # 닉네임만 일치하고 나머지는 다름
+                        else:
+                            if not alert_status:
+                                alert_status = "🔵 [주의] 닉네임 일치 유저"
+                                color_emoji = "🟦"
+
+                # 아이디가 같은 재입장 유저 케이스인 경우 멘트 추가 조정
+                if is_id_matched and not alert_status:
+                    alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
+                    color_emoji = "🟪"
+
+                # 일치 조건 경고가 발생했을 때 인증자방으로 Push 발송
+                if alert_status:
+                    alert_text = (
+                        f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
+                        f"📌 분류 상태: {alert_status}\n"
+                        f"👤 입력 닉네임: {nickname}\n"
+                        f"📍 입력 지역/성별: {region} / {gender}\n"
+                        f"🆔 유저 고유 ID:\n{user_id}\n\n"
+                        f"💡 관리자분들께서는 위 경고 내용을 기반으로 승인 절차를 진행하시기 바랍니다."
+                    )
+                    
+                    with ApiClient(configuration) as api_client:
+                        line_bot_api = MessagingApi(api_client)
+                        line_bot_api.push_message(
+                            PushMessageRequest(
+                                to=ADMIN_GROUP_CHAT_ID,
+                                messages=[TextMessage(text=alert_text)]
+                            )
+                        )
+            except Exception as filter_err:
+                print(f"중복 필터링 시스템 에러: {filter_err}")
+
+            # 구글 시트 '검증' 탭에 데이터 최종 입력
+            try:
                 row_to_insert = [nickname, current_date, gender, region, user_id]
-                
                 validation_sheet.append_row(row_to_insert)
             except Exception as sheet_err:
                 print(f"구글 시트 입력 실패: {sheet_err}")
@@ -269,7 +332,7 @@ def handle_message(event):
 
 
 # ==========================================
-# [핸들러 2] 유저 입장 시 처리 핸들러 (중복 검사 및 기존 닉네임 출력)
+# [핸들러 2] 유저 입장 시 처리 핸들러 (단순 환영 안내)
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
@@ -295,63 +358,8 @@ def handle_member_joined(event):
         " - 다른 방에서 킥을 당한적 있는지(있다면 사유도) :"
     )
     
-    # 신입 유저에게 환영 메시지 전송
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_text)])
         )
-        
-    # 🔍 기존 '검증' 시트 내역을 실시간 비교하여 인증자방으로 중복 경고 알림 전송
-    try:
-        all_records = validation_sheet.get_all_records()
-        match_count = 0
-        matched_nicknames = []
-        
-        for record in all_records:
-            # 시트의 '아이디' 열과 신입 유저의 ID가 일치하는지 비교
-            if str(record.get("아이디", "")).strip() == str(user_id).strip():
-                match_count += 1
-                # '닉네임(두글자)' 또는 '닉네임' 컬럼에서 값을 추출
-                name = record.get("닉네임(두글자)") or record.get("닉네임")
-                if name:
-                    matched_nicknames.append(str(name).strip())
-
-        # 중복 기록이 최소 1회 이상 있는 유저라면 알림 작동
-        if match_count > 0:
-            status = ""
-            color_emoji = ""
-            
-            if match_count >= 3:
-                status = "🚨 [적색 경고] 대단히 위험"
-                color_emoji = "🔴"
-            elif match_count == 2:
-                status = "⚠️ [황색 경고] 의심 유저"
-                color_emoji = "🟡"
-            else:
-                status = "🔵 [주의] 재입장 유저"
-                color_emoji = "🟦"
-                
-            # 기존 닉네임 리스트를 콤마(,)로 연결하여 가독성 있게 정돈
-            nicknames_str = ", ".join(set(matched_nicknames)) if matched_nicknames else "없음(기록 누락)"
-            
-            alert_text = (
-                f"{color_emoji} 신입 입장 중복 알림\n\n"
-                f"📌 상태: {status}\n"
-                f"👤 매칭된 기존 닉네임: {nicknames_str}\n"
-                f"📊 횟수: 과거 {match_count}회 일치 기록 있음\n"
-                f"🆔 유저 고유 ID:\n{user_id}\n\n"
-                f"💡 해당 유저의 인증 절차 진행 시 주의하시기 바랍니다."
-            )
-            
-            # 인증자방으로 관리자 경고 강제 Push 발송
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.push_message(
-                    PushMessageRequest(
-                        to=ADMIN_GROUP_CHAT_ID,
-                        messages=[TextMessage(text=alert_text)]
-                    )
-                )
-    except Exception as e:
-        print(f"입장 유저 중복 검사 중 오류 발생: {e}")
