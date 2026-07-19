@@ -1,6 +1,7 @@
 import os
 import json
 import gspread
+import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
 
@@ -31,6 +32,7 @@ last_joined_user_id = None
 
 # 1. 시트 연결: 파일명 "인증멘트"의 "멘트" 탭을 엽니다.
 sheet = client.open("인증멘트").worksheet("멘트")
+validation_sheet = client.open("인증멘트").worksheet("검증")
 
 def search_keyword(keyword):
     # 첫 번째 줄을 제목으로 인식하여 데이터를 가져옵니다.
@@ -81,7 +83,6 @@ def handle_message(event):
 
     # 1. 신입 인증 양식 검사 로직 (제일 먼저 수행)
     if "닉네임" in user_message and "년생" in user_message and "성별" in user_message:
-        # 양식을 새로 제출하면 대기 상태를 초기화하여 나중에 다시 "확인"했을 때 안내가 나가도록 합니다.
         if user_id in notified_users:
             del notified_users[user_id]
             
@@ -89,45 +90,65 @@ def handle_message(event):
         missing_fields = []
         
         required_fields = [
-            ("닉네임(두글자)", "닉네임(두글자)"), 
-            ("년생", "년생"), 
-            ("나이:", "나이"), 
-            ("성별", "성별"), 
-            ("지역", "지역"), 
-            ("결혼유무", "결혼유무"), 
-            ("군필여부", "군필여부"), 
-            ("초대자", "초대자"), 
-            ("야단라경험유무", "야단라경험유무"), 
-            ("기존 다른방에서 나온이유", "기존 다른방에서 나온이유"), 
+            ("닉네임(두글자)", "닉네임(두글자)"),
+            ("년생", "년생"),
+            ("나이:", "나이"),
+            ("성별", "성별"),
+            ("지역", "지역"),
+            ("결혼유무", "결혼유무"),
+            ("군필여부", "군필여부"),
+            ("초대자", "초대자"),
+            ("야단라경험유무", "야단라경험유무"),
+            ("기존 다른방에서 나온이유", "기존 다른방에서 나온이유"),
             ("다른 방에서 킥을 당한적 있는지", "다른 방에서 킥을 당한적 있는지")
         ]
         
-        for search_key, display_name in required_fields:
-            field_line = [l for l in lines if search_key in l]
-            if field_line:
-                parts = field_line[0].split(":")
-                if len(parts) < 2 or not parts[1].strip():
-                    missing_fields.append(display_name)
-            else:
-                missing_fields.append(display_name)
+        # 각 필드의 값을 추출하기 위한 딕셔너리 초기화
+        extracted_data = {display_name: "" for _, display_name in required_fields}
         
+        for search_key, display_name in required_fields:
+            field_line = [l for l in lines if search_key in l ]
+            if field_line:
+                parts = field_line [0 ] . split (":" )
+                if len (parts ) < 2 or not parts [1 ] . strip () :
+                    missing_fields. append (display_name )
+                else:
+                    # 💡 성공 시 저장을 위해 콜론(:) 오른쪽 값을 공백 제거 후 보관
+                    extracted_data[display_name] = parts[1].strip()
+            else :
+                missing_fields. append (display_name )
+                
         if not missing_fields:
-            # ⭕ 양식 성공 시 -> 개인정보 내부규정 안내 출력
-            reply_text = (
-                "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 "
-                "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n"
-                "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n"
-                "읽고 확인해주세요"
-            )
-        else:
+            # ⭕ 양식 성공 시 -> 구글 시트 '검증' 탭에 데이터 입력 추가!
+            try:
+                # 데이터 파싱
+                nickname = extracted_data["닉네임(두글자)"]
+                gender = extracted_data["성별"]
+                region = extracted_data["지역"]
+                
+                # 들어온 날짜 포맷팅 (예: 2026-07-19)
+                current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                
+                # 💡 순서: [닉네임, 마지막 들어온 날짜, 성별, 사는지역, 아이디]
+                # '검증' 시트 E열에 user_id가 들어가게 됩니다.
+                row_to_insert = [nickname, current_date, gender, region, user_id]
+                
+                # 시트에 행 추가
+                validation_sheet.append_row(row_to_insert)
+            except Exception as sheet_err:
+                print(f"구글 시트 입력 실패: {sheet_err}")
+
+            # 기존 내부규정 안내 출력 멘트
+            reply_text = ("저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
+                          "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
+                          "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
+                          "읽고 확인해주세요" )
+        else :
             # ❌ 빈칸이 있을 시 -> 안내 멘트
-            fields_str = "\n".join(f"- {f}" for f in missing_fields)
-            reply_text = (
-                "⚠️ 작성 내용 중 누락되었거나 비어있는 항목이 있습니다!\n\n"
-                f"📝 다시 채워주셔야 할 항목:\n{fields_str}\n\n"
-                "복사하신 본문 양식의 콜론(:) 오른쪽에 내용을 빠.짐.없.이. 작성해서 다시 보내주세요! 😢"
-            )
-            
+            fields_str = "\n" . join (f"- {f } " for f in missing_fields )
+            reply_text = ("⚠️ 작성 내용 중 누락되었거나 비어있는 항목이 있습니다!\n\n"
+                          f"📝 다시 채워주셔야 할 항목:\n {fields_str } \n\n"
+                          "복사하신 본문 양식의 콜론(:) 오른쪽에 내용을 빠.짐.없.이. 작성해서 다시 보내주세요! 😢" )
         if reply_text:
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -232,8 +253,32 @@ def handle_message(event):
     elif command == "불가":
         reply_text = ("죄송합니다 저희 방 입장은 불가능할 것 같습니다.\n"
                       "인증방은 나가주세요.")
+    if user_message == "여긴어디?":
+        source_type = event.source.type
+        current_id = ""
+        
+        if source_type == "group":
+            current_id = event.source.group_id
+            reply_text = f"📍 현재 계신 곳은 [그룹방]입니다.\n🆔 Group ID:\n{current_id}"
+        elif source_type == "room":
+            current_id = event.source.room_id
+            reply_text = f"📍 현재 계신 곳은 [멀티 대화방]입니다.\n🆔 Room ID:\n{current_id}"
+        else:
+            current_id = event.source.user_id
+            reply_text = f"👤 현재 계신 곳은 [1:1 채팅방]입니다.\n🆔 User ID:\n{current_id}"
+            
+        # 바로 그룹방에 고유 ID를 답장(Reply)으로 전송
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+        return  # 그룹 ID를 확인한 후에는 아래의 신입인증 검사나 다른 로직이 실행되지 않고 종료되도록 리턴 처리
     else:
-        reply_text = f"없어. '{command}'이런 명령언. 😢\n\n 자꾸 없는거 치면 파업한다?"
+        reply_text = f"명령어 확인. '{command}'이런 명령어는 없습니다. 😢"
 
     if reply_text:
         with ApiClient(configuration) as api_client:
@@ -272,14 +317,134 @@ def handle_member_joined(event):
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_text)])
         )
+ADMIN_GROUP_CHAT_ID = "YOUR_ADMIN_GROUP_CHAT_ID"
 
-# 상황 2: 봇 자체가 새로운 그룹/대화방에 초대되어 들어갔을 때 (선택 사항)
-@handler.add(JoinEvent)
-def handle_bot_join(event):
-    welcome_text = "안녕하세요! 신입 인증 관리 봇입니다. 명령어 확인은 '/목록'을 입력해주세요."
+@handler.add(FollowEvent)  # 또는 사용 환경에 따라 JoinEvent
+def handle_join(event):
+    global last_joined_user_id
+    user_id = event.source.user_id
+    last_joined_user_id = user_id  # 최근 입장 유저 ID 업데이트
     
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_text)])
-        )
+    try:
+        # 1. '검증' 시트의 모든 데이터 가져오기 (E열이 아이디라고 가정)
+        # 헤더: 닉네임, 마지막 들어온 날짜, 성별, 사는지역, 아이디
+        all_records = validation_sheet.get_all_records()
+        
+        # 2. 동일한 아이디가 몇 번이나 기록되어 있는지 확인
+        # (과거에 들어왔다 나간 기록이 여러 번 있을 수 있으므로 횟수를 카운트합니다.)
+        match_count = 0
+        matched_nicknames = []
+        
+        for record in all_records:
+            # 시트의 '아이디' 열에 기록된 값과 현재 들어온 user_id 비교
+            if str(record.get("아이디")) == str(user_id):
+                match_count += 1
+                if record.get("닉네임(두글자)"):
+                    matched_nicknames.append(record.get("닉네임(두글자)"))
+                elif record.get("닉네임"):
+                    matched_nicknames.append(record.get("닉네임"))
+
+        # 3. 중복이 존재한다면 일치 횟수(위험도)에 따라 분류하여 인증자방에 알림
+        if match_count > 0:
+            status = ""
+            color_emoji = ""
+            
+            if match_count >= 3:
+                status = "🚨 [적색 경고] 대단히 위험"
+                color_emoji = "🔴"
+            elif match_count == 2:
+                status = "⚠️ [황색 경고] 의심 유저"
+                color_emoji = "🟡"
+            else:
+                status = "👀 [주의] 재입장 유저"
+                color_emoji = "🔵"
+                
+            nicknames_str = ", ".join(matched_nicknames)
+            
+            # 인증자방에 보낼 경고 메시지 구성
+            alert_text = (
+                f"{color_emoji} 신입 입장 중복 알림\n\n"
+                f"📌 상태: {status}\n"
+                f"👤 매칭된 기존 닉네임: {nicknames_str}\n"
+                f"횟수: 과거 {match_count}회 일치 기록 있음\n"
+                f"🆔 유저 고유 ID:\n{user_id}\n\n"
+                f"💡 해당 유저의 인증 절차 진행 시 주의하시기 바랍니다."
+            )
+            
+            # 인증자방(그룹방)으로 메시지 강제 푸시(Push)
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=ADMIN_GROUP_CHAT_ID,
+                        messages=[TextMessage(text=alert_text)]
+                    )
+                )
+                
+    except Exception as e:
+        print(f"입장 유저 중복 검사 중 오류 발생: {e}")ADMIN_GROUP_CHAT_ID = "YOUR_ADMIN_GROUP_CHAT_ID"
+
+@handler.add(FollowEvent)  # 또는 사용 환경에 따라 JoinEvent
+def handle_join(event):
+    global last_joined_user_id
+    user_id = event.source.user_id
+    last_joined_user_id = user_id  # 최근 입장 유저 ID 업데이트
+    
+    try:
+        # 1. '검증' 시트의 모든 데이터 가져오기 (E열이 아이디라고 가정)
+        # 헤더: 닉네임, 마지막 들어온 날짜, 성별, 사는지역, 아이디
+        all_records = validation_sheet.get_all_records()
+        
+        # 2. 동일한 아이디가 몇 번이나 기록되어 있는지 확인
+        # (과거에 들어왔다 나간 기록이 여러 번 있을 수 있으므로 횟수를 카운트합니다.)
+        match_count = 0
+        matched_nicknames = []
+        
+        for record in all_records:
+            # 시트의 '아이디' 열에 기록된 값과 현재 들어온 user_id 비교
+            if str(record.get("아이디")) == str(user_id):
+                match_count += 1
+                if record.get("닉네임(두글자)"):
+                    matched_nicknames.append(record.get("닉네임(두글자)"))
+                elif record.get("닉네임"):
+                    matched_nicknames.append(record.get("닉네임"))
+
+        # 3. 중복이 존재한다면 일치 횟수(위험도)에 따라 분류하여 인증자방에 알림
+        if match_count > 0:
+            status = ""
+            color_emoji = ""
+            
+            if match_count >= 3:
+                status = "🚨 [적색 경고] 대단히 위험"
+                color_emoji = "🔴"
+            elif match_count == 2:
+                status = "⚠️ [황색 경고] 의심 유저"
+                color_emoji = "🟡"
+            else:
+                status = "👀 [주의] 재입장 유저"
+                color_emoji = "🔵"
+                
+            nicknames_str = ", ".join(matched_nicknames)
+            
+            # 인증자방에 보낼 경고 메시지 구성
+            alert_text = (
+                f"{color_emoji} 신입 입장 중복 알림\n\n"
+                f"📌 상태: {status}\n"
+                f"👤 매칭된 기존 닉네임: {nicknames_str}\n"
+                f"횟수: 과거 {match_count}회 일치 기록 있음\n"
+                f"🆔 유저 고유 ID:\n{user_id}\n\n"
+                f"💡 해당 유저의 인증 절차 진행 시 주의하시기 바랍니다."
+            )
+            
+            # 인증자방(그룹방)으로 메시지 강제 푸시(Push)
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=ADMIN_GROUP_CHAT_ID,
+                        messages=[TextMessage(text=alert_text)]
+                    )
+                )
+                
+    except Exception as e:
+        print(f"입장 유저 중복 검사 중 오류 발생: {e}")
