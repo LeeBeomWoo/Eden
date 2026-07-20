@@ -1,4 +1,5 @@
 import os
+import random
 import json
 import gspread
 import datetime
@@ -297,39 +298,54 @@ def handle_message(event):
                 )
         return
 
+    
     # 🤝 3. 안내 확인 답변 처리 (수정된 섹션)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
-            # 시트 전체를 가져오는 대신, 유저 ID를 검색하는 효율적인 방식 권장
-            # 여기서는 기존 로직의 흐름을 유지하며 들여쓰기만 교정합니다.
-            col_k = validation_sheet.col_values(11) 
-            
+            col_k = validation_sheet.col_values(11)
             if user_id in col_k:
                 row_index = col_k.index(user_id) + 1
-                current_status = validation_sheet.acell(f'L{row_index}').value
                 
-                if current_status == '입장대기':
-                    validation_sheet.update_acell(f'L{row_index}', '입장확인')
-                    reply_text = "인증자가 확인중이니 잠시 대기하여 주세요"
-                    
-                    with ApiClient(configuration) as api_client:
-                        line_bot_api = MessagingApi(api_client)
-                        line_bot_api.reply_message_with_http_info(
-                            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                        )
-            else:
-                # 리스트에 없는 경우에 대한 예외 처리
-                reply_text = "작성하신 양식이 확인되지 않습니다. 양식을 먼저 작성해주세요."
+                # 1. 성별 데이터 가져오기 및 공백 제거
+                user_gender = str(validation_sheet.cell(row_index, 2).value).strip()
+                user_nickname = str(validation_sheet.cell(row_index, 1).value).strip()
+                
+                # 2. '녹음' 시트에서 데이터 가져오기
+                recording_sheet = client.open("인증멘트").worksheet("녹음")
+                
+                # [수정] 데이터가 있는 모든 행을 가져와서 빈칸은 제거
+                # A열(1열) = 남자, B열(2열) = 여자
+                col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
+                col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
+                
+                # 성별 판정 (남/여 또는 남자/여자 모두 처리)
+                if "남" in user_gender:
+                    selected_ment = random.choice(col_male) if col_male else "인증 문구가 준비 중입니다."
+                else:
+                    selected_ment = random.choice(col_female) if col_female else "인증 문구가 준비 중입니다."
+
+                # 3. 안내 문구 구성
+                reply_text = (
+                    "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
+                    "키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
+                    "아래 문구를 정확하게 읽어주세요.\n\n"
+                    f"\"제 닉네임은 {user_nickname}입니다. 오늘은 OO월 OO일, 초대자 ■■입니다. {selected_ment}\"\n\n"
+                    "조용한 곳에서 천천히 또박또박 부탁드립니다."
+                )
+                
+                # 4. 상태 업데이트
+                validation_sheet.update_acell(f'L{row_index}', '음성대기')
+                
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
                     line_bot_api.reply_message_with_http_info(
                         ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                     )
         except Exception as e:
-            print(f"시트 조회/수정 에러: {e}")
-            
-        return # 이 return은 if문 블록 내에 위치해야 합니다.
-    # 📂 4. 슬래시(/) 명령어 로직
+            print(f"인증멘트 로직 에러: {e}")
+        return
+
+     # 📂 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
 
