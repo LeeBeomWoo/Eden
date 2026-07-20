@@ -330,10 +330,16 @@ def handle_message(event):
                 col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
                 col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
                 
-                if "남" in user_gender:
+                # 수정된 로직 예시
+                if user_gender in ["남", "남자"]:
+                    # 남성일 때 남성용 멘트 선택
                     selected_ment = random.choice(col_male) if col_male else "인증 문구가 준비 중입니다."
-                else:
+                elif user_gender in ["여", "여자"]:
+                    # 여성일 때 여성용 멘트 선택
                     selected_ment = random.choice(col_female) if col_female else "인증 문구가 준비 중입니다."
+                else:
+                    # 예외 처리
+                    selected_ment = "성별 정보가 올바르지 않습니다."
 
                 reply_text = (
                     "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
