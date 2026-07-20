@@ -128,10 +128,20 @@ def handle_message(event):
             if field_line:
                 parts = field_line[0].split(":")
                 if len(parts) < 2 or not parts[1].strip():
+                    # 성별이 '여자' 또는 '여'인 경우 군필여부 누락 검사 예외 처리
+                    if display_name == "군필여부":
+                        gender_val = extracted_data.get("성별", "").strip()
+                        if gender_val in ["여자", "여"]:
+                            continue
                     missing_fields.append(display_name)
                 else:
                     extracted_data[display_name] = parts[1].strip()
             else:
+                # 라인 자체가 아예 없는 경우에도 성별이 '여자' 또는 '여'면 군필여부 누락 예외 처리
+                if display_name == "군필여부":
+                    gender_val = extracted_data.get("성별", "").strip()
+                    if gender_val in ["여자", "여"]:
+                        continue
                 missing_fields.append(display_name)
                 
         if not missing_fields:
