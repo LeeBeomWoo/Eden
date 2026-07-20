@@ -75,6 +75,31 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
+    # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
+    if user_message == ".":
+        if user_id in notified_users:
+            del notified_users[user_id]
+        
+        try:
+            col_k = validation_sheet.col_values(11)
+            if user_id in col_k:
+                row_index = col_k.index(user_id) + 1
+                validation_sheet.update_cell(row_index, 11, "")
+                validation_sheet.update_cell(row_index, 12, "")
+        except Exception as e:
+            print(f"초기화 시트 에러: {e}")
+            
+        reply_text = "🔄 임시 저장된 데이터와 인증 진행 상태가 초기화되었습니다. 신입 인증 양식을 처음부터 다시 작성해 주세요!"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+        return
+
     # 🛠️ 1. 그룹/룸 고유 아이디 확인 명령어
     if user_message == "/여긴어디?":
         source_type = event.source.type
@@ -129,7 +154,6 @@ def handle_message(event):
             if field_line:
                 parts = field_line[0].split(":")
                 if len(parts) < 2 or not parts[1].strip():
-                    # 성별이 '여자' 또는 '여'인 경우 군필여부 누락 검사 예외 처리
                     if display_name == "군필여부":
                         gender_val = extracted_data.get("성별", "").strip()
                         if gender_val in ["여자", "여"]:
@@ -138,13 +162,18 @@ def handle_message(event):
                 else:
                     extracted_data[display_name] = parts[1].strip()
             else:
-                # 라인 자체가 아예 없는 경우에도 성별이 '여자' 또는 '여'면 군필여부 누락 예외 처리
                 if display_name == "군필여부":
                     gender_val = extracted_data.get("성별", "").strip()
                     if gender_val in ["여자", "여"]:
                         continue
                 missing_fields.append(display_name)
                 
+        # 🔍 성별 유효성 검사 추가 (남, 여, 남자, 여자 중 하나만 허용)
+        gender_value = extracted_data.get("성별", "").strip()
+        if gender_value and gender_value not in ["남", "여", "남자", "여자"]:
+            if "성별 (남, 여, 남자, 여자 중 하나만 입력)" not in missing_fields:
+                missing_fields.append("성별 (남, 여, 남자, 여자 중 하나만 입력)")
+
         if not missing_fields:
             nickname = extracted_data["닉네임(두글자)"].strip()
             birth_year = extracted_data["년생"].strip()
@@ -159,7 +188,7 @@ def handle_message(event):
                 is_id_matched = False
                 alert_status = ""
                 color_emoji = ""
-                found_black_reasons = [] # 발견된 블랙 사유 저장용
+                found_black_reasons = [] 
                 
                 for record in all_records:
                     rec_id = str(record.get("아이디", "")).strip()
@@ -169,16 +198,13 @@ def handle_message(event):
                     rec_region = str(record.get("사는지역", "")).strip()
                     rec_black = str(record.get("블랙사유", "")).strip()
                     
-                    # 1. 고유 ID 또는 닉네임이 매칭될 때 해당 행에 블랙사유가 적혀있으면 수집
                     if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
                         if rec_black:
                             found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
 
-                    # 2. 고유 라인 ID 일치 체크 (재입장 여부)
                     if rec_id and rec_id == str(user_id).strip():
                         is_id_matched = True
 
-                    # 3. 닉네임 일치 기반 정보 중복 판정
                     if rec_name == nickname:
                         match_score = 0
                         if rec_year == birth_year: match_score += 1
@@ -188,7 +214,6 @@ def handle_message(event):
                         if match_score == 3:
                             alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
                             color_emoji = "🔴"
-                            # 적색경고여도 블랙사유를 끝까지 다 찾아야 하므로 break하지 않고 계속 돕니다.
                         elif match_score in [1, 2]:
                             if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
                                 alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
@@ -198,21 +223,17 @@ def handle_message(event):
                                 alert_status = "🔵 [주의] 닉네임 일치 유저"
                                 color_emoji = "🟦"
 
-                # 4. 재입장 유저 판정 (정보 중복이 없고 ID만 매칭될 때)
                 if is_id_matched and not alert_status:
                     alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
                     color_emoji = "🟪"
 
-                # 5. [핵심] 블랙리스트 기록이 한 건이라도 발견된 경우 분류 상태를 강제로 '블랙 유저 감지'로 격상시킵니다.
                 if found_black_reasons:
                     alert_status = "💀 [위험] 블랙리스트 유저 감지"
                     color_emoji = "⚫"
 
-                # 경고/알림/블랙이 트리거되었을 때 알림 발송
                 if alert_status:
                     black_section = ""
                     if found_black_reasons:
-                        # 중복된 사유가 들어올 수 있으므로 깔끔하게 정렬 및 고유화
                         unique_reasons = list(set(found_black_reasons))
                         reasons_str = "\n".join(unique_reasons)
                         black_section = f"⚠️ [시트 내역 블랙 사유]\n{reasons_str}\n\n"
@@ -238,19 +259,14 @@ def handle_message(event):
             except Exception as filter_err:
                 print(f"중복 필터링 시스템 에러: {filter_err}")
 
-            # 📊 시트 구조 순서대로 행 삽입 (A~F열 순서 유지, 신입은 기본 블랙사유 빈칸)
-                        # 📊 [수정된 로직] 중복 판정 및 재시도 횟수 업데이트
             try:
-                # 1. 시트 전체 데이터 확인
-                all_data = validation_sheet.get_all_values() # 헤더 포함 전체 행
+                all_data = validation_sheet.get_all_values() 
                 found_row_index = -1
                 current_retry_count = 0
 
-                # 2. 아이디(E열=5번째)가 일치하는 행 찾기
                 for idx, row in enumerate(all_data):
                     if len(row) >= 5 and str(row[4]).strip() == str(user_id).strip():
-                        found_row_index = idx + 1 # 1부터 시작하는 행 번호
-                        # H열(8번째)의 기존 숫자 가져오기 (없으면 0)
+                        found_row_index = idx + 1 
                         try:
                             count_val = row[7] if len(row) >= 8 else "0"
                             current_retry_count = int(count_val) if count_val.isdigit() else 0
@@ -259,13 +275,10 @@ def handle_message(event):
                         break
 
                 if found_row_index != -1:
-                    # [재시도 시] 기존 행 덮어쓰기 + 횟수 +1 증가
                     new_count = current_retry_count + 1
                     update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
-                    # A열부터 H열까지 한 번에 업데이트
                     validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
                 else:
-                    # [최초 입장 시] 새 행 추가
                     row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
                     validation_sheet.append_row(row_to_insert)
 
@@ -276,9 +289,9 @@ def handle_message(event):
                           "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
                           "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
                           "읽고 확인이라고 입력해 주세요")
-            # 👇 [여기에 추가!] 유저 ID와 '입장대기' 상태를 검증 시트에 기록
+            
             try:
-                col_k = validation_sheet.col_values(11) # K열(인증중인 아이디)
+                col_k = validation_sheet.col_values(11) 
                 next_row = len(col_k) + 1
                 validation_sheet.update_acell(f'K{next_row}', user_id)
                 validation_sheet.update_acell(f'L{next_row}', '입장대기')
@@ -286,9 +299,9 @@ def handle_message(event):
                 print(f"시트 업데이트 에러: {e}")
         else:
             fields_str = "\n".join(f"- {f}" for f in missing_fields)
-            reply_text = ("⚠️ 작성 내용 중 누락되었거나 비어있는 항목이 있습니다!\n\n"
+            reply_text = ("⚠️ 작성 내용 중 누락되었거나 형식이 올바르지 않은 항목이 있습니다!\n\n"
                           f"📝 다시 채워주셔야 할 항목:\n{fields_str}\n\n"
-                          "복사하신 본문 양식의 콜론(:) 오른쪽에 내용을 빠.짐.없.이. 작성해서 다시 보내주세요! 😢")
+                          "성별은 **'남', '여', '남자', '여자'** 중 하나만 입력해주시고, 양식을 정확히 확인하여 다시 보내주세요! 😢")
                           
         if reply_text:
             with ApiClient(configuration) as api_client:
@@ -299,32 +312,26 @@ def handle_message(event):
         return
 
     
-    # 🤝 3. 안내 확인 답변 처리 (수정된 섹션)
+    # 🤝 3. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
             col_k = validation_sheet.col_values(11)
             if user_id in col_k:
                 row_index = col_k.index(user_id) + 1
                 
-                # 1. 성별 데이터 가져오기 및 공백 제거
                 user_gender = str(validation_sheet.cell(row_index, 2).value).strip()
                 user_nickname = str(validation_sheet.cell(row_index, 1).value).strip()
                 
-                # 2. '녹음' 시트에서 데이터 가져오기
                 recording_sheet = client.open("인증멘트").worksheet("녹음")
                 
-                # [수정] 데이터가 있는 모든 행을 가져와서 빈칸은 제거
-                # A열(1열) = 남자, B열(2열) = 여자
                 col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
                 col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
                 
-                # 성별 판정 (남/여 또는 남자/여자 모두 처리)
                 if "남" in user_gender:
                     selected_ment = random.choice(col_male) if col_male else "인증 문구가 준비 중입니다."
                 else:
                     selected_ment = random.choice(col_female) if col_female else "인증 문구가 준비 중입니다."
 
-                # 3. 안내 문구 구성
                 reply_text = (
                     "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
                     "키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
@@ -333,7 +340,6 @@ def handle_message(event):
                     "조용한 곳에서 천천히 또박또박 부탁드립니다."
                 )
                 
-                # 4. 상태 업데이트
                 validation_sheet.update_acell(f'L{row_index}', '음성대기')
                 
                 with ApiClient(configuration) as api_client:
@@ -396,7 +402,7 @@ def handle_member_joined(event):
         " - 닉네임(두글자):\n"
         " - 년생:\n"
         " - 나이: (만나이 ❌️)\n"
-        " - 성별:\n"
+        " - 성별(남/여/남자/여자 중 하나만 입력):\n"
         " - 지역(시까지, 단 서울 및 광역시는 구까지):\n"
         " - 결혼유무(기/미/돌):\n"
         " - 군필여부(남자만):\n"
