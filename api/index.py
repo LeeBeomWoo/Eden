@@ -59,7 +59,6 @@ def get_recording_ments():
     """녹음 멘트를 Redis 캐시에서 우선 조회 (캐시 유효시간: 1시간 = 3600초)"""
     cache_key = "cache:recording_ments"
     
-    # 1. Redis 캐시 확인
     if redis:
         try:
             cached_val = redis.get(cache_key)
@@ -69,13 +68,11 @@ def get_recording_ments():
         except Exception as e:
             print(f"Redis 읽기 에러 (녹음): {e}")
 
-    # 2. 캐시 미스 시 구글 시트 호출
     try:
         recording_sheet = client.open("인증멘트").worksheet("녹음")
         col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
         col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
         
-        # 3. Redis에 캐싱 (1시간 유지)
         if redis:
             try:
                 payload = json.dumps({"male": col_male, "female": col_female})
@@ -172,9 +169,12 @@ def handle_message(event):
             del notified_users[user_id]
             
         try:
-            user_ids = validation_sheet.col_values(5)
-            if user_id in user_ids:
-                row_index = user_ids.index(user_id) + 1
+            raw_user_ids = validation_sheet.col_values(5)
+            clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+            current_user_id = str(user_id).strip()
+            
+            if current_user_id in clean_user_ids:
+                row_index = clean_user_ids.index(current_user_id) + 1
                 validation_sheet.update_cell(row_index, 11, "")
                 validation_sheet.update_cell(row_index, 12, "")
         except Exception as e:
@@ -212,7 +212,7 @@ def handle_message(event):
             
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
+            line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[TextMessage(text=reply_text)]
@@ -220,156 +220,177 @@ def handle_message(event):
             )
         return
 
-            if not missing_fields:
-            nickname = extracted_data["닉네임(두글자)"].strip()
-            birth_year = extracted_data["년생"].strip()
-            gender = extracted_data["성별"].strip()
-            region = extracted_data["지역"].strip()
-            current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    # 📝 2. 신입 인증 양식 제출 처리
+    if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
+        extracted_data = {}
+        for line in user_message.split("\n"):
+            delimiter = ":" if ":" in line else ("：" if "：" in line else None)
+            if delimiter:
+                parts = line.split(delimiter, 1)
+                key_name = parts[0].replace("-", "").strip()
+                extracted_data[key_name] = parts[1].strip()
 
-            # -------------------------------------------------------------
-            # [1단계] 중복 필터링 및 관리자 알림 (에러 발생해도 시트 저장은 진행)
-            # -------------------------------------------------------------
-            try:
-                all_records = validation_sheet.get_all_records()
-                is_id_matched = False
-                alert_status = ""
-                color_emoji = ""
-                found_black_reasons = [] 
+        missing_fields = []
+        for req_field in ["닉네임(두글자)", "년생", "성별", "지역"]:
+            if not extracted_data.get(req_field):
+                missing_fields.append(req_field)
+
+        if missing_fields:
+            reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n빠짐없이 작성 후 다시 제출해 주세요!"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                )
+            return
+
+        # 모든 필수 항목이 채워진 경우 처리
+        nickname = extracted_data["닉네임(두글자)"].strip()
+        birth_year = extracted_data["년생"].strip()
+        gender = extracted_data["성별"].strip()
+        region = extracted_data["지역"].strip()
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # [단계 A] 중복 필터링 및 관리자 알림
+        try:
+            all_records = validation_sheet.get_all_records()
+            is_id_matched = False
+            alert_status = ""
+            color_emoji = ""
+            found_black_reasons = [] 
+            
+            for record in all_records:
+                rec_id = str(record.get("아이디", "")).strip()
+                rec_name = str(record.get("닉네임", "")).strip()
+                rec_year = str(record.get("년생", "")).strip()
+                rec_gender = str(record.get("성별", "")).strip()
+                rec_region = str(record.get("사는지역", "")).strip()
+                rec_black = str(record.get("블랙사유", "")).strip()
                 
-                for record in all_records:
-                    rec_id = str(record.get("아이디", "")).strip()
-                    rec_name = str(record.get("닉네임", "")).strip()
-                    rec_year = str(record.get("년생", "")).strip()
-                    rec_gender = str(record.get("성별", "")).strip()
-                    rec_region = str(record.get("사는지역", "")).strip()
-                    rec_black = str(record.get("블랙사유", "")).strip()
-                    
-                    if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
-                        if rec_black:
-                            found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
+                if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
+                    if rec_black:
+                        found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
 
-                    if rec_id and rec_id == str(user_id).strip():
-                        is_id_matched = True
+                if rec_id and rec_id == str(user_id).strip():
+                    is_id_matched = True
 
-                    if rec_name == nickname:
-                        match_score = 0
-                        if rec_year == birth_year: match_score += 1
-                        if rec_gender == gender: match_score += 1
-                        if rec_region == region: match_score += 1
+                if rec_name == nickname:
+                    match_score = 0
+                    if rec_year == birth_year: match_score += 1
+                    if rec_gender == gender: match_score += 1
+                    if rec_region == region: match_score += 1
 
-                        if match_score == 3:
-                            alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
-                            color_emoji = "🔴"
-                        elif match_score in [1, 2]:
-                            if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
-                                alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
-                                color_emoji = "🟡"
-                        else:
-                            if not alert_status:
-                                alert_status = "🔵 [주의] 닉네임 일치 유저"
-                                color_emoji = "🟦"
+                    if match_score == 3:
+                        alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
+                        color_emoji = "🔴"
+                    elif match_score in [1, 2]:
+                        if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
+                            alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
+                            color_emoji = "🟡"
+                    else:
+                        if not alert_status:
+                            alert_status = "🔵 [주의] 닉네임 일치 유저"
+                            color_emoji = "🟦"
 
-                if is_id_matched and not alert_status:
-                    alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
-                    color_emoji = "🟪"
+            if is_id_matched and not alert_status:
+                alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
+                color_emoji = "🟪"
 
+            if found_black_reasons:
+                alert_status = "💀 [위험] 블랙리스트 유저 감지"
+                color_emoji = "⚫"
+
+            if alert_status:
+                black_section = ""
                 if found_black_reasons:
-                    alert_status = "💀 [위험] 블랙리스트 유저 감지"
-                    color_emoji = "⚫"
+                    unique_reasons = list(set(found_black_reasons))
+                    reasons_str = "\n".join(unique_reasons)
+                    black_section = f"⚠️ [시트 내역 블랙 사유]\n{reasons_str}\n\n"
 
-                if alert_status:
-                    black_section = ""
-                    if found_black_reasons:
-                        unique_reasons = list(set(found_black_reasons))
-                        reasons_str = "\n".join(unique_reasons)
-                        black_section = f"⚠️ [시트 내역 블랙 사유]\n{reasons_str}\n\n"
-
-                    alert_text = (
-                        f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
-                        f"📌 분류 상태: {alert_status}\n"
-                        f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
-                        f"📍 입력 지역/성별: {region} / {gender}\n"
-                        f"🆔 유저 고유 ID:\n{user_id}\n\n"
-                        f"{black_section}"
-                        f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
-                    )
-                    
-                    with ApiClient(configuration) as api_client:
-                        line_bot_api = MessagingApi(api_client)
-                        line_bot_api.push_message(
-                            PushMessageRequest(
-                                to=ADMIN_GROUP_CHAT_ID,
-                                messages=[TextMessage(text=alert_text)]
-                            )
+                alert_text = (
+                    f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
+                    f"📌 분류 상태: {alert_status}\n"
+                    f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
+                    f"📍 입력 지역/성별: {region} / {gender}\n"
+                    f"🆔 유저 고유 ID:\n{user_id}\n\n"
+                    f"{black_section}"
+                    f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
+                )
+                
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.push_message(
+                        PushMessageRequest(
+                            to=ADMIN_GROUP_CHAT_ID,
+                            messages=[TextMessage(text=alert_text)]
                         )
-            except Exception as filter_err:
-                print(f"중복 필터링 에러 (무시하고 저장 진행): {filter_err}")
+                    )
+        except Exception as filter_err:
+            print(f"중복 필터링 에러 (저장은 정상 진행): {filter_err}")
 
-            # -------------------------------------------------------------
-            # [2단계] 선(先) 구글 시트 저장 처리
-            # -------------------------------------------------------------
-            save_success = False
-            try:
-                # 5번째 열(E열) ID 목록 불러오기
-                raw_user_ids = validation_sheet.col_values(5)
-                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                current_user_id = str(user_id).strip()
+        # [단계 B] 선(先) 구글 시트 저장 처리
+        save_success = False
+        try:
+            raw_user_ids = validation_sheet.col_values(5)
+            clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+            current_user_id = str(user_id).strip()
 
-                if current_user_id in clean_user_ids:
-                    # 기존 유저 정보 업데이트
-                    found_row_index = clean_user_ids.index(current_user_id) + 1
-                    row_data = validation_sheet.row_values(found_row_index)
-                    
-                    # 시도 횟수 계산
-                    count_val = row_data[7] if len(row_data) >= 8 else "0"
-                    current_retry_count = int(count_val) if count_val.isdigit() else 0
-                    new_count = current_retry_count + 1
-                    
-                    update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
-                    validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
-                else:
-                    # 신규 유저 행 추가
-                    row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
-                    validation_sheet.append_row(row_to_insert)
-
-                # 상태 업데이트 (K/L열)
-                col_k = validation_sheet.col_values(11) 
-                next_row = len(col_k) + 1
-                validation_sheet.update_acell(f'K{next_row}', user_id)
-                validation_sheet.update_acell(f'L{next_row}', '입장대기')
-
-                save_success = True  # 구글 시트 저장 완벽 성공!
-
-            except Exception as sheet_err:
-                print(f"🚨 구글 시트 저장 최종 실패: {sheet_err}")
-                save_success = False
-
-            # -------------------------------------------------------------
-            # [3단계] 시트 저장 결과에 따른 유저 응답 발송
-            # -------------------------------------------------------------
-            if save_success:
-                notified_users[user_id] = {"nickname": nickname}
-                reply_text = (
-                    "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
-                    "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
-                    "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
-                    "읽고 확인이라고 입력해 주세요"
-                )
+            if current_user_id in clean_user_ids:
+                found_row_index = clean_user_ids.index(current_user_id) + 1
+                row_data = validation_sheet.row_values(found_row_index)
+                
+                count_val = row_data[7] if len(row_data) >= 8 else "0"
+                current_retry_count = int(count_val) if count_val.isdigit() else 0
+                new_count = current_retry_count + 1
+                
+                update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
+                validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
             else:
-                reply_text = (
-                    "⚠️ 양식은 정상적으로 작성되었으나, 서버/시트 통신 문제로 저장에 실패했습니다.\n\n"
-                    "잠시 후 양식을 다시 제출해 주시거나 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
-                )
+                row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
+                validation_sheet.append_row(row_to_insert)
 
+            col_k = validation_sheet.col_values(11) 
+            next_row = len(col_k) + 1
+            validation_sheet.update_acell(f'K{next_row}', user_id)
+            validation_sheet.update_acell(f'L{next_row}', '입장대기')
 
-    # 🤝 3. 안내 확인 답변 처리 (E열 조회 + Redis 녹음 멘트 캐시 적용)
+            save_success = True
+
+        except Exception as sheet_err:
+            print(f"🚨 구글 시트 저장 최종 실패: {sheet_err}")
+            save_success = False
+
+        # [단계 C] 시트 저장 결과에 따른 유저 응답 발송
+        if save_success:
+            notified_users[user_id] = {"nickname": nickname}
+            reply_text = (
+                "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
+                "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
+                "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
+                "읽고 확인이라고 입력해 주세요"
+            )
+        else:
+            reply_text = (
+                "⚠️ 양식은 정상적으로 작성되었으나, 서버/시트 통신 문제로 저장에 실패했습니다.\n\n"
+                "잠시 후 양식을 다시 제출해 주시거나 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
+            )
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+            )
+        return
+
+    # 🤝 3. 안내 확인 답변 처리 (E열 공백 제거 비교 + Redis 녹음 멘트 캐시 적용)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
-            user_ids = validation_sheet.col_values(5)
+            raw_user_ids = validation_sheet.col_values(5)
+            clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+            current_user_id = str(user_id).strip()
             
-            if user_id in user_ids:
-                row_index = user_ids.index(user_id) + 1
+            if current_user_id in clean_user_ids:
+                row_index = clean_user_ids.index(current_user_id) + 1
                 row_data = validation_sheet.row_values(row_index)
                 
                 sheet_nickname = row_data[0].strip() if len(row_data) > 0 else ""
@@ -377,7 +398,7 @@ def handle_message(event):
                 
                 user_nickname = notified_users.get(user_id, {}).get("nickname", sheet_nickname)
                 
-                # 💡 [Upstash Redis 적용] 녹음 멘트 불러오기
+                # Redis 녹음 멘트 불러오기
                 col_male, col_female = get_recording_ments()
 
                 if user_gender in ["남", "남자"]:
@@ -420,7 +441,7 @@ def handle_message(event):
                 )
         return
 
-    # 📂 4. 슬래시(/) 명령어 로직 (Redis 캐싱된 함수 사용)
+    # 📂 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
 
@@ -428,13 +449,13 @@ def handle_message(event):
     
     if command.startswith("인증 "):
         search_query = command.replace("인증 ", "").strip()
-        result = search_keyword(search_query) # 💡 Redis 적용
+        result = search_keyword(search_query)
         if result:
             reply_text = result
         else:
             reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
     elif command == "목록":
-        keywords = get_all_keywords() # 💡 Redis 적용
+        keywords = get_all_keywords()
         if keywords:
             list_text = "\n".join(f"- {k}" for k in keywords)
             reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
@@ -458,8 +479,6 @@ def handle_message(event):
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
-    user_id = event.joined.members[0].user_id if event.joined.members else None
-    
     welcome_text = (
         "안녕하세요\n"
         "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
