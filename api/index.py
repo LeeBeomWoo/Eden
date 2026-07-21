@@ -220,64 +220,18 @@ def handle_message(event):
             )
         return
 
-    # 📝 2. 신입 인증 양식 검사 및 중복 데이터 필터링 로직
-    if "닉네임" in user_message and "년생" in user_message and "성별" in user_message:
-        if user_id in notified_users:
-            del notified_users[user_id]
-            
-        lines = user_message.split("\n")
-        missing_fields = []
-        
-        required_fields = [
-            ("닉네임(두글자)", "닉네임(두글자)"),
-            ("년생", "년생"),
-            ("나이:", "나이"),
-            ("성별", "성별"),
-            ("지역", "지역"),
-            ("결혼유무", "결혼유무"),
-            ("군필여부", "군필여부"),
-            ("초대자", "초대자"),
-            ("야단라경험유무", "야단라경험유무"),
-            ("기존 다른방에서 나온이유", "기존 다른방에서 나온이유"),
-            ("다른 방에서 킥을 당한적 있는지", "다른 방에서 킥을 당한적 있는지")
-        ]
-        
-        extracted_data = {display_name: "" for _, display_name in required_fields}
-        
-        for search_key, display_name in required_fields:
-            field_line = [l for l in lines if search_key in l]
-            if field_line:
-                parts = field_line[0].split(":")
-                if len(parts) < 2 or not parts[1].strip():
-                    if display_name == "군필여부":
-                        gender_val = extracted_data.get("성별", "").strip()
-                        if gender_val in ["여자", "여"]:
-                            continue
-                    missing_fields.append(display_name)
-                else:
-                    extracted_data[display_name] = parts[1].strip()
-            else:
-                if display_name == "군필여부":
-                    gender_val = extracted_data.get("성별", "").strip()
-                    if gender_val in ["여자", "여"]:
-                        continue
-                missing_fields.append(display_name)
-                
-        gender_value = extracted_data.get("성별", "").strip()
-        if gender_value and gender_value not in ["남", "여", "남자", "여자"]:
-            if "성별 (남, 여, 남자, 여자 중 하나만 입력)" not in missing_fields:
-                missing_fields.append("성별 (남, 여, 남자, 여자 중 하나만 입력)")
-
-        if not missing_fields:
+            if not missing_fields:
             nickname = extracted_data["닉네임(두글자)"].strip()
             birth_year = extracted_data["년생"].strip()
             gender = extracted_data["성별"].strip()
             region = extracted_data["지역"].strip()
             current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
+            # -------------------------------------------------------------
+            # [1단계] 중복 필터링 및 관리자 알림 (에러 발생해도 시트 저장은 진행)
+            # -------------------------------------------------------------
             try:
                 all_records = validation_sheet.get_all_records()
-                
                 is_id_matched = False
                 alert_status = ""
                 color_emoji = ""
@@ -350,63 +304,64 @@ def handle_message(event):
                             )
                         )
             except Exception as filter_err:
-                print(f"중복 필터링 시스템 에러: {filter_err}")
+                print(f"중복 필터링 에러 (무시하고 저장 진행): {filter_err}")
 
+            # -------------------------------------------------------------
+            # [2단계] 선(先) 구글 시트 저장 처리
+            # -------------------------------------------------------------
+            save_success = False
             try:
-                all_data = validation_sheet.get_all_values() 
-                found_row_index = -1
-                current_retry_count = 0
+                # 5번째 열(E열) ID 목록 불러오기
+                raw_user_ids = validation_sheet.col_values(5)
+                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                current_user_id = str(user_id).strip()
 
-                for idx, row in enumerate(all_data):
-                    if len(row) >= 5 and str(row[4]).strip() == str(user_id).strip():
-                        found_row_index = idx + 1 
-                        try:
-                            count_val = row[7] if len(row) >= 8 else "0"
-                            current_retry_count = int(count_val) if count_val.isdigit() else 0
-                        except:
-                            current_retry_count = 0
-                        break
-
-                if found_row_index != -1:
+                if current_user_id in clean_user_ids:
+                    # 기존 유저 정보 업데이트
+                    found_row_index = clean_user_ids.index(current_user_id) + 1
+                    row_data = validation_sheet.row_values(found_row_index)
+                    
+                    # 시도 횟수 계산
+                    count_val = row_data[7] if len(row_data) >= 8 else "0"
+                    current_retry_count = int(count_val) if count_val.isdigit() else 0
                     new_count = current_retry_count + 1
+                    
                     update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
                     validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
                 else:
+                    # 신규 유저 행 추가
                     row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
                     validation_sheet.append_row(row_to_insert)
 
-            except Exception as sheet_err:
-                print(f"구글 시트 입력/수정 실패: {sheet_err}")
-
-            notified_users[user_id] = {
-                "nickname": nickname
-            }
-            reply_text = ("저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
-                          "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
-                          "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
-                          "읽고 확인이라고 입력해 주세요")
-            
-            try:
+                # 상태 업데이트 (K/L열)
                 col_k = validation_sheet.col_values(11) 
                 next_row = len(col_k) + 1
                 validation_sheet.update_acell(f'K{next_row}', user_id)
                 validation_sheet.update_acell(f'L{next_row}', '입장대기')
-            except Exception as e:
-                print(f"시트 업데이트 에러: {e}")
-        else:
-            fields_str = "\n".join(f"- {f}" for f in missing_fields)
-            reply_text = ("⚠️ 작성 내용 중 누락되었거나 형식이 올바르지 않은 항목이 있습니다!\n"
-                          "기존양식을 건드리지 마시고 각 항목에 : ←이 표시 이후에 답변작성\n\n"
-                          f"📝 다시 채워주셔야 할 항목:\n{fields_str}\n\n"
-                          "성별은 **'남', '여', '남자', '여자'** 중 하나만 입력해주시고, 양식을 정확히 확인하여 다시 보내주세요! 😢")
-                          
-        if reply_text:
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+
+                save_success = True  # 구글 시트 저장 완벽 성공!
+
+            except Exception as sheet_err:
+                print(f"🚨 구글 시트 저장 최종 실패: {sheet_err}")
+                save_success = False
+
+            # -------------------------------------------------------------
+            # [3단계] 시트 저장 결과에 따른 유저 응답 발송
+            # -------------------------------------------------------------
+            if save_success:
+                notified_users[user_id] = {"nickname": nickname}
+                reply_text = (
+                    "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
+                    "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
+                    "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
+                    "읽고 확인이라고 입력해 주세요"
                 )
-        return
+            else:
+                reply_text = (
+                    "⚠️ 양식은 정상적으로 작성되었으나, 서버/시트 통신 문제로 저장에 실패했습니다.\n\n"
+                    "잠시 후 양식을 다시 제출해 주시거나 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
+                )
+
 
     # 🤝 3. 안내 확인 답변 처리 (E열 조회 + Redis 녹음 멘트 캐시 적용)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
