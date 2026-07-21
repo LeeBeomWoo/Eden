@@ -320,7 +320,8 @@ def handle_message(event):
                 print(f"시트 업데이트 에러: {e}")
         else:
             fields_str = "\n".join(f"- {f}" for f in missing_fields)
-            reply_text = ("⚠️ 작성 내용 중 누락되었거나 형식이 올바르지 않은 항목이 있습니다!\n\n"
+            reply_text = ("⚠️ 작성 내용 중 누락되었거나 형식이 올바르지 않은 항목이 있습니다!\n"
+                          "기존양식을 건드리지 마시고 각 항목에 : ←이 표시 이후에 답변작성\n\n"
                           f"📝 다시 채워주셔야 할 항목:\n{fields_str}\n\n"
                           "성별은 **'남', '여', '남자', '여자'** 중 하나만 입력해주시고, 양식을 정확히 확인하여 다시 보내주세요! 😢")
                           
