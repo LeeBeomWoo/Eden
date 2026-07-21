@@ -502,4 +502,4 @@ def handle_member_joined(event):
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_text)])
-        )
+    )
