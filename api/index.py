@@ -236,7 +236,8 @@ def handle_message(event):
                 missing_fields.append(req_field)
 
         if missing_fields:
-            reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n빠짐없이 작성 후 다시 제출해 주세요!"
+            reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n빠짐없이 작성 후 다시 제출해 주세요!\n\n"
+            "기존양식은 건들지 말고, : ← 표시 뒤에 입력하여주세요.\n"
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
