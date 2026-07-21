@@ -223,13 +223,50 @@ def handle_message(event):
     # 📝 2. 신입 인증 양식 제출 처리
     if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
         extracted_data = {}
+
         for line in user_message.split("\n"):
             delimiter = ":" if ":" in line else ("：" if "：" in line else None)
             if delimiter:
                 parts = line.split(delimiter, 1)
+
+                # 항목명 정리
                 key_name = parts[0].replace("-", "").strip()
+
+                # 괄호 안 설명 제거
+                if "(" in key_name:
+                    key_name = key_name.split("(", 1)[0].strip()
+
                 extracted_data[key_name] = parts[1].strip()
 
+        missing_fields = []
+        for req_field in ["닉네임", "년생", "성별", "지역"]:
+            if not extracted_data.get(req_field):
+                missing_fields.append(req_field)
+
+        if missing_fields:
+            reply_text = (
+                f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n"
+                f"- {', '.join(missing_fields)}\n\n"
+                "빠짐없이 작성 후 다시 제출해 주세요!\n\n"
+                "기존양식은 건들지 말고, : ← 표시 뒤에 입력하여주세요."
+            )
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
+            return
+
+        # 모든 필수 항목이 채워진 경우 처리
+        nickname = extracted_data["닉네임"].strip()
+        birth_year = extracted_data["년생"].strip()
+        gender = extracted_data["성별"].strip()
+        region = extracted_data["지역"].strip()
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
         missing_fields = []
         for req_field in ["닉네임(두글자)", "년생", "성별", "지역"]:
             if not extracted_data.get(req_field):
@@ -244,13 +281,6 @@ def handle_message(event):
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                 )
             return
-
-        # 모든 필수 항목이 채워진 경우 처리
-        nickname = extracted_data["닉네임(두글자)"].strip()
-        birth_year = extracted_data["년생"].strip()
-        gender = extracted_data["성별"].strip()
-        region = extracted_data["지역"].strip()
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
         # [단계 A] 중복 필터링 및 관리자 알림
         try:
