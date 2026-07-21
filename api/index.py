@@ -523,7 +523,7 @@ def handle_member_joined(event):
         "⭕️아래의 본문을 복사해서 빠.짐.없.이. 작성해주세요.\n\n"
         " - 닉네임(두글자):\n"
         " - 년생:\n"
-        " - 나이: (만나이 ❌️)\n"
+        " - 나이: (만나이 ❌️):\n"
         " - 성별(남/여/남자/여자 중 하나만 입력):\n"
         " - 지역(시까지, 단 서울 및 광역시는 구까지):\n"
         " - 결혼유무(기/미/돌):\n"
@@ -533,7 +533,22 @@ def handle_member_joined(event):
         " - 기존 다른방에서 나온이유(없다면 무) :\n"
         " - 다른 방에서 킥을 당한적 있는지(있다면 사유도) :"
     )
-    # ==========================================
+    
+    # 💡 여기서 바로 메시지를 전송하도록 수정되었습니다.
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token, 
+                    messages=[TextMessage(text=welcome_text)]
+                )
+            )
+    except Exception as e:
+        print(f"환영인사 전송 에러: {e}")
+
+
+# ==========================================
 # [핸들러 3] 음성 메시지(음성 인증) 처리 핸들러
 # ==========================================
 @handler.add(MessageEvent, message=AudioMessageContent)
@@ -593,8 +608,24 @@ def handle_audio_message(event):
                         )
                     )
             else:
-                # 음성 대기 상태가 아닐 때 음성을 보낸 경우 (조용히 무시하거나 안내 가능)
                 pass
+
+    except Exception as e:
+        print(f"음성 메시지 처리 에러: {e}")
+        error_text = "⚠️ 음성 메시지 접수 중 시스템 오류가 발생했습니다. 잠시 후 다시 전송해 주세요."
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token, 
+                        messages=[TextMessage(text=error_text)]
+                    )
+                )
+        except:
+            pass
+
+                
 
     except Exception as e:
         print(f"음성 메시지 처리 에러: {e}")
