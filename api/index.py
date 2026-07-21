@@ -267,20 +267,7 @@ def handle_message(event):
         gender = extracted_data["성별"].strip()
         region = extracted_data["지역"].strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        missing_fields = []
-        for req_field in ["닉네임(두글자)", "년생", "성별", "지역"]:
-            if not extracted_data.get(req_field):
-                missing_fields.append(req_field)
-
-        if missing_fields:
-            reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n빠짐없이 작성 후 다시 제출해 주세요!\n\n"
-            "기존양식은 건들지 말고, : ← 표시 뒤에 입력하여주세요.\n"
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                )
-            return
+        
 
         # [단계 A] 중복 필터링 및 관리자 알림
         try:
