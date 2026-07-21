@@ -80,26 +80,42 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
+        # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
     if user_message == ".":
+        # 1. 딕셔너리 초기화 (서버 재시작 등의 이유로 없을 수도 있으므로 try/except 대신 if문 유지)
         if user_id in notified_users:
             del notified_users[user_id]
-            try:
-                # E열(User ID)에서 해당 사용자의 행 찾기
-                user_ids = validation_sheet.col_values(5)
-                if user_id in user_ids:
-                    row_index = user_ids.index(user_id) + 1
+            
+        # 2. 구글 시트 초기화
+        try:
+            # E열(User ID)에서 해당 사용자의 행 찾기
+            user_ids = validation_sheet.col_values(5)
+            if user_id in user_ids:
+                row_index = user_ids.index(user_id) + 1
 
-                    # K열과 L열만 비우기
-                    validation_sheet.update_cell(row_index, 11, "")
-                    validation_sheet.update_cell(row_index, 12, "")
-            except Exception as e:
-                print(f"초기화 시트 에러: {e}")
-                
-                reply_text = (
-                    "🔄 임시 저장된 데이터와 인증 진행 상태가 초기화되었습니다.\n"
-                    "신입 인증 양식을 처음부터 다시 작성해 주세요!"
+                # K열과 L열만 비우기
+                validation_sheet.update_cell(row_index, 11, "")
+                validation_sheet.update_cell(row_index, 12, "")
+        except Exception as e:
+            print(f"초기화 시트 에러: {e}")
+            
+        # 3. (중요) except 블록 밖으로 빼서 무조건 안내 메시지가 세팅되도록 변경
+        reply_text = (
+            "🔄 임시 저장된 데이터와 인증 진행 상태가 초기화되었습니다.\n"
+            "신입 인증 양식을 처음부터 다시 작성해 주세요!"
+        )
+
+        # 4. (중요) 메시지를 여기서 바로 전송하고 return 하여 아래 로직으로 넘어가지 않게 방어
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token, 
+                    messages=[TextMessage(text=reply_text)]
                 )
+            )
+        return
+
 
     # 🛠️ 1. 그룹/룸 고유 아이디 확인 명령어
     if user_message == "/여긴어디?":
