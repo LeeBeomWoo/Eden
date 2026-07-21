@@ -32,7 +32,6 @@ client = gspread.authorize(creds)
 
 # 유저 상태 기억용 전역 변수
 notified_users = {}
-last_joined_user_id = None
 
 # 구글 스프레드시트 연결
 sheet = client.open("인증멘트").worksheet("멘트")
@@ -72,11 +71,16 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id  
+    
+    # 💡 [해결 2] 봇 친구 추가 안 한 상태에서 그룹방 채팅 시 에러 방지
+    if not user_id:
+        # User ID를 불러올 수 없으면 이후 로직(시트 기록 등)이 고장나므로 무시합니다.
+        return 
+
     user_message = event.message.text.strip()
     reply_text = ""
 
     # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
-
     if user_message == ".":
         if user_id in notified_users:
             del notified_users[user_id]
@@ -399,9 +403,9 @@ def handle_message(event):
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
-    global last_joined_user_id
-    user_id = event.source.user_id
-    last_joined_user_id = user_id
+    
+    # 💡 [해결 1] 그룹 입장 시 정확한 user_id 추출
+    user_id = event.joined.members[0].user_id if event.joined.members else None
     
     welcome_text = (
         "안녕하세요\n"
