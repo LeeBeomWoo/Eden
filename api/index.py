@@ -268,48 +268,59 @@ def handle_message(event):
         gender = extracted_data["성별"].strip()
         region = extracted_data["지역"].strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        
 
-        # [단계 A] 중복 필터링 및 관리자 알림
+                # [단계 A] 중복 필터링 및 관리자 알림
         try:
-            all_records = validation_sheet.get_all_records()
+            # get_all_records() 대신 get_all_values()를 사용하여 빈 열 오류 방지
+            all_data = validation_sheet.get_all_values()
             is_id_matched = False
             alert_status = ""
             color_emoji = ""
             found_black_reasons = [] 
             
-            for record in all_records:
-                rec_id = str(record.get("아이디", "")).strip()
-                rec_name = str(record.get("닉네임", "")).strip()
-                rec_year = str(record.get("년생", "")).strip()
-                rec_gender = str(record.get("성별", "")).strip()
-                rec_region = str(record.get("사는지역", "")).strip()
-                rec_black = str(record.get("블랙사유", "")).strip()
-                
-                if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
-                    if rec_black:
-                        found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
+            if all_data and len(all_data) > 1:
+                headers = all_data[0]
+                # 각 항목의 열 번호(인덱스) 파악 (이름이 다를 경우 기본값 적용)
+                idx_id = headers.index("아이디") if "아이디" in headers else 4
+                idx_name = headers.index("닉네임") if "닉네임" in headers else 0
+                idx_year = headers.index("년생") if "년생" in headers else 3
+                idx_gender = headers.index("성별") if "성별" in headers else 1
+                idx_region = headers.index("사는지역") if "사는지역" in headers else 2
+                idx_black = headers.index("블랙사유") if "블랙사유" in headers else 6
 
-                if rec_id and rec_id == str(user_id).strip():
-                    is_id_matched = True
+                for row in all_data[1:]:
+                    # 데이터가 짧을 경우 빈 문자열 반환 방어
+                    rec_id = str(row[idx_id]).strip() if idx_id < len(row) else ""
+                    rec_name = str(row[idx_name]).strip() if idx_name < len(row) else ""
+                    rec_year = str(row[idx_year]).strip() if idx_year < len(row) else ""
+                    rec_gender = str(row[idx_gender]).strip() if idx_gender < len(row) else ""
+                    rec_region = str(row[idx_region]).strip() if idx_region < len(row) else ""
+                    rec_black = str(row[idx_black]).strip() if idx_black < len(row) else ""
+                    
+                    if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
+                        if rec_black:
+                            found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
 
-                if rec_name == nickname:
-                    match_score = 0
-                    if rec_year == birth_year: match_score += 1
-                    if rec_gender == gender: match_score += 1
-                    if rec_region == region: match_score += 1
+                    if rec_id and rec_id == str(user_id).strip():
+                        is_id_matched = True
 
-                    if match_score == 3:
-                        alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
-                        color_emoji = "🔴"
-                    elif match_score in [1, 2]:
-                        if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
-                            alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
-                            color_emoji = "🟡"
-                    else:
-                        if not alert_status:
-                            alert_status = "🔵 [주의] 닉네임 일치 유저"
-                            color_emoji = "🟦"
+                    if rec_name == nickname:
+                        match_score = 0
+                        if rec_year == birth_year: match_score += 1
+                        if rec_gender == gender: match_score += 1
+                        if rec_region == region: match_score += 1
+
+                        if match_score == 3:
+                            alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
+                            color_emoji = "🔴"
+                        elif match_score in [1, 2]:
+                            if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
+                                alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
+                                color_emoji = "🟡"
+                        else:
+                            if not alert_status:
+                                alert_status = "🔵 [주의] 닉네임 일치 유저"
+                                color_emoji = "🟦"
 
             if is_id_matched and not alert_status:
                 alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
@@ -347,7 +358,9 @@ def handle_message(event):
         except Exception as filter_err:
             print(f"중복 필터링 에러 (저장은 정상 진행): {filter_err}")
 
-        # [단계 B] 선(先) 구글 시트 저장 처리
+        
+
+                # [단계 B] 선(先) 구글 시트 저장 처리
         save_success = False
         try:
             raw_user_ids = validation_sheet.col_values(5)
@@ -355,6 +368,7 @@ def handle_message(event):
             current_user_id = str(user_id).strip()
 
             if current_user_id in clean_user_ids:
+                # 기존 유저 덮어쓰기
                 found_row_index = clean_user_ids.index(current_user_id) + 1
                 row_data = validation_sheet.row_values(found_row_index)
                 
@@ -365,19 +379,22 @@ def handle_message(event):
                 update_data = [nickname, gender, region, birth_year, user_id, current_date, "", new_count]
                 validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [update_data])
             else:
+                # 💡 신규 유저 추가 시에도 found_row_index 지정 (에러 원인 해결)
+                found_row_index = len(clean_user_ids) + 1 
                 row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
-                validation_sheet.append_row(row_to_insert)
+                
+                # append_row를 쓰지 않고 update로 명확하게 해당 줄에 삽입
+                validation_sheet.update(f'A{found_row_index}:H{found_row_index}', [row_to_insert])
 
-            col_k = validation_sheet.col_values(11) 
-            next_row = len(col_k) + 1
-            validation_sheet.update(f'K{found_row_index}:L{found_row_index}',
-                        [[user_id, "입장대기"]])
+            # 공통 K, L열 입장대기 기록
+            validation_sheet.update(f'K{found_row_index}:L{found_row_index}', [[user_id, "입장대기"]])
             
             save_success = True
 
         except Exception as sheet_err:
             print(f"🚨 구글 시트 저장 최종 실패: {sheet_err}")
             save_success = False
+
 
         # [단계 C] 시트 저장 결과에 따른 유저 응답 발송
         if save_success:
