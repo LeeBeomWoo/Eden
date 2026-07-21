@@ -343,7 +343,6 @@ def handle_message(event):
                     f"📌 분류 상태: {alert_status}\n"
                     f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
                     f"📍 입력 지역/성별: {region} / {gender}\n"
-                    f"🆔 유저 고유 ID:\n{user_id}\n\n"
                     f"{black_section}"
                     f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
                 )
@@ -584,7 +583,6 @@ def handle_audio_message(event):
                 admin_alert_text = (
                     f"🔔 [음성 인증 제출 완료]\n\n"
                     f"👤 닉네임: {nickname}\n"
-                    f"🆔 유저 고유 ID:\n{user_id}\n\n"
                     f"해당 신입 유저가 음성 인증을 제출하여 상태가 [승인대기]로 변경되었습니다. "
                     f"1:1 채팅방에서 음성을 확인하시고 승인 절차를 진행해 주세요!"
                 )
