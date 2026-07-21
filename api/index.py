@@ -15,7 +15,8 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEvent, AudioMessageContent
+
 
 app = Flask(__name__)
 
@@ -532,6 +533,84 @@ def handle_member_joined(event):
         " - 기존 다른방에서 나온이유(없다면 무) :\n"
         " - 다른 방에서 킥을 당한적 있는지(있다면 사유도) :"
     )
+    # ==========================================
+# [핸들러 3] 음성 메시지(음성 인증) 처리 핸들러
+# ==========================================
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio_message(event):
+    user_id = event.source.user_id
+    if not user_id:
+        return
+
+    try:
+        raw_user_ids = validation_sheet.col_values(5)
+        clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+        current_user_id = str(user_id).strip()
+
+        if current_user_id in clean_user_ids:
+            row_index = clean_user_ids.index(current_user_id) + 1
+            row_data = validation_sheet.row_values(row_index)
+            
+            # L열(12번째) 상태 확인
+            current_status = row_data[11].strip() if len(row_data) >= 12 else ""
+            nickname = row_data[0].strip() if len(row_data) > 0 else "알수없음"
+
+            if current_status == "음성대기":
+                # 1. 상태를 '승인대기'로 업데이트
+                validation_sheet.update_cell(row_index, 12, "승인대기")
+                
+                # 2. 유저에게 안심시키는 완료 메시지 발송
+                reply_text = (
+                    "🎙️ 음성 인증 메시지가 성공적으로 제출되었습니다!\n\n"
+                    "인증자 확인 후 이후절차 진행 예정이니 잠시만 기다려주세요. 감사합니다! 😊"
+                )
+                
+                # 3. 관리자 방에 알림 발송
+                admin_alert_text = (
+                    f"🔔 [음성 인증 제출 완료]\n\n"
+                    f"👤 닉네임: {nickname}\n"
+                    f"🆔 유저 고유 ID:\n{user_id}\n\n"
+                    f"해당 신입 유저가 음성 인증을 제출하여 상태가 [승인대기]로 변경되었습니다. "
+                    f"1:1 채팅방에서 음성을 확인하시고 승인 절차를 진행해 주세요!"
+                )
+                
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    
+                    # 유저에게 답장
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token, 
+                            messages=[TextMessage(text=reply_text)]
+                        )
+                    )
+                    
+                    # 관리자 방에 알림 (Push)
+                    line_bot_api.push_message(
+                        PushMessageRequest(
+                            to=ADMIN_GROUP_CHAT_ID,
+                            messages=[TextMessage(text=admin_alert_text)]
+                        )
+                    )
+            else:
+                # 음성 대기 상태가 아닐 때 음성을 보낸 경우 (조용히 무시하거나 안내 가능)
+                pass
+
+    except Exception as e:
+        print(f"음성 메시지 처리 에러: {e}")
+        error_text = "⚠️ 음성 메시지 접수 중 시스템 오류가 발생했습니다. 잠시 후 다시 전송해 주세요."
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token, 
+                        messages=[TextMessage(text=error_text)]
+                    )
+                )
+        except:
+            pass
+
     
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
