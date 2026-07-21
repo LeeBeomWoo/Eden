@@ -6,6 +6,9 @@ import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
 
+# 💡 Upstash Redis 라이브러리 추가
+from upstash_redis import Redis
+
 # Line SDK v3 컴포넌트
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -30,6 +33,16 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope)
 client = gspread.authorize(creds)
 
+# 💡 [Upstash Redis 클라이언트 초기화]
+redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
+redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+
+if redis_url and redis_token:
+    redis = Redis(url=redis_url, token=redis_token)
+else:
+    redis = None
+    print("⚠️ Upstash Redis 환경변수가 설정되지 않아 캐시 없이 동작합니다.")
+
 # 유저 상태 기억용 전역 변수
 notified_users = {}
 
@@ -37,8 +50,67 @@ notified_users = {}
 sheet = client.open("인증멘트").worksheet("멘트")
 validation_sheet = client.open("인증멘트").worksheet("검증")
 
+
+# ==========================================
+# 💡 [Redis 캐시 함수 정의]
+# ==========================================
+
+def get_recording_ments():
+    """녹음 멘트를 Redis 캐시에서 우선 조회 (캐시 유효시간: 1시간 = 3600초)"""
+    cache_key = "cache:recording_ments"
+    
+    # 1. Redis 캐시 확인
+    if redis:
+        try:
+            cached_val = redis.get(cache_key)
+            if cached_val:
+                data = json.loads(cached_val)
+                return data.get("male", []), data.get("female", [])
+        except Exception as e:
+            print(f"Redis 읽기 에러 (녹음): {e}")
+
+    # 2. 캐시 미스 시 구글 시트 호출
+    try:
+        recording_sheet = client.open("인증멘트").worksheet("녹음")
+        col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
+        col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
+        
+        # 3. Redis에 캐싱 (1시간 유지)
+        if redis:
+            try:
+                payload = json.dumps({"male": col_male, "female": col_female})
+                redis.set(cache_key, payload, ex=3600)
+            except Exception as e:
+                print(f"Redis 저장 에러 (녹음): {e}")
+                
+        return col_male, col_female
+    except Exception as e:
+        print(f"녹음 시트 로드 에러: {e}")
+        return [], []
+
+
 def search_keyword(keyword):
-    data = sheet.get_all_records()
+    """멘트 목록 전체를 Redis에 캐싱하여 키워드 검색 (캐시 유효시간: 10분 = 600초)"""
+    cache_key = "cache:sheet_ments_records"
+    data = None
+    
+    if redis:
+        try:
+            cached_val = redis.get(cache_key)
+            if cached_val:
+                data = json.loads(cached_val)
+        except Exception as e:
+            print(f"Redis 읽기 에러 (키워드 검색): {e}")
+
+    if not data:
+        try:
+            data = sheet.get_all_records()
+            if redis and data:
+                redis.set(cache_key, json.dumps(data), ex=600)
+        except Exception as e:
+            print(f"시트 로드 실패: {e}")
+            return None
+
     for row in data:
         cell_value = str(row.get('인증', '')).strip()
         keywords_in_cell = [k.strip() for k in cell_value.split(',') if k.strip()]
@@ -46,13 +118,29 @@ def search_keyword(keyword):
             return row.get('출력')
     return None
 
+
 def get_all_keywords():
+    """등록된 키워드 목록을 Redis에 캐싱 (캐시 유효시간: 10분 = 600초)"""
+    cache_key = "cache:all_keywords"
+    
+    if redis:
+        try:
+            cached_val = redis.get(cache_key)
+            if cached_val:
+                return json.loads(cached_val)
+        except Exception as e:
+            print(f"Redis 읽기 에러 (목록): {e}")
+
     try:
         values = sheet.col_values(1)
         keywords = [str(val).strip() for val in values[1:] if str(val).strip()]
+        if redis and keywords:
+            redis.set(cache_key, json.dumps(keywords), ex=600)
         return keywords
     except Exception as e:
+        print(f"키워드 목록 불러오기 실패: {e}")
         return []
+
 
 @app.route("/api", methods=['POST'])
 def callback():
@@ -72,40 +160,31 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id  
     
-    # 💡 [해결 2] 봇 친구 추가 안 한 상태에서 그룹방 채팅 시 에러 방지
     if not user_id:
-        # User ID를 불러올 수 없으면 이후 로직(시트 기록 등)이 고장나므로 무시합니다.
         return 
 
     user_message = event.message.text.strip()
     reply_text = ""
 
-        # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
+    # 🔄 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
     if user_message == ".":
-        # 1. 딕셔너리 초기화 (서버 재시작 등의 이유로 없을 수도 있으므로 try/except 대신 if문 유지)
         if user_id in notified_users:
             del notified_users[user_id]
             
-        # 2. 구글 시트 초기화
         try:
-            # E열(User ID)에서 해당 사용자의 행 찾기
             user_ids = validation_sheet.col_values(5)
             if user_id in user_ids:
                 row_index = user_ids.index(user_id) + 1
-
-                # K열과 L열만 비우기
                 validation_sheet.update_cell(row_index, 11, "")
                 validation_sheet.update_cell(row_index, 12, "")
         except Exception as e:
             print(f"초기화 시트 에러: {e}")
             
-        # 3. (중요) except 블록 밖으로 빼서 무조건 안내 메시지가 세팅되도록 변경
         reply_text = (
             "🔄 임시 저장된 데이터와 인증 진행 상태가 초기화되었습니다.\n"
             "신입 인증 양식을 처음부터 다시 작성해 주세요!"
         )
 
-        # 4. (중요) 메시지를 여기서 바로 전송하고 return 하여 아래 로직으로 넘어가지 않게 방어
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
@@ -115,7 +194,6 @@ def handle_message(event):
                 )
             )
         return
-
 
     # 🛠️ 1. 그룹/룸 고유 아이디 확인 명령어
     if user_message == "/여긴어디?":
@@ -185,7 +263,6 @@ def handle_message(event):
                         continue
                 missing_fields.append(display_name)
                 
-        # 🔍 성별 유효성 검사 추가 (남, 여, 남자, 여자 중 하나만 허용)
         gender_value = extracted_data.get("성별", "").strip()
         if gender_value and gender_value not in ["남", "여", "남자", "여자"]:
             if "성별 (남, 여, 남자, 여자 중 하나만 입력)" not in missing_fields:
@@ -198,7 +275,6 @@ def handle_message(event):
             region = extracted_data["지역"].strip()
             current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-            # 🔍 구글 시트 내역 전체 정밀 비교 + 블랙 사유 추출
             try:
                 all_records = validation_sheet.get_all_records()
                 
@@ -302,7 +378,6 @@ def handle_message(event):
             except Exception as sheet_err:
                 print(f"구글 시트 입력/수정 실패: {sheet_err}")
 
-            # 사용자별 닉네임 임시 저장
             notified_users[user_id] = {
                 "nickname": nickname
             }
@@ -333,38 +408,27 @@ def handle_message(event):
                 )
         return
 
-        # 🤝 3. 안내 확인 답변 처리
+    # 🤝 3. 안내 확인 답변 처리 (E열 조회 + Redis 녹음 멘트 캐시 적용)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
-            # 💡 [핵심 수정] K열이 아닌, 유저 ID가 확실히 기록되는 E열(5번째 열)에서 검색
             user_ids = validation_sheet.col_values(5)
             
             if user_id in user_ids:
                 row_index = user_ids.index(user_id) + 1
-                
-                # API 호출 횟수를 줄이기 위해 해당 행의 전체 데이터를 한 번에 가져옵니다.
                 row_data = validation_sheet.row_values(row_index)
                 
-                # 시트 A열(인덱스 0) = 닉네임, B열(인덱스 1) = 성별
                 sheet_nickname = row_data[0].strip() if len(row_data) > 0 else ""
                 user_gender = row_data[1].strip() if len(row_data) > 1 else ""
                 
                 user_nickname = notified_users.get(user_id, {}).get("nickname", sheet_nickname)
                 
-                # 💡 "녹음" 시트를 불러올 때 발생할 수 있는 에러 방어
-                try:
-                    recording_sheet = client.open("인증멘트").worksheet("녹음")
-                    col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
-                    col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
-                except Exception as sheet_err:
-                    print(f"녹음 시트 로드 에러: {sheet_err}")
-                    col_male, col_female = [], []
+                # 💡 [Upstash Redis 적용] 녹음 멘트 불러오기
+                col_male, col_female = get_recording_ments()
 
-                # 성별에 따른 멘트 분기
                 if user_gender in ["남", "남자"]:
-                    selected_ment = random.choice(col_male) if col_male else "남성 인증 문구를 시트에서 불러올 수 없습니다."
+                    selected_ment = random.choice(col_male) if col_male else "남성 인증 문구를 불러올 수 없습니다."
                 elif user_gender in ["여", "여자"]:
-                    selected_ment = random.choice(col_female) if col_female else "여성 인증 문구를 시트에서 불러올 수 없습니다."
+                    selected_ment = random.choice(col_female) if col_female else "여성 인증 문구를 불러올 수 없습니다."
                 else:
                     selected_ment = "성별 정보가 올바르지 않습니다. 양식을 다시 작성해주세요."
 
@@ -376,7 +440,6 @@ def handle_message(event):
                     "조용한 곳에서 천천히 또박또박 부탁드립니다."
                 )
                 
-                # L열(12번째 열) 상태 업데이트
                 validation_sheet.update_cell(row_index, 12, '음성대기')
                 
                 with ApiClient(configuration) as api_client:
@@ -385,7 +448,6 @@ def handle_message(event):
                         ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                     )
             else:
-                # 유저 ID를 시트에서 찾지 못했을 때의 안내 (먹통 방지)
                 reply_text = "⚠️ 양식 제출 내역을 찾을 수 없습니다.\n먼저 신입 인증 양식을 정확히 작성하여 보내주세요."
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
@@ -395,7 +457,6 @@ def handle_message(event):
                     
         except Exception as e:
             print(f"인증멘트 로직 에러: {e}")
-            # 에러 발생 시 유저에게 알려서 대화가 멈추지 않도록 처리
             error_text = f"⚠️ 오류가 발생했습니다. 잠시 후 다시 '확인'을 입력해 주세요.\n(시스템 메시지: {e})"
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -404,7 +465,7 @@ def handle_message(event):
                 )
         return
 
-     # 📂 4. 슬래시(/) 명령어 로직
+    # 📂 4. 슬래시(/) 명령어 로직 (Redis 캐싱된 함수 사용)
     if not user_message.startswith("/"):
         return
 
@@ -412,13 +473,13 @@ def handle_message(event):
     
     if command.startswith("인증 "):
         search_query = command.replace("인증 ", "").strip()
-        result = search_keyword(search_query)
+        result = search_keyword(search_query) # 💡 Redis 적용
         if result:
             reply_text = result
         else:
             reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
     elif command == "목록":
-        keywords = get_all_keywords()
+        keywords = get_all_keywords() # 💡 Redis 적용
         if keywords:
             list_text = "\n".join(f"- {k}" for k in keywords)
             reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
@@ -426,7 +487,6 @@ def handle_message(event):
             reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
     elif command in ["id", "내정보", "아이디"]:
         reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
-    
     else:
         reply_text = f"명령어 확인. '{command}'이런 명령어는 없습니다. 😢"
 
@@ -443,8 +503,6 @@ def handle_message(event):
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
-    
-    # 💡 [해결 1] 그룹 입장 시 정확한 user_id 추출
     user_id = event.joined.members[0].user_id if event.joined.members else None
     
     welcome_text = (
