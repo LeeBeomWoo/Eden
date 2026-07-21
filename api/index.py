@@ -333,34 +333,40 @@ def handle_message(event):
                 )
         return
 
-    
-    # 🤝 3. 안내 확인 답변 처리
+        # 🤝 3. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
-            col_k = validation_sheet.col_values(11)
-            if user_id in col_k:
-                row_index = col_k.index(user_id) + 1
+            # 💡 [핵심 수정] K열이 아닌, 유저 ID가 확실히 기록되는 E열(5번째 열)에서 검색
+            user_ids = validation_sheet.col_values(5)
+            
+            if user_id in user_ids:
+                row_index = user_ids.index(user_id) + 1
                 
-                user_gender = str(validation_sheet.cell(row_index, 2).value).strip()
-                user_nickname = notified_users.get(user_id, {}).get(
-                "nickname",
-                str(validation_sheet.cell(row_index, 1).value).strip()
-                )
-                recording_sheet = client.open("인증멘트").worksheet("녹음")
+                # API 호출 횟수를 줄이기 위해 해당 행의 전체 데이터를 한 번에 가져옵니다.
+                row_data = validation_sheet.row_values(row_index)
                 
-                col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
-                col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
+                # 시트 A열(인덱스 0) = 닉네임, B열(인덱스 1) = 성별
+                sheet_nickname = row_data[0].strip() if len(row_data) > 0 else ""
+                user_gender = row_data[1].strip() if len(row_data) > 1 else ""
                 
-                # 수정된 로직 예시
+                user_nickname = notified_users.get(user_id, {}).get("nickname", sheet_nickname)
+                
+                # 💡 "녹음" 시트를 불러올 때 발생할 수 있는 에러 방어
+                try:
+                    recording_sheet = client.open("인증멘트").worksheet("녹음")
+                    col_male = [cell for cell in recording_sheet.col_values(1)[1:] if cell and cell.strip()]
+                    col_female = [cell for cell in recording_sheet.col_values(2)[1:] if cell and cell.strip()]
+                except Exception as sheet_err:
+                    print(f"녹음 시트 로드 에러: {sheet_err}")
+                    col_male, col_female = [], []
+
+                # 성별에 따른 멘트 분기
                 if user_gender in ["남", "남자"]:
-                    # 남성일 때 남성용 멘트 선택
-                    selected_ment = random.choice(col_male) if col_male else "인증 문구가 준비 중입니다."
+                    selected_ment = random.choice(col_male) if col_male else "남성 인증 문구를 시트에서 불러올 수 없습니다."
                 elif user_gender in ["여", "여자"]:
-                    # 여성일 때 여성용 멘트 선택
-                    selected_ment = random.choice(col_female) if col_female else "인증 문구가 준비 중입니다."
+                    selected_ment = random.choice(col_female) if col_female else "여성 인증 문구를 시트에서 불러올 수 없습니다."
                 else:
-                    # 예외 처리
-                    selected_ment = "성별 정보가 올바르지 않습니다."
+                    selected_ment = "성별 정보가 올바르지 않습니다. 양식을 다시 작성해주세요."
 
                 reply_text = (
                     "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
@@ -370,15 +376,32 @@ def handle_message(event):
                     "조용한 곳에서 천천히 또박또박 부탁드립니다."
                 )
                 
-                validation_sheet.update_acell(f'L{row_index}', '음성대기')
+                # L열(12번째 열) 상태 업데이트
+                validation_sheet.update_cell(row_index, 12, '음성대기')
                 
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
                     line_bot_api.reply_message_with_http_info(
                         ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                     )
+            else:
+                # 유저 ID를 시트에서 찾지 못했을 때의 안내 (먹통 방지)
+                reply_text = "⚠️ 양식 제출 내역을 찾을 수 없습니다.\n먼저 신입 인증 양식을 정확히 작성하여 보내주세요."
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                    )
+                    
         except Exception as e:
             print(f"인증멘트 로직 에러: {e}")
+            # 에러 발생 시 유저에게 알려서 대화가 멈추지 않도록 처리
+            error_text = f"⚠️ 오류가 발생했습니다. 잠시 후 다시 '확인'을 입력해 주세요.\n(시스템 메시지: {e})"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=error_text)])
+                )
         return
 
      # 📂 4. 슬래시(/) 명령어 로직
