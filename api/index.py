@@ -175,6 +175,7 @@ def handle_message(event):
             
             if current_user_id in clean_user_ids:
                 row_index = clean_user_ids.index(current_user_id) + 1
+                
                 validation_sheet.update_cell(row_index, 11, "")
                 validation_sheet.update_cell(row_index, 12, "")
         except Exception as e:
@@ -369,9 +370,9 @@ def handle_message(event):
 
             col_k = validation_sheet.col_values(11) 
             next_row = len(col_k) + 1
-            validation_sheet.update_acell(f'K{next_row}', user_id)
-            validation_sheet.update_acell(f'L{next_row}', '입장대기')
-
+            validation_sheet.update(f'K{found_row_index}:L{found_row_index}',
+                        [[user_id, "입장대기"]])
+            
             save_success = True
 
         except Exception as sheet_err:
