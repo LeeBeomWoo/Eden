@@ -243,7 +243,7 @@ def handle_message(event):
         region = extracted_data["지역"].strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        # [단계 A] 중복 필터링 및 관리자 알림
+                # [단계 A] 중복 필터링 및 관리자 알림
         all_data = [] # 스코프 문제 방지를 위해 미리 초기화
         try:
             all_data = validation_sheet.get_all_values()
@@ -271,7 +271,15 @@ def handle_message(event):
                     
                     if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
                         if rec_black:
-                            found_black_reasons.append(f"[{rec_name}/{rec_year}년생] -> {rec_black}")
+                            # 💡 블랙 멤버 발견 시 시트 내역을 상세히 저장 (빈칸은 공란으로 출력됨)
+                            black_info = (
+                                f"▪️ 닉네임: {rec_name}\n"
+                                f"▪️ 사는지역: {rec_region}\n"
+                                f"▪️ 년생: {rec_year}\n"
+                                f"▪️ 성별: {rec_gender}\n"
+                                f"▪️ 블랙사유: {rec_black}"
+                            )
+                            found_black_reasons.append(black_info)
 
                     if rec_id and rec_id == str(user_id).strip():
                         is_id_matched = True
@@ -304,14 +312,19 @@ def handle_message(event):
             if alert_status:
                 black_section = ""
                 if found_black_reasons:
-                    unique_reasons = list(set(found_black_reasons))
-                    black_section = f"⚠️ [시트 내역 블랙 사유]\n{chr(10).join(unique_reasons)}\n\n"
+                    # 중복 내역 제거 후 보기 좋게 구분선으로 묶기
+                    unique_reasons = []
+                    for r in found_black_reasons:
+                        if r not in unique_reasons:
+                            unique_reasons.append(r)
+                    
+                    black_section = "⚠️ [시트 내역 블랙 정보]\n" + "\n-------------------\n".join(unique_reasons) + "\n\n"
 
                 alert_text = (
                     f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
                     f"📌 분류 상태: {alert_status}\n"
                     f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
-                    f"📍 입력 지역/성별: {region} / {gender}\n"
+                    f"📍 입력 지역/성별: {region} / {gender}\n\n"
                     f"{black_section}"
                     f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
                 )
@@ -324,7 +337,7 @@ def handle_message(event):
         except Exception as filter_err:
             print(f"중복 필터링 에러 (저장은 정상 진행): {filter_err}")
 
-
+        
         # [단계 B] 즉각적이고 안정적인 구글 시트 저장 처리 (로직 최적화)
         save_success = False
         try:
