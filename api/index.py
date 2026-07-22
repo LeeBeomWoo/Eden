@@ -458,70 +458,6 @@ def handle_message(event):
             )
         return
 
-    # 3. 안내 확인 답변 처리
-    if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
-        try:
-            with sheet_sync_lock():
-                raw_user_ids = validation_sheet.col_values(5)
-                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                current_user_id = str(user_id).strip()
-                
-                if current_user_id in clean_user_ids:
-                    row_index = clean_user_ids.index(current_user_id) + 1
-                    row_data = validation_sheet.row_values(row_index)
-                    
-                    sheet_nickname = row_data[0].strip() if len(row_data) > 0 else ""
-                    user_gender = row_data[1].strip() if len(row_data) > 1 else ""
-                    
-                    session_info = get_user_session(user_id) or {}
-                    user_nickname = session_info.get("nickname", sheet_nickname)
-                    
-                    col_male, col_female = get_recording_ments()
-
-                    if user_gender in ["남", "남자"]:
-                        selected_ment = random.choice(col_male) if col_male else "남성 인증 문구를 불러올 수 없습니다."
-                    elif user_gender in ["여", "여자"]:
-                        selected_ment = random.choice(col_female) if col_female else "여성 인증 문구를 불러올 수 없습니다."
-                    else:
-                        selected_ment = "성별 정보가 올바르지 않습니다. 양식을 다시 작성해주세요."
-
-                    reply_text = (
-                        "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
-                        "키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
-                        "아래 문구를 정확하게 읽어주세요.\n\n"
-                        f"\"제 닉네임은 {user_nickname}입니다. 오늘은 OO월 OO일, 초대자 ■■입니다. {selected_ment}\"\n\n"
-                        "조용한 곳에서 천천히 또박또박 부탁드립니다."
-                    )
-                    
-                    # 배치 단일 업데이트
-                    validation_sheet.update(range_name=f'L{row_index}', values=[['음성대기']])
-                    user_found = True
-                else:
-                    user_found = False
-
-            if user_found:
-                with ApiClient(configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                    )
-            else:
-                reply_text = "⚠️ 양식 제출 내역을 찾을 수 없습니다.\n먼저 신입 인증 양식을 정확히 작성하여 보내주세요."
-                with ApiClient(configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                    )
-                    
-        except Exception as e:
-            print(f"인증멘트 로직 에러: {e}")
-            error_text = f"⚠️ 오류가 발생했습니다. 잠시 후 다시 '확인'을 입력해 주세요.\n(시스템 메시지: {e})"
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=error_text)])
-                )
-        return
 
     # 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
@@ -554,6 +490,76 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
             )
+
+
+    # 3. 안내 확인 답변 처리
+    if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
+        try:
+            should_respond = False
+            reply_text = ""
+
+            with sheet_sync_lock():
+                raw_user_ids = validation_sheet.col_values(5)
+                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                current_user_id = str(user_id).strip()
+                
+                if current_user_id in clean_user_ids:
+                    row_index = clean_user_ids.index(current_user_id) + 1
+                    row_data = validation_sheet.row_values(row_index)
+                    
+                    # L열(12번째, 인덱스 11) 상태 확인
+                    current_status = row_data[11].strip() if len(row_data) > 11 else ""
+                    
+                    # 💡 핵심: 상태가 "입장대기"인 '진짜 신입'일 때만 반응!
+                    if current_status == "입장대기":
+                        should_respond = True
+                        
+                        sheet_nickname = row_data[0].strip() if len(row_data) > 0 else ""
+                        user_gender = row_data[1].strip() if len(row_data) > 1 else ""
+                        
+                        session_info = get_user_session(user_id) or {}
+                        user_nickname = session_info.get("nickname", sheet_nickname)
+                        
+                        col_male, col_female = get_recording_ments()
+
+                        if user_gender in ["남", "남자"]:
+                            selected_ment = random.choice(col_male) if col_male else "남성 인증 문구를 불러올 수 없습니다."
+                        elif user_gender in ["여", "여자"]:
+                            selected_ment = random.choice(col_female) if col_female else "여성 인증 문구를 불러올 수 없습니다."
+                        else:
+                            selected_ment = "성별 정보가 올바르지 않습니다. 양식을 다시 작성해주세요."
+
+                        reply_text = (
+                            "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
+                            "키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
+                            "아래 문구를 정확하게 읽어주세요.\n\n"
+                            f"\"제 닉네임은 {user_nickname}입니다. 오늘은 OO월 OO일, 초대자 ■■입니다. {selected_ment}\"\n\n"
+                            "조용한 곳에서 천천히 또박또박 부탁드립니다."
+                        )
+                        
+                        # 상태를 '음성대기'로 업데이트
+                        validation_sheet.update(range_name=f'L{row_index}', values=[['음성대기']])
+
+            # 신입 회원(입장대기 상태)인 경우에만 메시지 전송
+            if should_respond and reply_text:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                    )
+            # 조건에 맞지 않는 기존 회원의 '확인' 메시지 등은 아무 동작 없이 조용히 무시(return)
+            return
+                    
+        except Exception as e:
+            print(f"인증멘트 로직 에러: {e}")
+            # 서버 에러 발생 시에만 알림
+            error_text = f"⚠️ 서버 처리 중 오류가 발생했습니다. 잠시 후 다시 '확인'을 입력해 주세요.\n(시스템 메시지: {e})"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=error_text)])
+                )
+        return
 
 
 # ==========================================
