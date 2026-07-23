@@ -422,9 +422,20 @@ def handle_message(event):
                 save_success = True
 
             except Exception as sheet_err:
-                print(f"🚨 구글 시트 저장 처리 에러: {sheet_err}")
                 save_success = False
-
+                error_msg = f"🚨 구글 시트 저장 처리 에러:\n{sheet_err}"
+                print(error_msg)
+            
+                # 봇이 관리자 방으로 에러 내역을 직접 쏴줌
+                try:
+                    with ApiClient(configuration) as api_client:
+                        line_bot_api = MessagingApi(api_client)
+                        line_bot_api.push_message(
+                            PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=error_msg)])
+                       )
+                except Exception as push_err:
+                    print(f"에러 메시지 푸시 전송 실패: {push_err}")
+                
         # 관리자 알림 전송 (시트 락 해제 후 전송하여 락 점유시간 단축)
         if alert_text:
             try:
