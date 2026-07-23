@@ -553,10 +553,10 @@ def handle_message(event):
             search_query = command[2:].strip()   # "ㅇㅈ " 제거
 
         result = search_keyword(search_query)
-            if result:
-                reply_text = result
-            else:
-                reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+        if result:
+            reply_text = result
+        else:
+            reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
             
     elif command == "목록":
         keywords = get_all_keywords()
