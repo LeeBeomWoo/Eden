@@ -458,40 +458,7 @@ def handle_message(event):
             )
         return
 
-
-    # 4. 슬래시(/) 명령어 로직
-    if not user_message.startswith("/"):
-        return
-
-    command = user_message[1:].strip()
     
-    if command.startswith("인증 "):
-        search_query = command.replace("인증 ", "").strip()
-        result = search_keyword(search_query)
-        if result:
-            reply_text = result
-        else:
-            reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
-    elif command == "목록":
-        keywords = get_all_keywords()
-        if keywords:
-            list_text = "\n".join(f"- {k}" for k in keywords)
-            reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
-        else:
-            reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
-    elif command in ["id", "내정보", "아이디"]:
-        reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
-    else:
-        reply_text = f"명령어 확인. '{command}'이런 명령어는 없습니다. 😢"
-
-    if reply_text:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-            )
-
-
     # 3. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
@@ -560,6 +527,41 @@ def handle_message(event):
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=error_text)])
                 )
         return
+
+
+
+    # 4. 슬래시(/) 명령어 로직
+    if not user_message.startswith("/"):
+        return
+
+    command = user_message[1:].strip()
+    
+    if command.startswith("인증 "):
+        search_query = command.replace("인증 ", "").strip()
+        result = search_keyword(search_query)
+        if result:
+            reply_text = result
+        else:
+            reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+    elif command == "목록":
+        keywords = get_all_keywords()
+        if keywords:
+            list_text = "\n".join(f"- {k}" for k in keywords)
+            reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
+        else:
+            reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
+    elif command in ["id", "내정보", "아이디"]:
+        reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
+    else:
+        reply_text = f"명령어 확인. '{command}'이런 명령어는 없습니다. 😢"
+
+    if reply_text:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+            )
+
 
 
 # ==========================================
