@@ -546,14 +546,18 @@ def handle_message(event):
         return
 
     command = user_message[1:].strip()
-    
-    if command.startswith("인증 "):
-        search_query = command.replace("인증 ", "").strip()
-        result = search_keyword(search_query)
-        if result:
-            reply_text = result
+    if command.startswith(("인증 ", "ㅇㅈ ")):
+        if command.startswith("인증 "):
+            search_query = command[3:].strip()   # "인증 " 제거
         else:
-            reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+            search_query = command[2:].strip()   # "ㅇㅈ " 제거
+
+        result = search_keyword(search_query)
+            if result:
+                reply_text = result
+            else:
+                reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+            
     elif command == "목록":
         keywords = get_all_keywords()
         if keywords:
@@ -561,6 +565,7 @@ def handle_message(event):
             reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
         else:
             reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
+            
     elif command in ["id", "내정보", "아이디"]:
         reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
     else:
