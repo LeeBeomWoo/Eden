@@ -542,7 +542,6 @@ def handle_message(event):
 
 
     # 4. 슬래시(/) 명령어 로직
-        # 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
 
@@ -579,7 +578,7 @@ def handle_message(event):
                 "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
                 "읽고 확인이라고 입력해 주세요"
             )
-                elif search_query in ["3단계", "음성", "음성안내"]:
+        elif search_query in ["3단계", "음성", "음성안내"]:
             # 1. 세션에서 닉네임 시도 시도 (없으면 임시 텍스트)
             session_info = get_user_session(user_id) or {}
             user_nickname = session_info.get("nickname", "[본인닉네임]")
@@ -598,7 +597,6 @@ def handle_message(event):
                 f"\"제 닉네임은 {user_nickname}입니다. 오늘은 OO월 OO일, 초대자 ■■입니다. {random_ment}\"\n\n"
                 "조용한 곳에서 천천히 또박또박 부탁드립니다."
             )
-
         else:
             # 고정 명령어가 아니면 기존처럼 구글 시트에서 검색
             result = search_keyword(search_query)
