@@ -542,6 +542,7 @@ def handle_message(event):
 
 
     # 4. 슬래시(/) 명령어 로직
+        # 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
 
@@ -552,19 +553,74 @@ def handle_message(event):
         else:
             search_query = command[2:].strip()   # "ㅇㅈ " 제거
 
-        result = search_keyword(search_query)
-        if result:
-            reply_text = result
+        # [추가됨] 고정 단계별 안내문 수동 출력 로직
+        if search_query in ["1단계", "양식", "양식안내"]:
+            reply_text = (
+                "안녕하세요\n"
+                "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
+                "오신것을 환영합니다\n\n"
+                "⭕️아래의 본문을 복사해서 빠.짐.없.이. 작성해주세요.\n\n"
+                " - 닉네임(두글자):\n"
+                " - 년생:\n"
+                " - 나이: (만나이 ❌️):\n"
+                " - 성별(남/여/남자/여자 중 하나만 입력):\n"
+                " - 지역(시까지, 단 서울 및 광역시는 구까지):\n"
+                " - 결혼유무(기/미/돌):\n"
+                " - 군필여부(남자만):\n"
+                " - 초대자:\n"
+                " - 야단라경험유무(방 이름 및 임티, 기존에 썻던 닉):\n"
+                " - 기존 다른방에서 나온이유(없다면 무) :\n"
+                " - 다른 방에서 킥을 당한적 있는지(있다면 사유도) :"
+            )
+        elif search_query in ["2단계", "주의사항", "규정"]:
+            reply_text = (
+                "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
+                "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
+                "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
+                "읽고 확인이라고 입력해 주세요"
+            )
+                elif search_query in ["3단계", "음성", "음성안내"]:
+            # 1. 세션에서 닉네임 시도 시도 (없으면 임시 텍스트)
+            session_info = get_user_session(user_id) or {}
+            user_nickname = session_info.get("nickname", "[본인닉네임]")
+            
+            # 2. 캐시/구글 시트에서 녹음 멘트 불러오기
+            col_male, col_female = get_recording_ments()
+            all_ments = col_male + col_female
+            
+            # 3. 멘트 중 하나를 무작위로 선택
+            random_ment = random.choice(all_ments) if all_ments else "인증 문구를 불러올 수 없습니다."
+
+            reply_text = (
+                "⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
+                "키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
+                "아래 문구를 정확하게 읽어주세요.\n\n"
+                f"\"제 닉네임은 {user_nickname}입니다. 오늘은 OO월 OO일, 초대자 ■■입니다. {random_ment}\"\n\n"
+                "조용한 곳에서 천천히 또박또박 부탁드립니다."
+            )
+
         else:
-            reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
+            # 고정 명령어가 아니면 기존처럼 구글 시트에서 검색
+            result = search_keyword(search_query)
+            if result:
+                reply_text = result
+            else:
+                reply_text = f"😢 '{search_query}' 미 입력된 인증멘트. 오타에 주의해주세요!"
             
     elif command == "목록":
         keywords = get_all_keywords()
+        # 목록 출력 시 단계별 고정 명령어도 함께 안내하도록 수정
+        list_text = "📍 [단계별 고정 명령어]\n"
+        list_text += "- /ㅇㅈ 1단계 (또는 양식)\n"
+        list_text += "- /ㅇㅈ 2단계 (또는 주의사항)\n"
+        list_text += "- /ㅇㅈ 3단계 (또는 음성)\n\n"
+        list_text += "📋 [시트 등록 인증멘트]\n"
+        
         if keywords:
-            list_text = "\n".join(f"- {k}" for k in keywords)
-            reply_text = f"📋 현재 등록된 인증 리스트입니다:\n\n{list_text}"
+            list_text += "\n".join(f"- {k}" for k in keywords)
+            reply_text = list_text
         else:
-            reply_text = "📭 현재 등록된 인증 멘트가 없습니다."
+            reply_text = list_text + "📭 현재 등록된 인증 멘트가 없습니다."
             
     elif command in ["id", "내정보", "아이디"]:
         reply_text = f"👤 당신의 LINE User ID:\n{user_id}\n\n위 ID를 복사하여 관리자에게 전달해 주세요!"
