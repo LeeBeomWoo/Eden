@@ -290,16 +290,30 @@ def handle_message(event):
                     key_name = key_name.split("(", 1)[0].strip()
                 extracted_data[key_name] = parts[1].strip()
 
+        # 전체 필수 항목 리스트 정의 (어느 하나라도 빠지면 안 됨)
+        required_fields = [
+            "닉네임", "년생", "나이", "성별", "지역", 
+            "결혼유무", "군필여부", "초대자", "야단라경험유무", 
+            "기존 다른방에서 나온이유", "다른 방에서 킥을 당한적 있는지"
+        ]
+
         missing_fields = []
-        for req_field in ["닉네임", "년생", "성별", "지역"]:
-            if not extracted_data.get(req_field):
+        user_gender = extracted_data.get("성별", "").strip()
+        
+        for req_field in required_fields:
+            val = extracted_data.get(req_field, "").strip()
+            if not val:
+                # [예외 처리] 여성의 경우 군필여부는 빈칸이어도 통과
+                if req_field == "군필여부" and user_gender in ["여", "여자"]:
+                    continue
                 missing_fields.append(req_field)
 
+        # 누락된 항목이 존재할 경우 되돌려 보냄
         if missing_fields:
             reply_text = (
                 f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n"
                 f"- {', '.join(missing_fields)}\n\n"
-                "빠짐없이 작성 후 다시 제출해 주세요!\n\n"
+                "해당 항목을 빠짐없이 작성 후 다시 제출해 주세요!\n\n"
                 "기존양식은 건들지 말고, : ← 표시 뒤에 입력하여주세요."
             )
             with ApiClient(configuration) as api_client:
@@ -309,15 +323,24 @@ def handle_message(event):
                 )
             return
 
-        nickname = extracted_data["닉네임"].strip()
-        birth_year = extracted_data["년생"].strip()
-        gender = extracted_data["성별"].strip()
-        region = extracted_data["지역"].strip()
+        # 모든 데이터 추출 및 변수화 (추가된 세부 항목 포함)
+        nickname = extracted_data.get("닉네임", "").strip()
+        birth_year = extracted_data.get("년생", "").strip()
+        age = extracted_data.get("나이", "").strip()
+        gender = extracted_data.get("성별", "").strip()
+        region = extracted_data.get("지역", "").strip()
+        marriage = extracted_data.get("결혼유무", "").strip()
+        military = extracted_data.get("군필여부", "").strip()
+        inviter = extracted_data.get("초대자", "").strip()
+        yadan = extracted_data.get("야단라경험유무", "").strip()
+        leave_reason = extracted_data.get("기존 다른방에서 나온이유", "").strip()
+        kick_reason = extracted_data.get("다른 방에서 킥을 당한적 있는지", "").strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
         # [단계 A & B] 동시성 방지 락 내부에서 읽기/검증/저장 일괄 처리
         save_success = False
         alert_text = None
+        current_status = "입장대기" # 신규 유저 기본 상태
 
         with sheet_sync_lock():
             try:
@@ -338,7 +361,6 @@ def handle_message(event):
                     idx_region = headers.index("사는지역") if "사는지역" in headers else 2
                     idx_black = headers.index("블랙사유") if "블랙사유" in headers else 6
 
-                    # enumerate를 사용하여 인덱스 추출 (데이터는 2행부터 시작하므로 인덱스 + 2)
                     for idx, row in enumerate(all_data[1:]):
                         sheet_row_num = idx + 2 
                         
@@ -358,13 +380,11 @@ def handle_message(event):
                             if is_id_matched: match_reasons.append("고유ID 일치")
                             if is_name_matched: match_reasons.append("닉네임 일치")
 
-                            # 닉네임 일치 시 세부정보 유사도 점수 계산
                             match_score = 0
                             if rec_year == birth_year: match_score += 1
                             if rec_gender == gender: match_score += 1
                             if rec_region == region: match_score += 1
 
-                            # 발견된 중복 데이터의 세부사항 및 '행 번호' 저장
                             row_info = (
                                 f"📍 [시트 {sheet_row_num}행] ({', '.join(match_reasons)})\n"
                                 f" - 기존정보: {rec_name} / {rec_year}년생 / {rec_gender} / {rec_region}"
@@ -374,7 +394,6 @@ def handle_message(event):
                             
                             found_duplicates.append(row_info)
 
-                            # 경고 레벨 판별 로직 (우선순위 산정)
                             current_level = 0
                             if is_name_matched:
                                 if match_score == 3: current_level = 4
@@ -382,12 +401,11 @@ def handle_message(event):
                                 else: current_level = 1
                             
                             if is_id_matched:
-                                if current_level < 3: current_level = 3  # ID 일치는 단순 닉네임 일치보다 강력함
+                                if current_level < 3: current_level = 3
                             
                             if rec_black:
-                                current_level = 5  # 블랙리스트가 최우선순위
+                                current_level = 5
 
-                            # 가장 높은 경고 레벨로 갱신
                             if current_level > highest_alert_level:
                                 highest_alert_level = current_level
                                 if current_level == 5:
@@ -406,7 +424,6 @@ def handle_message(event):
                                     alert_status_text = "🔵 [주의] 닉네임 일치 유저"
                                     color_emoji = "🟦"
 
-                # 중복 또는 경고 사항이 발견되어 관리자에게 보낼 메시지 생성
                 if highest_alert_level > 0:
                     dup_details_str = "\n\n".join(found_duplicates)
                     alert_text = (
@@ -418,27 +435,43 @@ def handle_message(event):
                         f"💡 관리자분들께서는 위 '시트 행 번호' 및 상세 내역을 기반으로 승인 여부를 검토하시기 바랍니다."
                     )
 
-                # 시트 저장 및 업데이트 로직 (이하 기존과 동일)
                 clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
                 current_user_id = str(user_id).strip()
 
+                # 시트에 입력할 데이터를 그룹화
+                # 1. A~H 열 (기본정보)
+                # 2. M~S 열 (상세정보: 나이, 결혼, 군필, 초대자, 야단라, 나온이유, 킥사유)
+                update_data_details = [age, marriage, military, inviter, yadan, leave_reason, kick_reason]
+
                 if current_user_id in clean_user_ids:
-                    # 🔄 기존 유저 덮어쓰기
+                    # 🔄 기존 유저 덮어쓰기 (수정 제출 시)
                     found_row_index = clean_user_ids.index(current_user_id) + 1
                     row_data = all_data[found_row_index - 1]
                     count_val = row_data[7] if len(row_data) >= 8 else "0"
                     current_retry_count = int(count_val) if count_val.isdigit() else 0
                     
-                    update_data = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
-                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data])
+                    # L열(12번째) 기존 상태 보존
+                    if len(row_data) >= 12:
+                        existing_status = row_data[11].strip()
+                        if existing_status:
+                            current_status = existing_status
+                            
+                    update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
+                    
+                    # A~H, K~L, M~S 각각 덮어쓰기 진행
+                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
+                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, current_status]])
+                    validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[update_data_details])
                 else:
                     # ➕ 신규 유저 추가
                     found_row_index = len(all_data) + 1 
-                    row_to_insert = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
-                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert])
+                    
+                    row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
+                    
+                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
+                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, "입장대기"]])
+                    validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[update_data_details])
 
-                # K, L열 일괄 저장
-                validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, "입장대기"]])
                 save_success = True
 
             except Exception as sheet_err:
@@ -455,7 +488,7 @@ def handle_message(event):
                     print(f"에러 메시지 푸시 전송 실패: {push_err}")
 
         
-        # 관리자 알림 전송 (시트 락 해제 후 전송하여 락 점유시간 단축)
+        # 관리자 알림 전송
         if alert_text:
             try:
                 with ApiClient(configuration) as api_client:
@@ -469,12 +502,27 @@ def handle_message(event):
         # [단계 C] 사용자 응답
         if save_success:
             set_user_session(user_id, {"nickname": nickname})
-            reply_text = (
-                "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
-                "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
-                "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
-                "읽고 확인이라고 입력해 주세요"
-            )
+            
+            # 현재 진행 상태에 따라 안내 문구를 다르게 출력
+            if current_status == "입장대기":
+                reply_text = (
+                    "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
+                    "내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n" 
+                    "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n" 
+                    "읽고 확인이라고 입력해 주세요"
+                )
+            elif current_status == "음성대기":
+                reply_text = (
+                    "✅ 양식 수정이 반영되었습니다.\n\n"
+                    "이어서 진행 중이던 [음성 인증]을 마저 완료해 주세요!"
+                )
+            elif current_status == "승인대기":
+                reply_text = (
+                    "✅ 양식 수정이 반영되었습니다.\n\n"
+                    "현재 관리자 승인을 대기 중이므로 잠시만 기다려주세요."
+                )
+            else:
+                reply_text = "✅ 양식 수정이 정상적으로 반영되었습니다."
         else:
             reply_text = (
                 "⚠️ 양식은 정상적으로 작성되었으나, 서버/시트 통신 문제로 저장에 실패했습니다.\n\n"
@@ -507,7 +555,7 @@ def handle_message(event):
                     # L열(12번째, 인덱스 11) 상태 확인
                     current_status = row_data[11].strip() if len(row_data) > 11 else ""
                     
-                    # 💡 핵심: 상태가 "입장대기"인 '진짜 신입'일 때만 반응!
+                    # 상태가 "입장대기"일 때만 반응!
                     if current_status == "입장대기":
                         should_respond = True
                         
@@ -544,12 +592,10 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(
                         ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                     )
-            # 조건에 맞지 않는 기존 회원의 '확인' 메시지 등은 아무 동작 없이 조용히 무시(return)
             return
                     
         except Exception as e:
             print(f"인증멘트 로직 에러: {e}")
-            # 서버 에러 발생 시에만 알림
             error_text = f"⚠️ 서버 처리 중 오류가 발생했습니다. 잠시 후 다시 '확인'을 입력해 주세요.\n(시스템 메시지: {e})"
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -571,7 +617,7 @@ def handle_message(event):
         else:
             search_query = command[2:].strip()   # "ㅇㅈ " 제거
 
-        # [추가됨] 고정 단계별 안내문 수동 출력 로직
+        # 고정 단계별 안내문 수동 출력 로직
         if search_query in ["1단계", "양식", "양식안내"]:
             reply_text = (
                 "안녕하세요\n"
@@ -598,15 +644,12 @@ def handle_message(event):
                 "읽고 확인이라고 입력해 주세요"
             )
         elif search_query in ["3단계", "음성", "음성안내"]:
-            # 1. 세션에서 닉네임 시도 시도 (없으면 임시 텍스트)
             session_info = get_user_session(user_id) or {}
             user_nickname = session_info.get("nickname", "[본인닉네임]")
             
-            # 2. 캐시/구글 시트에서 녹음 멘트 불러오기
             col_male, col_female = get_recording_ments()
             all_ments = col_male + col_female
             
-            # 3. 멘트 중 하나를 무작위로 선택
             random_ment = random.choice(all_ments) if all_ments else "인증 문구를 불러올 수 없습니다."
 
             reply_text = (
@@ -617,7 +660,6 @@ def handle_message(event):
                 "조용한 곳에서 천천히 또박또박 부탁드립니다."
             )
         else:
-            # 고정 명령어가 아니면 기존처럼 구글 시트에서 검색
             result = search_keyword(search_query)
             if result:
                 reply_text = result
@@ -626,7 +668,6 @@ def handle_message(event):
             
     elif command == "목록":
         keywords = get_all_keywords()
-        # 목록 출력 시 단계별 고정 명령어도 함께 안내하도록 수정
         list_text = "📍 [단계별 고정 명령어]\n"
         list_text += "- /ㅇㅈ 1단계 (또는 양식)\n"
         list_text += "- /ㅇㅈ 2단계 (또는 주의사항)\n"
@@ -721,13 +762,11 @@ def handle_audio_message(event):
                     should_alert = True
 
         if should_alert:
-            # 유저 전송 메시지
             reply_text = (
                 "🎙️ 음성 인증 메시지가 성공적으로 제출되었습니다!\n\n"
                 "인증자 확인 후 이후절차 진행 예정이니 잠시만 기다려주세요. 감사합니다! 😊"
             )
             
-            # 관리자 전용 알림 메시지 (지정된 ADMIN_GROUP_CHAT_ID로 쏘아줌)
             admin_alert_text = (
                 f"🔔 [음성 인증 제출 완료]\n\n"
                 f"👤 닉네임: {nickname}\n"
@@ -738,7 +777,6 @@ def handle_audio_message(event):
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 
-                # 유저 답장
                 line_bot_api.reply_message_with_http_info(
                     ReplyMessageRequest(
                         reply_token=event.reply_token, 
@@ -746,7 +784,6 @@ def handle_audio_message(event):
                     )
                 )
                 
-                # 관리자방 푸시 전송
                 line_bot_api.push_message(
                     PushMessageRequest(
                         to=ADMIN_GROUP_CHAT_ID,
