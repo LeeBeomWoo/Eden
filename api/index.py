@@ -315,17 +315,19 @@ def handle_message(event):
         region = extracted_data["지역"].strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        # [단계 A & B] 동시성 방지 락 내부에서 읽기/검증/저장 일동 처리
+        # [단계 A & B] 동시성 방지 락 내부에서 읽기/검증/저장 일괄 처리
         save_success = False
         alert_text = None
 
         with sheet_sync_lock():
             try:
                 all_data = validation_sheet.get_all_values()
-                is_id_matched = False
-                alert_status = ""
+                
+                # 중복 및 블랙 내역을 담을 리스트와 경고 레벨 변수
+                found_duplicates = []
+                highest_alert_level = 0
+                alert_status_text = ""
                 color_emoji = ""
-                found_black_reasons = [] 
 
                 if all_data and len(all_data) > 1:
                     headers = all_data[0]
@@ -336,7 +338,10 @@ def handle_message(event):
                     idx_region = headers.index("사는지역") if "사는지역" in headers else 2
                     idx_black = headers.index("블랙사유") if "블랙사유" in headers else 6
 
-                    for row in all_data[1:]:
+                    # enumerate를 사용하여 인덱스 추출 (데이터는 2행부터 시작하므로 인덱스 + 2)
+                    for idx, row in enumerate(all_data[1:]):
+                        sheet_row_num = idx + 2 
+                        
                         rec_id = str(row[idx_id]).strip() if idx_id < len(row) else ""
                         rec_name = str(row[idx_name]).strip() if idx_name < len(row) else ""
                         rec_year = str(row[idx_year]).strip() if idx_year < len(row) else ""
@@ -344,61 +349,76 @@ def handle_message(event):
                         rec_region = str(row[idx_region]).strip() if idx_region < len(row) else ""
                         rec_black = str(row[idx_black]).strip() if idx_black < len(row) else ""
                         
-                        if (rec_id and rec_id == str(user_id).strip()) or (rec_name == nickname):
-                            if rec_black:
-                                black_info = (
-                                    f"▪️ 닉네임: {rec_name}\n"
-                                    f"▪️ 사는지역: {rec_region}\n"
-                                    f"▪️ 년생: {rec_year}\n"
-                                    f"▪️ 성별: {rec_gender}\n"
-                                    f"▪️ 블랙사유: {rec_black}"
-                                )
-                                found_black_reasons.append(black_info)
+                        is_id_matched = (rec_id == str(user_id).strip() and rec_id != "")
+                        is_name_matched = (rec_name == nickname)
 
-                        if rec_id and rec_id == str(user_id).strip():
-                            is_id_matched = True
+                        # ID가 일치하거나 닉네임이 일치하는 경우 (중복 감지)
+                        if is_id_matched or is_name_matched:
+                            match_reasons = []
+                            if is_id_matched: match_reasons.append("고유ID 일치")
+                            if is_name_matched: match_reasons.append("닉네임 일치")
 
-                        if rec_name == nickname:
+                            # 닉네임 일치 시 세부정보 유사도 점수 계산
                             match_score = 0
                             if rec_year == birth_year: match_score += 1
                             if rec_gender == gender: match_score += 1
                             if rec_region == region: match_score += 1
 
-                            if match_score == 3:
-                                alert_status = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
-                                color_emoji = "🔴"
-                            elif match_score in [1, 2]:
-                                if alert_status != "🚨 [적색 경고] 닉네임 및 모든 정보 일치":
-                                    alert_status = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
+                            # 발견된 중복 데이터의 세부사항 및 '행 번호' 저장
+                            row_info = (
+                                f"📍 [시트 {sheet_row_num}행] ({', '.join(match_reasons)})\n"
+                                f" - 기존정보: {rec_name} / {rec_year}년생 / {rec_gender} / {rec_region}"
+                            )
+                            if rec_black:
+                                row_info += f"\n - 💀 블랙사유: {rec_black}"
+                            
+                            found_duplicates.append(row_info)
+
+                            # 경고 레벨 판별 로직 (우선순위 산정)
+                            current_level = 0
+                            if is_name_matched:
+                                if match_score == 3: current_level = 4
+                                elif match_score > 0: current_level = 2
+                                else: current_level = 1
+                            
+                            if is_id_matched:
+                                if current_level < 3: current_level = 3  # ID 일치는 단순 닉네임 일치보다 강력함
+                            
+                            if rec_black:
+                                current_level = 5  # 블랙리스트가 최우선순위
+
+                            # 가장 높은 경고 레벨로 갱신
+                            if current_level > highest_alert_level:
+                                highest_alert_level = current_level
+                                if current_level == 5:
+                                    alert_status_text = "💀 [위험] 블랙리스트 유저 감지"
+                                    color_emoji = "⚫"
+                                elif current_level == 4:
+                                    alert_status_text = "🚨 [적색 경고] 닉네임 및 모든 정보 일치"
+                                    color_emoji = "🔴"
+                                elif current_level == 3:
+                                    alert_status_text = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
+                                    color_emoji = "🟪"
+                                elif current_level == 2:
+                                    alert_status_text = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치"
                                     color_emoji = "🟡"
-                            else:
-                                if not alert_status:
-                                    alert_status = "🔵 [주의] 닉네임 일치 유저"
+                                elif current_level == 1:
+                                    alert_status_text = "🔵 [주의] 닉네임 일치 유저"
                                     color_emoji = "🟦"
 
-                if is_id_matched and not alert_status:
-                    alert_status = "🔄 [주의] 재입장 유저 (동일 ID 확인)"
-                    color_emoji = "🟪"
-                if found_black_reasons:
-                    alert_status = "💀 [위험] 블랙리스트 유저 감지"
-                    color_emoji = "⚫"
-
-                if alert_status:
-                    black_section = ""
-                    if found_black_reasons:
-                        unique_reasons = list(dict.fromkeys(found_black_reasons))
-                        black_section = "⚠️ [시트 내역 블랙 정보]\n" + "\n-------------------\n".join(unique_reasons) + "\n\n"
-
+                # 중복 또는 경고 사항이 발견되어 관리자에게 보낼 메시지 생성
+                if highest_alert_level > 0:
+                    dup_details_str = "\n\n".join(found_duplicates)
                     alert_text = (
                         f"{color_emoji} 신입 양식 작성 중복 필터링\n\n"
-                        f"📌 분류 상태: {alert_status}\n"
-                        f"👤 입력 닉네임: {nickname} ({birth_year}년생)\n"
-                        f"📍 입력 지역/성별: {region} / {gender}\n\n"
-                        f"{black_section}"
-                        f"💡 관리자분들께서는 위 내용 및 블랙 사유를 기반으로 승인 여부를 검토하시기 바랍니다."
+                        f"📌 상태: {alert_status_text}\n"
+                        f"👤 신규입력: {nickname} ({birth_year}년생) / {region} / {gender}\n\n"
+                        f"📑 [중복/기존 내역 상세]\n"
+                        f"{dup_details_str}\n\n"
+                        f"💡 관리자분들께서는 위 '시트 행 번호' 및 상세 내역을 기반으로 승인 여부를 검토하시기 바랍니다."
                     )
 
-                # 시트 저장 및 업데이트 (동일 락 안에서 실행하여 행 번호 충돌 100% 방지)
+                # 시트 저장 및 업데이트 로직 (이하 기존과 동일)
                 clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
                 current_user_id = str(user_id).strip()
 
@@ -425,8 +445,6 @@ def handle_message(event):
                 save_success = False
                 error_msg = f"🚨 구글 시트 저장 처리 에러:\n{sheet_err}"
                 print(error_msg)
-            
-                # 봇이 관리자 방으로 에러 내역을 직접 쏴줌
                 try:
                     with ApiClient(configuration) as api_client:
                         line_bot_api = MessagingApi(api_client)
@@ -435,7 +453,8 @@ def handle_message(event):
                        )
                 except Exception as push_err:
                     print(f"에러 메시지 푸시 전송 실패: {push_err}")
-                
+
+        
         # 관리자 알림 전송 (시트 락 해제 후 전송하여 락 점유시간 단축)
         if alert_text:
             try:
