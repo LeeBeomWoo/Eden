@@ -12,13 +12,15 @@ from flask import Flask, request, abort
 # Upstash Redis 라이브러리
 from upstash_redis import Redis
 
-# Line SDK v3 컴포넌트
+# Line SDK v3 컴포넌트 (MemberLeftEvent 추가)
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, MemberJoinedEvent, AudioMessageContent
+from linebot.v3.webhooks import (
+    MessageEvent, TextMessageContent, MemberJoinedEvent, MemberLeftEvent, AudioMessageContent
+)
 
 
 app = Flask(__name__)
@@ -72,7 +74,6 @@ def sheet_sync_lock(timeout=10, wait_time=7):
             end_time = time.time() + wait_time
             while time.time() < end_time:
                 try:
-                    # set nx=True, ex=timeout 으로 분산 락 획득 시도
                     res = redis.set("lock:sheet_write", "LOCKED", nx=True, ex=timeout)
                     if res:
                         acquired = True
@@ -240,7 +241,6 @@ def handle_message(event):
                 
                 if current_user_id in clean_user_ids:
                     row_index = clean_user_ids.index(current_user_id) + 1
-                    # 배치 업데이트로 K, L열 한번에 초기화
                     validation_sheet.update(range_name=f'K{row_index}:L{row_index}', values=[["", ""]])
         except Exception as e:
             print(f"초기화 시트 에러: {e}")
@@ -290,7 +290,6 @@ def handle_message(event):
                     key_name = key_name.split("(", 1)[0].strip()
                 extracted_data[key_name] = parts[1].strip()
 
-        # 전체 필수 항목 리스트 정의 (어느 하나라도 빠지면 안 됨)
         required_fields = [
             "닉네임", "년생", "나이", "성별", "지역", 
             "결혼유무", "군필여부", "초대자", "야단라경험유무", 
@@ -303,12 +302,10 @@ def handle_message(event):
         for req_field in required_fields:
             val = extracted_data.get(req_field, "").strip()
             if not val:
-                # [예외 처리] 여성의 경우 군필여부는 빈칸이어도 통과
                 if req_field == "군필여부" and user_gender in ["여", "여자"]:
                     continue
                 missing_fields.append(req_field)
 
-        # 누락된 항목이 존재할 경우 되돌려 보냄
         if missing_fields:
             reply_text = (
                 f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n"
@@ -323,7 +320,6 @@ def handle_message(event):
                 )
             return
 
-        # 모든 데이터 추출 및 변수화 (추가된 세부 항목 포함)
         nickname = extracted_data.get("닉네임", "").strip()
         birth_year = extracted_data.get("년생", "").strip()
         age = extracted_data.get("나이", "").strip()
@@ -337,16 +333,14 @@ def handle_message(event):
         kick_reason = extracted_data.get("다른 방에서 킥을 당한적 있는지", "").strip()
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        # [단계 A & B] 동시성 방지 락 내부에서 읽기/검증/저장 일괄 처리
         save_success = False
         alert_text = None
-        current_status = "입장대기" # 신규 유저 기본 상태
+        current_status = "입장대기"
 
         with sheet_sync_lock():
             try:
                 all_data = validation_sheet.get_all_values()
                 
-                # 중복 및 블랙 내역을 담을 리스트와 경고 레벨 변수
                 found_duplicates = []
                 highest_alert_level = 0
                 alert_status_text = ""
@@ -374,7 +368,6 @@ def handle_message(event):
                         is_id_matched = (rec_id == str(user_id).strip() and rec_id != "")
                         is_name_matched = (rec_name == nickname)
 
-                        # ID가 일치하거나 닉네임이 일치하는 경우 (중복 감지)
                         if is_id_matched or is_name_matched:
                             match_reasons = []
                             if is_id_matched: match_reasons.append("고유ID 일치")
@@ -438,19 +431,14 @@ def handle_message(event):
                 clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
                 current_user_id = str(user_id).strip()
 
-                # 시트에 입력할 데이터를 그룹화
-                # 1. A~H 열 (기본정보)
-                # 2. M~S 열 (상세정보: 나이, 결혼, 군필, 초대자, 야단라, 나온이유, 킥사유)
                 update_data_details = [age, marriage, military, inviter, yadan, leave_reason, kick_reason]
 
                 if current_user_id in clean_user_ids:
-                    # 🔄 기존 유저 덮어쓰기 (수정 제출 시)
                     found_row_index = clean_user_ids.index(current_user_id) + 1
                     row_data = all_data[found_row_index - 1]
                     count_val = row_data[7] if len(row_data) >= 8 else "0"
                     current_retry_count = int(count_val) if count_val.isdigit() else 0
                     
-                    # L열(12번째) 기존 상태 보존
                     if len(row_data) >= 12:
                         existing_status = row_data[11].strip()
                         if existing_status:
@@ -458,14 +446,11 @@ def handle_message(event):
                             
                     update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
                     
-                    # A~H, K~L, M~S 각각 덮어쓰기 진행
                     validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
                     validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, current_status]])
                     validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[update_data_details])
                 else:
-                    # ➕ 신규 유저 추가
                     found_row_index = len(all_data) + 1 
-                    
                     row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
                     
                     validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
@@ -487,8 +472,6 @@ def handle_message(event):
                 except Exception as push_err:
                     print(f"에러 메시지 푸시 전송 실패: {push_err}")
 
-        
-        # 관리자 알림 전송
         if alert_text:
             try:
                 with ApiClient(configuration) as api_client:
@@ -499,11 +482,9 @@ def handle_message(event):
             except Exception as push_err:
                 print(f"관리자 푸시 알림 에러: {push_err}")
 
-        # [단계 C] 사용자 응답
         if save_success:
             set_user_session(user_id, {"nickname": nickname})
             
-            # 현재 진행 상태에 따라 안내 문구를 다르게 출력
             if current_status == "입장대기":
                 reply_text = (
                     "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 " 
@@ -552,10 +533,8 @@ def handle_message(event):
                     row_index = clean_user_ids.index(current_user_id) + 1
                     row_data = validation_sheet.row_values(row_index)
                     
-                    # L열(12번째, 인덱스 11) 상태 확인
                     current_status = row_data[11].strip() if len(row_data) > 11 else ""
                     
-                    # 상태가 "입장대기"일 때만 반응!
                     if current_status == "입장대기":
                         should_respond = True
                         
@@ -582,10 +561,8 @@ def handle_message(event):
                             "조용한 곳에서 천천히 또박또박 부탁드립니다."
                         )
                         
-                        # 상태를 '음성대기'로 업데이트
                         validation_sheet.update(range_name=f'L{row_index}', values=[['음성대기']])
 
-            # 신입 회원(입장대기 상태)인 경우에만 메시지 전송
             if should_respond and reply_text:
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
@@ -605,7 +582,6 @@ def handle_message(event):
         return
 
 
-
     # 4. 슬래시(/) 명령어 로직
     if not user_message.startswith("/"):
         return
@@ -613,11 +589,10 @@ def handle_message(event):
     command = user_message[1:].strip()
     if command.startswith(("인증 ", "ㅇㅈ ")):
         if command.startswith("인증 "):
-            search_query = command[3:].strip()   # "인증 " 제거
+            search_query = command[3:].strip()
         else:
-            search_query = command[2:].strip()   # "ㅇㅈ " 제거
+            search_query = command[2:].strip()
 
-        # 고정 단계별 안내문 수동 출력 로직
         if search_query in ["1단계", "양식", "양식안내"]:
             reply_text = (
                 "안녕하세요\n"
@@ -693,7 +668,6 @@ def handle_message(event):
             )
 
 
-
 # ==========================================
 # [핸들러 2] 유저 입장 시 처리 핸들러 (3개 인증방 어디든 동시 대응)
 # ==========================================
@@ -701,7 +675,7 @@ def handle_message(event):
 def handle_member_joined(event):
     welcome_text = (
         "안녕하세요\n"
-        "𝔼·𝔻 ꕤ 𝔼·ℕ 신입 인증방에\n"
+        "𝔼·ℕ ꕤ 𝔼·ℕ 신입 인증방에\n"
         "오신것을 환영합니다\n\n"
         "⭕️아래의 본문을 복사해서 빠.짐.없.이. 작성해주세요.\n\n"
         " - 닉네임(두글자):\n"
@@ -731,7 +705,38 @@ def handle_member_joined(event):
 
 
 # ==========================================
-# [핸들러 3] 음성 메시지(음성 인증) 처리 핸들러
+# [핸들러 3] 유저 퇴장 시 처리 핸들러 (인증 진행상태 및 세션 초기화)
+# ==========================================
+@handler.add(MemberLeftEvent)
+def handle_member_left(event):
+    try:
+        left_members = event.left.members
+        for member in left_members:
+            user_id = member.user_id
+            if not user_id:
+                continue
+
+            # 1. 임시 세션 데이터 삭제
+            del_user_session(user_id)
+
+            # 2. 구글 시트에서 해당 유저의 인증 진행 상태(K, L열) 초기화
+            with sheet_sync_lock():
+                raw_user_ids = validation_sheet.col_values(5)  # E열(아이디)
+                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                current_user_id = str(user_id).strip()
+
+                if current_user_id in clean_user_ids:
+                    row_index = clean_user_ids.index(current_user_id) + 1
+                    # K, L열을 빈값으로 업데이트하여 인증 상태 리셋
+                    validation_sheet.update(range_name=f'K{row_index}:L{row_index}', values=[["", ""]])
+                    print(f"🚪 유저 퇴장으로 인한 인증 상태 초기화 완료 (User ID: {user_id})")
+
+    except Exception as e:
+        print(f"퇴장 처리 핸들러 에러: {e}")
+
+
+# ==========================================
+# [핸들러 4] 음성 메시지(음성 인증) 처리 핸들러
 # ==========================================
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio_message(event):
@@ -752,12 +757,10 @@ def handle_audio_message(event):
                 row_index = clean_user_ids.index(current_user_id) + 1
                 row_data = validation_sheet.row_values(row_index)
                 
-                # L열(12번째) 상태 확인
                 current_status = row_data[11].strip() if len(row_data) >= 12 else ""
                 nickname = row_data[0].strip() if len(row_data) > 0 else "알수없음"
 
                 if current_status == "음성대기":
-                    # 1. 상태를 '승인대기'로 배치 업데이트
                     validation_sheet.update(range_name=f'L{row_index}', values=[['승인대기']])
                     should_alert = True
 
