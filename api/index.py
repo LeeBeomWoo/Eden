@@ -118,7 +118,6 @@ def del_user_session(user_id):
     notified_users.pop(user_id, None)
 
 def set_room_state(room_id, data, ttl=3600):
-    """특정 방(인증방)에 입장한 유저의 상태와 리포트를 캐시(Redis)에 저장"""
     if redis:
         try:
             redis.set(f"room_state:{room_id}", json.dumps(data), ex=ttl)
@@ -141,7 +140,6 @@ def del_room_state(room_id):
     room_states_memory.pop(room_id, None)
 
 def get_room_id_by_name(room_name):
-    """'방관리' 시트에서 '1번방' 등의 이름을 검색해 해당 방의 ID를 반환"""
     if not room_manage_sheet: return None
     cache_key = "cache:room_management"
     data = None
@@ -155,12 +153,11 @@ def get_room_id_by_name(room_name):
         try:
             data = room_manage_sheet.get_all_records()
             if redis and data:
-                redis.set(cache_key, json.dumps(data), ex=3600) # 1시간 캐시
+                redis.set(cache_key, json.dumps(data), ex=3600)
         except Exception as e:
             print(f"방관리 시트 로드 실패: {e}")
             return None
             
-    # 시트의 A열(키) 기반 검색
     target_name = room_name.replace(" ", "")
     for row in data:
         keys = list(row.keys())
@@ -170,9 +167,6 @@ def get_room_id_by_name(room_name):
                 return str(row[keys[1]]).strip()
     return None
 
-# ==========================================
-# [기존 캐시 함수들]
-# ==========================================
 def get_recording_ments():
     cache_key = "cache:recording_ments"
     if redis:
@@ -235,19 +229,18 @@ def callback():
     return 'OK'
 
 # ==========================================
-# [핸들러 1] 일반 유저 메시지 처리 핸들러
+# [핸들러 1] 일반 유저 및 관리자 명령어 처리 핸들러
 # ==========================================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id  
     if not user_id: return 
     
-    # 메시지가 작성된 방/그룹의 ID 추출
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화 (방 상태 캐시도 함께 초기화)
+    # 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
     if user_message == ".":
         del_user_session(user_id)
         del_room_state(source_id)
@@ -266,66 +259,56 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # [NEW] 0-1. 관리자방 명령어: O번방 확인
-    if "확인" in user_message and source_id == ADMIN_GROUP_CHAT_ID:
-        room_name_input = user_message.replace("확인", "").strip()
-        target_room_id = get_room_id_by_name(room_name_input)
+    # [관리자 전용 명령어 (반드시 '/'로 시작해야 함)]
+    if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
+        command_body = user_message[1:].strip()
         
-        if target_room_id:
-            room_state = get_room_state(target_room_id)
-            if not room_state:
-                reply_text = f"📭 [{room_name_input}] 현재 대기 중인 신규 인증 멤버가 없습니다."
-            else:
-                status = room_state.get('status')
-                is_known = room_state.get('is_known', False)
-                
-                if status == 'joined':
-                    if is_known:
-                        reply_text = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
-                    else:
-                        reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다."
-                        
-                elif status == 'form_submitted':
-                    alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
-                    reply_text = alert_report
-        else:
-            if room_manage_sheet:
-                reply_text = f"❌ '{room_name_input}' 정보를 '방관리' 시트에서 찾을 수 없습니다."
+        # 1) /O번방 확인 명령어
+        if "확인" in command_body:
+            room_name_input = command_body.replace("확인", "").strip()
+            target_room_id = get_room_id_by_name(room_name_input)
             
-        if reply_text:
+            if target_room_id:
+                room_state = get_room_state(target_room_id)
+                if not room_state:
+                    reply_text = f"📭 [{room_name_input}] 현재 대기 중인 신규 인증 멤버가 없습니다."
+                else:
+                    status = room_state.get('status')
+                    is_known = room_state.get('is_known', False)
+                    
+                    if status == 'joined':
+                        if is_known:
+                            reply_text = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
+                        else:
+                            reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다."
+                            
+                    elif status == 'form_submitted':
+                        alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
+                        reply_text = alert_report
+            else:
+                if room_manage_sheet:
+                    reply_text = f"❌ '{room_name_input}' 정보를 '방관리' 시트에서 찾을 수 없습니다."
+                
+            if reply_text:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+            return
+
+        # 2) /방목록갱신 명령어
+        if command_body == "방목록갱신":
+            if redis:
+                try:
+                    redis.delete("cache:room_management")
+                except: pass
+            reply_text = "🔄 방 관리 목록 캐시가 갱신되었습니다. 이제 새로 추가된 방을 즉시 인식할 수 있습니다!"
+            
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-        return
+            return
 
-    # [NEW] 0-2. 관리자방 명령어: 방목록갱신
-    if user_message in ["방목록갱신", "/방목록갱신"] and source_id == ADMIN_GROUP_CHAT_ID:
-        if redis:
-            try:
-                redis.delete("cache:room_management")
-            except: pass
-        reply_text = "🔄 방 관리 목록 캐시가 갱신되었습니다. 이제 새로 추가된 방을 즉시 인식할 수 있습니다!"
-        
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-        return
-
-    # 1. 그룹/룸 고유 아이디 확인 명령어 (편의성 개선)
-    if user_message in ["/여긴어디?", "방아이디확인", "/방아이디확인"]:
-        if hasattr(event.source, 'group_id'):
-            reply_text = f"📍 현재 계신 곳은 [그룹방]입니다.\n🆔 Group ID:\n{event.source.group_id}"
-        elif hasattr(event.source, 'room_id'):
-            reply_text = f"📍 현재 계신 곳은 [멀티 대화방]입니다.\n🆔 Room ID:\n{event.source.room_id}"
-        else:
-            reply_text = f"👤 현재 계신 곳은 [1:1 채팅방]입니다.\n🆔 User ID:\n{event.source.user_id}"
-            
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-        return
-
-    # 2. 신입 인증 양식 제출 처리
+    # 1. 신입 인증 양식 제출 처리 (일반 텍스트 입력)
     if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
         extracted_data = {}
         for line in user_message.split("\n"):
@@ -499,7 +482,7 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # 3. 안내 확인 답변 처리
+    # 2. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
             should_respond = False
@@ -536,8 +519,7 @@ def handle_message(event):
             pass
         return
 
-
-    # 4. 슬래시(/) 명령어 로직 (기존과 동일)
+    # 3. 슬래시(/) 명령어 로직 (유저용)
     if not user_message.startswith("/"): return
     command = user_message[1:].strip()
     if command.startswith(("인증 ", "ㅇㅈ ")):
@@ -571,7 +553,7 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
 
 # ==========================================
-# [핸들러 2] 유저 입장 시 처리 핸들러 (블랙리스트 즉시 캐싱)
+# [핸들러 2] 유저 입장 시 처리 핸들러
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
