@@ -491,6 +491,19 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
+        # [NEW] 방 목록 캐시 즉시 갱신 명령어
+    if user_message in ["방목록갱신", "/방목록갱신"] and source_id == ADMIN_GROUP_CHAT_ID:
+        if redis:
+            try:
+                redis.delete("cache:room_management")
+            except: pass
+        reply_text = "🔄 방 관리 목록 캐시가 갱신되었습니다. 이제 새로 추가된 방을 즉시 인식할 수 있습니다!"
+        
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+        return
+
     # 3. 안내 확인 답변 처리
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
