@@ -247,9 +247,10 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화
+    # 0. 점(.)만 입력된 경우 임시 저장 데이터 및 인증 상태 초기화 (방 상태 캐시도 함께 초기화)
     if user_message == ".":
         del_user_session(user_id)
+        del_room_state(source_id)
         try:
             with sheet_sync_lock():
                 raw_user_ids = validation_sheet.col_values(5)
@@ -267,7 +268,6 @@ def handle_message(event):
 
     # [NEW] 0-1. 관리자방 명령어: O번방 확인
     if "확인" in user_message and source_id == ADMIN_GROUP_CHAT_ID:
-        # 예: "1번방 확인", "1번 방 확인" 등을 파싱
         room_name_input = user_message.replace("확인", "").strip()
         target_room_id = get_room_id_by_name(room_name_input)
         
@@ -286,7 +286,6 @@ def handle_message(event):
                         reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다."
                         
                 elif status == 'form_submitted':
-                    # 양식 제출 시 생성해둔 중복/블랙 알림 리포트를 그대로 답장
                     alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
                     reply_text = alert_report
         else:
@@ -299,9 +298,21 @@ def handle_message(event):
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
+    # [NEW] 0-2. 관리자방 명령어: 방목록갱신
+    if user_message in ["방목록갱신", "/방목록갱신"] and source_id == ADMIN_GROUP_CHAT_ID:
+        if redis:
+            try:
+                redis.delete("cache:room_management")
+            except: pass
+        reply_text = "🔄 방 관리 목록 캐시가 갱신되었습니다. 이제 새로 추가된 방을 즉시 인식할 수 있습니다!"
+        
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+        return
 
-    # 1. 그룹/룸 고유 아이디 확인 명령어
-    if user_message == "/여긴어디?":
+    # 1. 그룹/룸 고유 아이디 확인 명령어 (편의성 개선)
+    if user_message in ["/여긴어디?", "방아이디확인", "/방아이디확인"]:
         if hasattr(event.source, 'group_id'):
             reply_text = f"📍 현재 계신 곳은 [그룹방]입니다.\n🆔 Group ID:\n{event.source.group_id}"
         elif hasattr(event.source, 'room_id'):
@@ -421,7 +432,6 @@ def handle_message(event):
 
                 if highest_alert_level > 0:
                     dup_details_str = "\n\n".join(found_duplicates)
-                    # [NEW] Push 메시지용이 아닌, Redis 저장용 리포트 생성
                     alert_text = (
                         f"{color_emoji} 신입 양식 작성 중복/블랙 필터링 결과\n\n"
                         f"📌 상태: {alert_status_text}\n"
@@ -457,7 +467,6 @@ def handle_message(event):
                 save_success = False
                 print(f"🚨 구글 시트 저장 처리 에러:\n{sheet_err}")
 
-        # [NEW] 푸시 발송 대신 캐시에 유저의 상태(양식 제출 및 리포트)를 저장해둡니다.
         if save_success:
             if alert_text:
                 state_data = {
@@ -471,8 +480,7 @@ def handle_message(event):
                     "status": "form_submitted",
                     "report": "✅ 해당 유저는 중복/블랙 이력이 없는 깨끗한 신규 회원입니다.\n양식이 정상 접수되었습니다."
                 }
-            # 현재 양식을 제출한 방의 ID 기준으로 상태 저장 (관리자가 조회할 수 있도록)
-            set_room_state(source_id, state_data, ttl=7200) # 2시간 보관
+            set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname})
             
             if current_status == "입장대기":
@@ -486,19 +494,6 @@ def handle_message(event):
         else:
             reply_text = "⚠️ 서버 통신 문제로 저장에 실패했습니다. 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
 
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-        return
-
-        # [NEW] 방 목록 캐시 즉시 갱신 명령어
-    if user_message in ["방목록갱신", "/방목록갱신"] and source_id == ADMIN_GROUP_CHAT_ID:
-        if redis:
-            try:
-                redis.delete("cache:room_management")
-            except: pass
-        reply_text = "🔄 방 관리 목록 캐시가 갱신되었습니다. 이제 새로 추가된 방을 즉시 인식할 수 있습니다!"
-        
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
@@ -582,7 +577,6 @@ def handle_message(event):
 def handle_member_joined(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', None))
     
-    # [NEW] 유저가 입장하자마자 구글 시트에서 방문 이력이 있는지 빠르게 검사합니다.
     try:
         joined_member_id = event.joined.members[0].user_id
         is_known_user = False
@@ -623,11 +617,9 @@ def handle_member_left(event):
             user_id = member.user_id
             if not user_id: continue
 
-            # 1. 임시 세션 및 방 상태 삭제
             del_user_session(user_id)
-            if source_id: del_room_state(source_id) # 방 캐시 초기화
+            if source_id: del_room_state(source_id)
 
-            # 2. 구글 시트 초기화
             with sheet_sync_lock():
                 raw_user_ids = validation_sheet.col_values(5)
                 clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
@@ -645,8 +637,6 @@ def handle_audio_message(event):
     user_id = event.source.user_id
     if not user_id: return
 
-    # [주의] 음성 인증 완료 알람은 여전히 Push를 사용하도록 남겨두었습니다. 
-    # (빈도가 낮을 것으로 예상되어 남겼으나, 이것도 요금 문제를 일으킨다면 나중에 명령어 방식으로 바꿀 수 있습니다.)
     try:
         should_alert = False
         nickname = "알수없음"
@@ -671,7 +661,6 @@ def handle_audio_message(event):
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
                 
-                # Push 발송 에러가 나더라도(한도 초과) 봇이 죽지 않도록 예외처리 강화
                 try:
                     line_bot_api.push_message(PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=admin_alert_text)]))
                 except Exception as e:
