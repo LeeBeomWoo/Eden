@@ -39,8 +39,8 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope)
 client = gspread.authorize(creds)
 
 # [Supabase 클라이언트 초기화]
-supabase_url = os.environ.get("https://vlicptxwvzgshpcgesqh.supabase.co")
-supabase_key = os.environ.get("sb_publishable_icCIj5hWWvIspIGqRklVwg_vmXStPT1")
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
 
 if supabase_url and supabase_key:
     supabase: Client = create_client(supabase_url, supabase_key)
