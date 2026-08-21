@@ -33,10 +33,10 @@ handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
 
 # 구글 서비스 계정 인증
 json_key_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-json_key_dict = json.loads(json_key_str)
+json_key_dict = json.loads(json_key_str) if json_key_str else {}
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope)
-client = gspread.authorize(creds)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key_dict, scope) if json_key_dict else None
+client = gspread.authorize(creds) if creds else None
 
 # [Supabase 클라이언트 초기화]
 supabase_url = os.environ.get("SUPABASE_URL")
@@ -56,13 +56,16 @@ room_states_memory = {}
 local_sheet_lock = threading.Lock()
 
 # 구글 스프레드시트 연결
-sheet = client.open("인증멘트").worksheet("멘트")
-validation_sheet = client.open("인증멘트").worksheet("검증")
-try:
-    room_manage_sheet = client.open("인증멘트").worksheet("방관리")
-except Exception as e:
-    print(f"⚠️ '방관리' 시트를 찾을 수 없습니다: {e}")
-    room_manage_sheet = None
+if client:
+    try:
+        sheet = client.open("인증멘트").worksheet("멘트")
+        validation_sheet = client.open("인증멘트").worksheet("검증")
+        room_manage_sheet = client.open("인증멘트").worksheet("방관리")
+    except Exception as e:
+        print(f"⚠️ 시트 연결 중 일부 실패: {e}")
+        room_manage_sheet = None
+else:
+    sheet = validation_sheet = room_manage_sheet = None
 
 
 # ==========================================
@@ -180,7 +183,6 @@ def is_last_joined_user(source_id, user_id):
     if room_state and room_state.get('user_id'):
         return room_state.get('user_id') == user_id
     
-    # 방 세션 정보가 아직 없거나 만료되었을 경우, 기존 유저의 오작동 방지를 위해 제한
     return True
 
 
@@ -244,29 +246,41 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 0. 점(.) 입력 시 초기화 (마지막 입장 유저만 허용)
+    # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
     if user_message == ".":
-        if not is_last_joined_user(source_id, user_id):
-            return
+        # 1) 현재 방 세션에서 진행 중이던 신입 유저 ID 추출
+        room_state = get_room_state(source_id)
+        target_user_id = room_state.get('user_id') if room_state else None
 
-        del_user_session(user_id)
+        # 2) 진행 중이던 신입이 존재하면 DB 및 시트 상태를 '입장대기'로 리셋
+        if target_user_id:
+            del_user_session(target_user_id)
+            try:
+                if supabase:
+                    supabase.table('user_validations').update({"status": "입장대기"}).eq('user_id', target_user_id).execute()
+                
+                with sheet_sync_lock():
+                    if validation_sheet:
+                        raw_user_ids = validation_sheet.col_values(5)
+                        clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                        if target_user_id in clean_user_ids:
+                            row_index = clean_user_ids.index(target_user_id) + 1
+                            validation_sheet.update(range_name=f'L{row_index}', values=[["입장대기"]])
+            except Exception as e:
+                print(f"유저 상태 초기화 처리 중 에러: {e}")
+
+        # 3) 해당 방 세션 삭제
         del_room_state(source_id)
-        try:
-            if supabase:
-                supabase.table('user_validations').update({"status": "입장대기"}).eq('user_id', user_id).execute()
-            with sheet_sync_lock():
-                raw_user_ids = validation_sheet.col_values(5)
-                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                if user_id in clean_user_ids:
-                    row_index = clean_user_ids.index(user_id) + 1
-                    validation_sheet.update(range_name=f'K{row_index}:L{row_index}', values=[["", ""]])
-        except Exception as e:
-            print(f"초기화 처리 중 에러: {e}")
-            
-        reply_text = "🔄 임시 저장된 데이터와 인증 진행 상태가 초기화되었습니다.\n신입 인증 양식을 처음부터 다시 작성해 주세요!"
+
+        reply_text = "🔄 해당 방의 인증 진행 상태가 초기화되었습니다.\n신입 유저는 양식을 처음부터 다시 작성해 주세요!"
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token, 
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
         return
 
     # 슬래시(/) 명령어 로직
@@ -298,19 +312,20 @@ def handle_message(event):
                 sync_reports = []
 
                 # A. '멘트' 시트 동기화
-                ments_data = sheet.get_all_records()
-                ments_records = []
-                for row in ments_data:
-                    k_raw = str(row.get('인증', '')).strip()
-                    v_text = str(row.get('출력', '')).strip()
-                    if k_raw and v_text:
-                        for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
-                            ments_records.append({"keyword": k, "reply_text": v_text})
-                
-                if ments_records and supabase:
-                    supabase.table('auth_ments').delete().neq('keyword', '_DELETE_ALL_KEY_').execute()
-                    supabase.table('auth_ments').insert(ments_records).execute()
-                    sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드")
+                if sheet:
+                    ments_data = sheet.get_all_records()
+                    ments_records = []
+                    for row in ments_data:
+                        k_raw = str(row.get('인증', '')).strip()
+                        v_text = str(row.get('출력', '')).strip()
+                        if k_raw and v_text:
+                            for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
+                                ments_records.append({"keyword": k, "reply_text": v_text})
+                    
+                    if ments_records and supabase:
+                        supabase.table('auth_ments').delete().neq('keyword', '_DELETE_ALL_KEY_').execute()
+                        supabase.table('auth_ments').insert(ments_records).execute()
+                        sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드")
 
                 # B. '방관리' 시트 동기화
                 if room_manage_sheet:
@@ -330,39 +345,41 @@ def handle_message(event):
 
                 # C. '녹음' 시트 동기화
                 try:
-                    rec_sheet = client.open("인증멘트").worksheet("녹음")
-                    males = [c.strip() for c in rec_sheet.col_values(1)[1:] if c and c.strip()]
-                    females = [c.strip() for c in rec_sheet.col_values(2)[1:] if c and c.strip()]
-                    rec_records = [{"gender": "male", "ment": m} for m in males] + [{"gender": "female", "ment": f} for f in females]
-                    
-                    if rec_records and supabase:
-                        supabase.table('recording_ments').delete().gte('id', 0).execute()
-                        supabase.table('recording_ments').insert(rec_records).execute()
-                        sync_reports.append(f"• 녹음멘트: 남성({len(males)}) / 여성({len(females)})")
+                    if client:
+                        rec_sheet = client.open("인증멘트").worksheet("녹음")
+                        males = [c.strip() for c in rec_sheet.col_values(1)[1:] if c and c.strip()]
+                        females = [c.strip() for c in rec_sheet.col_values(2)[1:] if c and c.strip()]
+                        rec_records = [{"gender": "male", "ment": m} for m in males] + [{"gender": "female", "ment": f} for f in females]
+                        
+                        if rec_records and supabase:
+                            supabase.table('recording_ments').delete().gte('id', 0).execute()
+                            supabase.table('recording_ments').insert(rec_records).execute()
+                            sync_reports.append(f"• 녹음멘트: 남성({len(males)}) / 여성({len(females)})")
                 except Exception as e:
                     print(f"녹음 시트 동기화 패스: {e}")
 
                 # D. '검증' 시트 동기화
-                all_val_data = validation_sheet.get_all_values()
-                if all_val_data and len(all_val_data) > 1:
-                    val_records = []
-                    for row in all_val_data[1:]:
-                        u_id = str(row[4]).strip() if len(row) > 4 else ""
-                        if u_id:
-                            val_records.append({
-                                "user_id": u_id,
-                                "nickname": str(row[0]).strip() if len(row) > 0 else "",
-                                "gender": str(row[1]).strip() if len(row) > 1 else "",
-                                "region": str(row[2]).strip() if len(row) > 2 else "",
-                                "birth_year": str(row[3]).strip() if len(row) > 3 else "",
-                                "entry_date": str(row[5]).strip() if len(row) > 5 else "",
-                                "black_reason": str(row[6]).strip() if len(row) > 6 else "",
-                                "retry_count": int(row[7]) if len(row) > 7 and row[7].isdigit() else 1,
-                                "status": str(row[11]).strip() if len(row) > 11 else "입장대기"
-                            })
-                    if val_records and supabase:
-                        supabase.table('user_validations').upsert(val_records).execute()
-                        sync_reports.append(f"• 검증이력: {len(val_records)}명 유저 데이터")
+                if validation_sheet:
+                    all_val_data = validation_sheet.get_all_values()
+                    if all_val_data and len(all_val_data) > 1:
+                        val_records = []
+                        for row in all_val_data[1:]:
+                            u_id = str(row[4]).strip() if len(row) > 4 else ""
+                            if u_id:
+                                val_records.append({
+                                    "user_id": u_id,
+                                    "nickname": str(row[0]).strip() if len(row) > 0 else "",
+                                    "gender": str(row[1]).strip() if len(row) > 1 else "",
+                                    "region": str(row[2]).strip() if len(row) > 2 else "",
+                                    "birth_year": str(row[3]).strip() if len(row) > 3 else "",
+                                    "entry_date": str(row[5]).strip() if len(row) > 5 else "",
+                                    "black_reason": str(row[6]).strip() if len(row) > 6 else "",
+                                    "retry_count": int(row[7]) if len(row) > 7 and row[7].isdigit() else 1,
+                                    "status": str(row[11]).strip() if len(row) > 11 else "입장대기"
+                                })
+                        if val_records and supabase:
+                            supabase.table('user_validations').upsert(val_records).execute()
+                            sync_reports.append(f"• 검증이력: {len(val_records)}명 유저 데이터")
 
                 report_str = "\n".join(sync_reports)
                 reply_text = f"✅ 모든 구글 시트 데이터가 DB에 동기화되었습니다!\n\n{report_str}"
@@ -526,6 +543,7 @@ def handle_message(event):
             "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason
         }
         
+        # 1번 양식 제출 시 무조건 '입장대기'로 초기화하여 2번 양식이 정상 전송되도록 변경
         target_status = "입장대기"
         if supabase:
             try:
@@ -533,9 +551,6 @@ def handle_message(event):
                 retry_cnt = 1
                 if user_res.data:
                     retry_cnt = user_res.data[0].get('retry_count', 1) + 1
-                    prev_status = user_res.data[0].get('status', '')
-                    if prev_status in ["음성대기", "승인대기"]:
-                        target_status = prev_status
 
                 supabase.table('user_validations').upsert({
                     "user_id": user_id,
@@ -555,27 +570,28 @@ def handle_message(event):
         # C. 구글 시트 백업
         with sheet_sync_lock():
             try:
-                all_data = validation_sheet.get_all_values()
-                clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
-                details_list = [age, marriage, military, inviter, yadan, leave_reason, kick_reason]
+                if validation_sheet:
+                    all_data = validation_sheet.get_all_values()
+                    clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
+                    details_list = [age, marriage, military, inviter, yadan, leave_reason, kick_reason]
 
-                if user_id in clean_user_ids:
-                    found_row_index = clean_user_ids.index(user_id) + 1
-                    row_data = all_data[found_row_index - 1]
-                    count_val = row_data[7] if len(row_data) >= 8 else "0"
-                    current_retry_count = int(count_val) if count_val.isdigit() else 0
+                    if user_id in clean_user_ids:
+                        found_row_index = clean_user_ids.index(user_id) + 1
+                        row_data = all_data[found_row_index - 1]
+                        count_val = row_data[7] if len(row_data) >= 8 else "0"
+                        current_retry_count = int(count_val) if count_val.isdigit() else 0
 
-                    update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
-                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
-                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
-                    validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
-                else:
-                    found_row_index = len(all_data) + 1
-                    row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
-                    validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
-                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
-                    validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
-                save_success = True
+                        update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
+                        validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
+                        validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
+                        validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
+                    else:
+                        found_row_index = len(all_data) + 1
+                        row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
+                        validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
+                        validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
+                        validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
+                    save_success = True
             except Exception as sheet_err:
                 print(f"구글 시트 백업 에러: {sheet_err}")
 
@@ -589,16 +605,11 @@ def handle_message(event):
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
 
             # 2번 양식 전송
-            if target_status == "입장대기":
-                form2_text = search_keyword("2") or search_keyword("2번")
-                if form2_text:
-                    reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
-                else:
-                    reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
-            elif target_status == "음성대기":
-                reply_text = "✅ 양식 수정이 반영되었습니다.\n\n이어서 진행 중이던 [음성 인증]을 마저 완료해 주세요!"
-            elif target_status == "승인대기":
-                reply_text = "✅ 양식 수정이 반영되었습니다.\n\n현재 관리자 승인을 대기 중이므로 잠시만 기다려주세요."
+            form2_text = search_keyword("2") or search_keyword("2번")
+            if form2_text:
+                reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
+            else:
+                reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
         else:
             reply_text = "⚠️ 서버 통신 문제로 저장에 실패했습니다. 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
 
@@ -663,11 +674,12 @@ def handle_message(event):
                     supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
 
                 with sheet_sync_lock():
-                    raw_user_ids = validation_sheet.col_values(5)
-                    clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                    if user_id in clean_user_ids:
-                        row_index = clean_user_ids.index(user_id) + 1
-                        validation_sheet.update(range_name=f'L{row_index}', values=[["음성대기"]])
+                    if validation_sheet:
+                        raw_user_ids = validation_sheet.col_values(5)
+                        clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                        if user_id in clean_user_ids:
+                            row_index = clean_user_ids.index(user_id) + 1
+                            validation_sheet.update(range_name=f'L{row_index}', values=[["음성대기"]])
 
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
@@ -773,11 +785,12 @@ def handle_audio(event):
 
         with sheet_sync_lock():
             try:
-                raw_user_ids = validation_sheet.col_values(5)
-                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                if user_id in clean_user_ids:
-                    row_index = clean_user_ids.index(user_id) + 1
-                    validation_sheet.update(range_name=f'L{row_index}', values=[["승인대기"]])
+                if validation_sheet:
+                    raw_user_ids = validation_sheet.col_values(5)
+                    clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                    if user_id in clean_user_ids:
+                        row_index = clean_user_ids.index(user_id) + 1
+                        validation_sheet.update(range_name=f'L{row_index}', values=[["승인대기"]])
             except Exception as e:
                 print(f"음성 제출 시트 업데이트 에러: {e}")
 
