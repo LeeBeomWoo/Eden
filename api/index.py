@@ -110,7 +110,7 @@ def sheet_sync_lock(timeout=10, wait_time=7):
             if acquired and supabase:
                 try:
                     supabase.table('app_locks').delete().eq('lock_name', lock_name).execute()
-                except:
+                except Exception:
                     pass
 
 
@@ -616,37 +616,49 @@ def handle_message(event):
             should_respond = False
             user_nickname = ""
             user_gender = ""
+            inviter = ""
 
-            # DB 유저 상태 확인
+            # DB 유저 상태 및 정보(닉네임, 성별, 초대자) 조회
             if supabase:
                 u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
                 if u_res.data:
                     u_data = u_res.data[0]
                     if u_data.get('status') == '입장대기':
                         should_respond = True
-                        user_nickname = u_data.get('nickname', '')
+                        user_nickname = u_data.get('nickname', '신입')
                         user_gender = u_data.get('gender', '')
+                        
+                        # 1번 양식에서 저장된 details 내 초대자 정보 추출
+                        details = u_data.get('details') or {}
+                        inviter = details.get('inviter', '없음')
 
             if should_respond:
-                # 3번 키워드(음성인증 안내) 조회
-                reply_text = search_keyword("3") or search_keyword("3번")
+                # 성별에 따른 DB 랜덤 녹음 멘트 추출
+                col_male, col_female = get_recording_ments()
+                rec_ment = ""
+                if user_gender in ["남", "남자"] and col_male:
+                    rec_ment = random.choice(col_male)
+                elif user_gender in ["여", "여자"] and col_female:
+                    rec_ment = random.choice(col_female)
                 
-                if not reply_text:
-                    col_male, col_female = get_recording_ments()
-                    rec_ment = ""
-                    if user_gender in ["남", "남자"] and col_male:
-                        rec_ment = random.choice(col_male)
-                    elif user_gender in ["여", "여자"] and col_female:
-                        rec_ment = random.choice(col_female)
+                # DB 멘트가 없을 경우 기본 멘트 처리
+                if not rec_ment:
+                    rec_ment = "잘 부탁드립니다."
 
-                    if rec_ment:
-                        reply_text = f"🎙️ [{user_nickname}]님, 음성 인증 단계입니다.\n아래 문장을 녹음하여 음성 메시지로 보내주세요!\n\n\"{rec_ment}\""
-                    else:
-                        reply_text = f"🎙️ [{user_nickname}]님, 음성 인증 단계입니다.\n안내받으신 문장을 녹음하여 음성 메시지로 보내주세요!"
-                else:
-                    reply_text = reply_text.replace("{닉네임}", user_nickname).replace("{nickname}", user_nickname)
+                # 오늘 날짜 추출 (예: 8월 21일)
+                now = datetime.datetime.now()
+                date_str = f"{now.month}월 {now.day}일"
 
-                # DB & 구글 시트 상태 '음성대기' 변경
+                # 요청 양식에 맞춰 문구 동적 생성
+                reply_text = (
+                    f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
+                    f"키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
+                    f"아래 문구를 정확하게 읽어주세요.\n\n"
+                    f"\"제 닉네임은 {user_nickname}입니다. 오늘은 {date_str}, 초대자 {inviter}입니다. {rec_ment}\"\n\n"
+                    f"조용한 곳에서 천천히 또박또박 부탁드립니다."
+                )
+
+                # DB & 구글 시트 상태를 '음성대기'로 변경
                 if supabase:
                     supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
 
