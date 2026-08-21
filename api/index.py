@@ -268,6 +268,35 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
+    # 3. 슬래시(/) 명령어 로직 (유저용 인증 멘트 조회)
+    if user_message.startswith("/"):
+        command = user_message[1:].strip()
+        parts = command.split(maxsplit=1)
+        cmd_prefix = parts[0]
+
+        if cmd_prefix in ("인증", "ㅇㅈ"):
+            if len(parts) < 2 or not parts[1].strip():
+                reply_text = "사용법: /인증 [키워드] 형태로 입력해 주세요."
+            else:
+                keyword = parts[1].strip()
+                try:
+                    res = supabase.table('auth_ments').select('reply_text').eq('keyword', keyword).execute()
+                    if res.data and len(res.data) > 0:
+                        reply_text = res.data[0]['reply_text']
+                    else:
+                        reply_text = f"'{keyword}'에 해당하는 인증 멘트를 찾을 수 없습니다."
+                except Exception as e:
+                    reply_text = f"DB 조회 오류: {e}"
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
+            return
     # [관리자 전용 명령어 (반드시 '/'로 시작해야 함)]
     if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
         command_body = user_message[1:].strip()
