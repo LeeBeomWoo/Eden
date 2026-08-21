@@ -173,7 +173,7 @@ def del_room_state(room_id):
 
 
 # ==========================================
-# [DB 전용 조회 함수 (구글 시트 Direct 조회 대신 DB 사용)]
+# [DB 전용 조회 함수]
 # ==========================================
 def get_room_id_by_name(room_name):
     """DB에서 방 이름으로 방 ID를 조회합니다."""
@@ -210,17 +210,6 @@ def search_keyword(keyword):
         except Exception as e:
             print(f"키워드 DB 검색 오류: {e}")
     return None
-
-def get_all_keywords():
-    """DB에 등록된 모든 인증 키워드 목록을 가져옵니다."""
-    if supabase:
-        try:
-            res = supabase.table('auth_ments').select('keyword').execute()
-            if res.data:
-                return [row['keyword'] for row in res.data]
-        except Exception as e:
-            print(f"전체 키워드 DB 조회 오류: {e}")
-    return []
 
 
 @app.route("/api", methods=['POST'])
@@ -268,7 +257,7 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # 3. 슬래시(/) 명령어 로직 (유저용 인증 멘트 조회)
+    # 슬래시(/) 명령어 로직 (유저용 인증 멘트 직접 조회)
     if user_message.startswith("/"):
         command = user_message[1:].strip()
         parts = command.split(maxsplit=1)
@@ -279,30 +268,19 @@ def handle_message(event):
                 reply_text = "사용법: /인증 [키워드] 형태로 입력해 주세요."
             else:
                 keyword = parts[1].strip()
-                try:
-                    res = supabase.table('auth_ments').select('reply_text').eq('keyword', keyword).execute()
-                    if res.data and len(res.data) > 0:
-                        reply_text = res.data[0]['reply_text']
-                    else:
-                        reply_text = f"'{keyword}'에 해당하는 인증 멘트를 찾을 수 없습니다."
-                except Exception as e:
-                    reply_text = f"DB 조회 오류: {e}"
+                res_text = search_keyword(keyword)
+                reply_text = res_text if res_text else f"'{keyword}'에 해당하는 인증 멘트를 찾을 수 없습니다."
 
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)]
-                    )
-                )
+                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
             return
 
     # [관리자 전용 명령어 (반드시 '/'로 시작해야 함)]
     if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
         command_body = user_message[1:].strip()
 
-        # 1) /디비업데이트 명령어 (4개 구글 시트를 Supabase DB로 일괄 동기화)
+        # 1) /디비업데이트 명령어
         if "디비업데이트" in command_body:
             try:
                 sync_reports = []
@@ -383,12 +361,7 @@ def handle_message(event):
                 safe_reply_text = reply_text[:4900] if len(reply_text) > 4900 else reply_text
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token, 
-                            messages=[TextMessage(text=safe_reply_text)]
-                        )
-                    )
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
 
         # 2) /O번방 확인 명령어
@@ -427,7 +400,7 @@ def handle_message(event):
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
             return
 
-    # 1. 신입 인증 양식 제출 처리 (일반 텍스트 입력)
+    # 1. 1번 양식 제출 처리 (일반 텍스트 입력)
     if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
         extracted_data = {}
         for line in user_message.split("\n"):
@@ -450,6 +423,7 @@ def handle_message(event):
                     continue
                 missing_fields.append(req_field)
 
+        # 누락된 필드가 있는 경우 안내
         if missing_fields:
             reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n해당 항목을 빠짐없이 작성 후 다시 제출해 주세요!"
             with ApiClient(configuration) as api_client:
@@ -498,10 +472,8 @@ def handle_message(event):
 
                     if is_id_matched or is_name_matched:
                         match_reasons = []
-                        if is_id_matched:
-                            match_reasons.append("고유ID 일치")
-                        if is_name_matched:
-                            match_reasons.append("닉네임 일치")
+                        if is_id_matched: match_reasons.append("고유ID 일치")
+                        if is_name_matched: match_reasons.append("닉네임 일치")
 
                         match_score = 0
                         if rec_year == birth_year: match_score += 1
@@ -608,10 +580,15 @@ def handle_message(event):
                 state_data = {"user_id": user_id, "status": "form_submitted", "report": "✅ 해당 유저는 중복/블랙 이력이 없는 깨끗한 신규 회원입니다.\n양식이 정상 접수되었습니다."}
 
             set_room_state(source_id, state_data, ttl=7200)
-            set_user_session(user_id, {"nickname": nickname})
+            set_user_session(user_id, {"nickname": nickname, "gender": gender})
 
+            # 📌 1번 양식 완수 시 -> 바로 2번 양식(멘트)을 DB에서 검색하여 유저에게 출력
             if current_status == "입장대기":
-                reply_text = "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 내부인원들의 동의없이 무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n읽고 확인이라고 입력해 주세요"
+                form2_text = search_keyword("2") or search_keyword("2번")
+                if form2_text:
+                    reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
+                else:
+                    reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n내부 규정을 확인하시고 '확인'이라고 답장해 주세요."
             elif current_status == "음성대기":
                 reply_text = "✅ 양식 수정이 반영되었습니다.\n\n이어서 진행 중이던 [음성 인증]을 마저 완료해 주세요!"
             elif current_status == "승인대기":
@@ -626,13 +603,14 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # 2. 안내 확인 답변 처리 ("확인", "확인했습니다" 등 -> 2번 멘트 출력)
+    # 2. 신입이 "확인" 답장 입력 시 -> 음성인증 안내 메시지 출력
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         try:
             should_respond = False
             user_nickname = ""
+            user_gender = ""
 
-            # DB에서 유저 상태 확인 (입장대기 상태인지 check)
+            # DB에서 유저 상태 확인 (입장대기 상태인지 확인)
             if supabase:
                 u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
                 if u_res.data:
@@ -640,18 +618,27 @@ def handle_message(event):
                     if u_data.get('status') == '입장대기':
                         should_respond = True
                         user_nickname = u_data.get('nickname', '')
+                        user_gender = u_data.get('gender', '')
 
             if should_respond:
-                # 📌 auth_ments DB에서 '2'번(또는 '2번') 키워드 멘트 조회
-                reply_text = search_keyword("2") or search_keyword("2번")
+                # 📌 3번 키워드(음성인증 안내) DB 조회
+                reply_text = search_keyword("3") or search_keyword("3번")
+                
+                # 3번 키워드가 없을 경우, DB '녹음' 시트에서 성별별 랜던 녹음 멘트 발송
                 if not reply_text:
-                    reply_text = "⚠️ DB에 '2'번 키워드 멘트가 등록되어 있지 않습니다."
+                    col_male, col_female = get_recording_ments()
+                    rec_ment = ""
+                    if user_gender in ["남", "남자"] and col_male:
+                        rec_ment = random.choice(col_male)
+                    elif user_gender in ["여", "여자"] and col_female:
+                        rec_ment = random.choice(col_female)
+
+                    if rec_ment:
+                        reply_text = f"🎙️ [{user_nickname}]님, 음성 인증 단계입니다.\n아래 문장을 녹음하여 음성 메시지로 보내주세요!\n\n\"{rec_ment}\""
+                    else:
+                        reply_text = f"🎙️ [{user_nickname}]님, 음성 인증 단계입니다.\n안내받으신 문장을 녹음하여 음성 메시지로 보내주세요!"
                 else:
-                    # DB 멘트에 {닉네임} 치환값이 포함되어 있다면 입력한 닉네임으로 자동 치환
-                    session_info = get_user_session(user_id) or {}
-                    final_nickname = session_info.get("nickname") or user_nickname
-                    if final_nickname:
-                        reply_text = reply_text.replace("{닉네임}", final_nickname).replace("{nickname}", final_nickname)
+                    reply_text = reply_text.replace("{닉네임}", user_nickname).replace("{nickname}", user_nickname)
 
                 # DB & 구글 시트 상태 업데이트 ('음성대기')
                 if supabase:
@@ -676,7 +663,7 @@ def handle_message(event):
         except Exception as e:
             print(f"확인 답변 처리 에러: {e}")
 
-    # 3. DB 인증 키워드 자동 응답 (인증멘트 검색)
+    # 3. DB 인증 키워드 자동 응답 (기타 키워드 검색)
     matched_reply = search_keyword(user_message)
     if matched_reply:
         with ApiClient(configuration) as api_client:
@@ -686,7 +673,7 @@ def handle_message(event):
 
 
 # ==========================================
-# [핸들러 2] 방 입장 이벤트 처리 핸들러 (1번 멘트 출력)
+# [핸들러 2] 방 입장 이벤트 처리 핸들러 (1번 멘트/양식 안내)
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
@@ -749,7 +736,7 @@ def handle_audio(event):
     if not user_id:
         return
 
-    # DB 상태 확인
+    # DB 상태 확인 (음성대기 상태 유저인지 확인)
     is_audio_waiting = False
     if supabase:
         res = supabase.table('user_validations').select('status').eq('user_id', user_id).execute()
@@ -770,7 +757,7 @@ def handle_audio(event):
             except Exception as e:
                 print(f"음성 제출 시트 업데이트 에러: {e}")
 
-        reply_text = "🎤 음성인증 파일이 접수되었습니다!\n\n운영진이 확인 후 최종 승인 처리해 드릴 예정이니 잠시만 기다려 주세요."
+        reply_text = "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n운영진이 확인 후 최종 승인 처리해 드릴 예정이니 잠시만 기다려 주세요."
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
