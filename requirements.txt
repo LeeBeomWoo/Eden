@@ -3,3 +3,4 @@ line-bot-sdk
 gspread
 oauth2client
 upstash-redis
+supabase>=2.3.0
