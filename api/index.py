@@ -683,9 +683,8 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=matched_reply)]))
         return
 
-
 # ==========================================
-# [핸들러 2] 방 입장 이벤트 처리 핸들러
+# [핸들러 2] 방 입장 이벤트 처리 핸들러 (수정본)
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
@@ -710,6 +709,36 @@ def handle_member_joined(event):
             "status": "joined",
             "is_known": is_known
         }, ttl=3600)
+
+    # 📌 신입 입장 시 자동으로 전송될 안내 및 양식 멘트
+    welcome_message = (
+        "👋 환영합니다! 아래 신입 인증 양식을 작성하여 전송해 주세요.\n\n"
+        "닉네임 : \n"
+        "년생 : \n"
+        "나이 : \n"
+        "성별 : \n"
+        "지역 : \n"
+        "결혼유무 : \n"
+        "군필여부 : \n"
+        "초대자 : \n"
+        "야단라경험유무 : \n"
+        "기존 다른방에서 나온이유 : \n"
+        "다른 방에서 킥을 당한적 있는지 : \n\n"
+        "⚠️ 위 양식을 복사하여 빠짐없이 입력 후 전송 부탁드립니다!"
+    )
+
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=welcome_message)]
+                )
+            )
+    except Exception as e:
+        print(f"신입 안내 메시지 전송 실패: {e}")
+
 
 
 # ==========================================
