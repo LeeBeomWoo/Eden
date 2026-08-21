@@ -287,11 +287,11 @@ def handle_message(event):
                         for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
                             ments_records.append({"keyword": k, "reply_text": v_text})
                 
+                # A. '멘트' 시트 동기화 부분
                 if ments_records and supabase:
-                    supabase.table('auth_ments').delete().neq('keyword', '').execute()
+                    supabase.table('auth_ments').delete().neq('keyword', '_DELETE_ALL_KEY_').execute()
                     supabase.table('auth_ments').insert(ments_records).execute()
                     sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드")
-
                 # B. '방관리' 시트 동기화
                 if room_manage_sheet:
                     room_data = room_manage_sheet.get_all_records()
@@ -304,11 +304,10 @@ def handle_message(event):
                             if r_name and r_id:
                                 room_records.append({"room_name": r_name, "room_id": r_id})
                     if room_records and supabase:
-                        supabase.table('room_management').delete().neq('room_name', '').execute()
+                        supabase.table('room_management').delete().neq('room_name', '_DELETE_ALL_KEY_').execute()
                         supabase.table('room_management').insert(room_records).execute()
                         sync_reports.append(f"• 방관리: {len(room_records)}개 방 목록")
-
-                # C. '녹음' 시트 동기화
+                                    # C. '녹음' 시트 동기화
                 try:
                     rec_sheet = client.open("인증멘트").worksheet("녹음")
                     males = [c.strip() for c in rec_sheet.col_values(1)[1:] if c and c.strip()]
@@ -316,7 +315,7 @@ def handle_message(event):
                     rec_records = [{"gender": "male", "ment": m} for m in males] + [{"gender": "female", "ment": f} for f in females]
                     
                     if rec_records and supabase:
-                        supabase.table('recording_ments').delete().neq('id', -1).execute()
+                        supabase.table('recording_ments').delete().gte('id', 0).execute()
                         supabase.table('recording_ments').insert(rec_records).execute()
                         sync_reports.append(f"• 녹음멘트: 남성({len(males)}) / 여성({len(females)})")
                 except Exception as e:
@@ -349,10 +348,19 @@ def handle_message(event):
             except Exception as e:
                 reply_text = f"❌ DB 업데이트 중 오류 발생: {e}"
 
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-            return
+            if reply_text:
+                # LINE 메시지 5,000자 초과 오류 방지
+                safe_reply_text = reply_text[:4900] if len(reply_text) > 4900 else reply_text
+                
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token, 
+                            messages=[TextMessage(text=safe_reply_text)]
+                        )
+                    )
+                return
 
         # 2) /O번방 확인 명령어
         elif "확인" in command_body:
