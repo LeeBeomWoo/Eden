@@ -52,10 +52,10 @@ else:
 notified_users = {}
 room_states_memory = {}
 
-# 스레드 락 (동일 인스턴스 내 동시 접근 제어)
+# 스레드 락
 local_sheet_lock = threading.Lock()
 
-# 구글 스프레드시트 연결 (관리자 대시보드 및 동기화용)
+# 구글 스프레드시트 연결
 sheet = client.open("인증멘트").worksheet("멘트")
 validation_sheet = client.open("인증멘트").worksheet("검증")
 try:
@@ -66,7 +66,7 @@ except Exception as e:
 
 
 # ==========================================
-# [동시성 제어 - Supabase 분산 락 컨텍스트 매니저]
+# [동시성 제어 - Supabase 분산 락]
 # ==========================================
 @contextmanager
 def sheet_sync_lock(timeout=10, wait_time=7):
@@ -115,7 +115,7 @@ def sheet_sync_lock(timeout=10, wait_time=7):
 
 
 # ==========================================
-# [Supabase 유저/방 세션 관리 함수]
+# [Supabase 유저/방 세션 관리 및 신입 검증 함수]
 # ==========================================
 def set_user_session(user_id, data, ttl=3600):
     if supabase:
@@ -171,12 +171,23 @@ def del_room_state(room_id):
             print(f"room_state 삭제 에러: {e}")
     room_states_memory.pop(room_id, None)
 
+def is_last_joined_user(source_id, user_id):
+    """그룹방에서 메시지를 보낸 유저가 가장 최근에 입장한 유저인지 검증합니다."""
+    if source_id == user_id:
+        return True  # 1:1 개인 대화는 통과
+
+    room_state = get_room_state(source_id)
+    if room_state and room_state.get('user_id'):
+        return room_state.get('user_id') == user_id
+    
+    # 방 세션 정보가 아직 없거나 만료되었을 경우, 기존 유저의 오작동 방지를 위해 제한
+    return True
+
 
 # ==========================================
 # [DB 전용 조회 함수]
 # ==========================================
 def get_room_id_by_name(room_name):
-    """DB에서 방 이름으로 방 ID를 조회합니다."""
     if supabase:
         try:
             target_name = room_name.replace(" ", "")
@@ -188,7 +199,6 @@ def get_room_id_by_name(room_name):
     return None
 
 def get_recording_ments():
-    """DB에서 녹음 안내 멘트 목록을 가져옵니다."""
     if supabase:
         try:
             males = supabase.table('recording_ments').select('ment').eq('gender', 'male').execute()
@@ -201,10 +211,9 @@ def get_recording_ments():
     return [], []
 
 def search_keyword(keyword):
-    """DB에서 인증 키워드에 해당하는 출력 멘트를 가져옵니다."""
     if supabase:
         try:
-            res = supabase.table('auth_ments').select('reply_text').eq('keyword', keyword).execute()
+            res = supabase.table('auth_ments').select('reply_text').eq('keyword', str(keyword).strip()).execute()
             if res.data:
                 return res.data[0]['reply_text']
         except Exception as e:
@@ -235,8 +244,11 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # 0. 점(.) 입력 시 임시 저장 데이터 및 상태 초기화
+    # 0. 점(.) 입력 시 초기화 (마지막 입장 유저만 허용)
     if user_message == ".":
+        if not is_last_joined_user(source_id, user_id):
+            return
+
         del_user_session(user_id)
         del_room_state(source_id)
         try:
@@ -257,7 +269,7 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # 슬래시(/) 명령어 로직 (유저용 인증 멘트 직접 조회)
+    # 슬래시(/) 명령어 로직
     if user_message.startswith("/"):
         command = user_message[1:].strip()
         parts = command.split(maxsplit=1)
@@ -276,7 +288,7 @@ def handle_message(event):
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
             return
 
-    # [관리자 전용 명령어 (반드시 '/'로 시작해야 함)]
+    # [관리자 전용 명령어]
     if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
         command_body = user_message[1:].strip()
 
@@ -392,16 +404,11 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
             return
 
-        # 3) /방목록갱신 명령어
-        elif command_body == "방목록갱신":
-            reply_text = "💡 이제 방 목록을 포함한 모든 정보는 '/디비업데이트' 명령어를 통해 DB로 즉시 동기화됩니다."
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
-            return
-
-    # 1. 1번 양식 제출 처리 (일반 텍스트 입력)
+    # 📌 [핵심 검증 1] 1번 양식 제출 처리 (마지막 입장 유저만 작동)
     if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
+        if not is_last_joined_user(source_id, user_id):
+            return  # 기존 유저나 다른 멤버가 작성한 경우 반응하지 않고 종료
+
         extracted_data = {}
         for line in user_message.split("\n"):
             delimiter = ":" if ":" in line else ("：" if "：" in line else None)
@@ -423,7 +430,6 @@ def handle_message(event):
                     continue
                 missing_fields.append(req_field)
 
-        # 누락된 필드가 있는 경우 안내
         if missing_fields:
             reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n해당 항목을 빠짐없이 작성 후 다시 제출해 주세요!"
             with ApiClient(configuration) as api_client:
@@ -446,9 +452,8 @@ def handle_message(event):
 
         save_success = False
         alert_text = None
-        current_status = "입장대기"
 
-        # A. DB에서 중복 및 블랙리스트 조회
+        # A. DB 중복/블랙리스트 조회
         found_duplicates = []
         highest_alert_level = 0
         alert_status_text = ""
@@ -521,13 +526,16 @@ def handle_message(event):
             "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason
         }
         
+        target_status = "입장대기"
         if supabase:
             try:
                 user_res = supabase.table('user_validations').select('retry_count, status').eq('user_id', user_id).execute()
                 retry_cnt = 1
                 if user_res.data:
                     retry_cnt = user_res.data[0].get('retry_count', 1) + 1
-                    current_status = user_res.data[0].get('status', '입장대기')
+                    prev_status = user_res.data[0].get('status', '')
+                    if prev_status in ["음성대기", "승인대기"]:
+                        target_status = prev_status
 
                 supabase.table('user_validations').upsert({
                     "user_id": user_id,
@@ -537,14 +545,14 @@ def handle_message(event):
                     "birth_year": birth_year,
                     "entry_date": current_date,
                     "retry_count": retry_cnt,
-                    "status": current_status,
+                    "status": target_status,
                     "details": update_data_details
                 }).execute()
                 save_success = True
             except Exception as e:
                 print(f"Supabase 유저 저장 에러: {e}")
 
-        # C. 구글 시트 백업 및 관리자 대시보드 업데이트
+        # C. 구글 시트 백업
         with sheet_sync_lock():
             try:
                 all_data = validation_sheet.get_all_values()
@@ -556,18 +564,16 @@ def handle_message(event):
                     row_data = all_data[found_row_index - 1]
                     count_val = row_data[7] if len(row_data) >= 8 else "0"
                     current_retry_count = int(count_val) if count_val.isdigit() else 0
-                    if len(row_data) >= 12 and row_data[11].strip():
-                        current_status = row_data[11].strip()
 
                     update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
                     validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
-                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, current_status]])
+                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
                     validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
                 else:
                     found_row_index = len(all_data) + 1
                     row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
                     validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
-                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, "입장대기"]])
+                    validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
                     validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
                 save_success = True
             except Exception as sheet_err:
@@ -582,19 +588,17 @@ def handle_message(event):
             set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
 
-            # 📌 1번 양식 완수 시 -> 바로 2번 양식(멘트)을 DB에서 검색하여 유저에게 출력
-            if current_status == "입장대기":
+            # 2번 양식 전송
+            if target_status == "입장대기":
                 form2_text = search_keyword("2") or search_keyword("2번")
                 if form2_text:
                     reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
                 else:
-                    reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n내부 규정을 확인하시고 '확인'이라고 답장해 주세요."
-            elif current_status == "음성대기":
+                    reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
+            elif target_status == "음성대기":
                 reply_text = "✅ 양식 수정이 반영되었습니다.\n\n이어서 진행 중이던 [음성 인증]을 마저 완료해 주세요!"
-            elif current_status == "승인대기":
+            elif target_status == "승인대기":
                 reply_text = "✅ 양식 수정이 반영되었습니다.\n\n현재 관리자 승인을 대기 중이므로 잠시만 기다려주세요."
-            else:
-                reply_text = "✅ 양식 수정이 정상적으로 반영되었습니다."
         else:
             reply_text = "⚠️ 서버 통신 문제로 저장에 실패했습니다. 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
 
@@ -603,14 +607,17 @@ def handle_message(event):
             line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
         return
 
-    # 2. 신입이 "확인" 답장 입력 시 -> 음성인증 안내 메시지 출력
+    # 📌 [핵심 검증 2] 신입이 "확인" 답장 입력 시 (마지막 입장 유저만 작동)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
+        if not is_last_joined_user(source_id, user_id):
+            return  # 마지막 입장 유저가 아니면 무시
+
         try:
             should_respond = False
             user_nickname = ""
             user_gender = ""
 
-            # DB에서 유저 상태 확인 (입장대기 상태인지 확인)
+            # DB 유저 상태 확인
             if supabase:
                 u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
                 if u_res.data:
@@ -621,10 +628,9 @@ def handle_message(event):
                         user_gender = u_data.get('gender', '')
 
             if should_respond:
-                # 📌 3번 키워드(음성인증 안내) DB 조회
+                # 3번 키워드(음성인증 안내) 조회
                 reply_text = search_keyword("3") or search_keyword("3번")
                 
-                # 3번 키워드가 없을 경우, DB '녹음' 시트에서 성별별 랜던 녹음 멘트 발송
                 if not reply_text:
                     col_male, col_female = get_recording_ments()
                     rec_ment = ""
@@ -640,7 +646,7 @@ def handle_message(event):
                 else:
                     reply_text = reply_text.replace("{닉네임}", user_nickname).replace("{nickname}", user_nickname)
 
-                # DB & 구글 시트 상태 업데이트 ('음성대기')
+                # DB & 구글 시트 상태 '음성대기' 변경
                 if supabase:
                     supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
 
@@ -663,7 +669,7 @@ def handle_message(event):
         except Exception as e:
             print(f"확인 답변 처리 에러: {e}")
 
-    # 3. DB 인증 키워드 자동 응답 (기타 키워드 검색)
+    # 3. 일반 DB 키워드 검색
     matched_reply = search_keyword(user_message)
     if matched_reply:
         with ApiClient(configuration) as api_client:
@@ -673,7 +679,7 @@ def handle_message(event):
 
 
 # ==========================================
-# [핸들러 2] 방 입장 이벤트 처리 핸들러 (1번 멘트/양식 안내)
+# [핸들러 2] 방 입장 이벤트 처리 핸들러
 # ==========================================
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
@@ -693,13 +699,13 @@ def handle_member_joined(event):
             if res.data:
                 is_known = True
 
+        # 📌 입장하는 신입 유저의 ID를 방 세션에 최신화하여 저장
         set_room_state(source_id, {
             "user_id": user_id,
             "status": "joined",
             "is_known": is_known
         }, ttl=3600)
 
-    # 📌 auth_ments DB에서 '1'번(또는 '1번') 키워드 멘트 조회
     welcome_message = search_keyword("1") or search_keyword("1번")
     if not welcome_message:
         welcome_message = "👋 환영합니다! (DB에 '1'번 키워드 멘트가 없으니 등록해 주세요.)"
@@ -728,7 +734,7 @@ def handle_member_left(event):
 
 
 # ==========================================
-# [핸들러 4] 음성 메시지 처리 핸들러 (녹음 인증)
+# [핸들러 4] 📌 음성 메시지 처리 핸들러 (마지막 입장 유저만 작동)
 # ==========================================
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio(event):
@@ -736,7 +742,13 @@ def handle_audio(event):
     if not user_id:
         return
 
-    # DB 상태 확인 (음성대기 상태 유저인지 확인)
+    source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
+
+    # 마지막 입장 유저가 아니면 음성 메시지 무시
+    if not is_last_joined_user(source_id, user_id):
+        return
+
+    # DB 상태 확인 ('음성대기' 유저인지)
     is_audio_waiting = False
     if supabase:
         res = supabase.table('user_validations').select('status').eq('user_id', user_id).execute()
