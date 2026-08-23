@@ -441,6 +441,10 @@ def handle_message(event):
                 key_name = parts[0].replace("-", "").strip()
                 if "(" in key_name:
                     key_name = key_name.split("(", 1)[0].strip()
+                # ================= [이동/추가] 슬래시 처리 로직 =================
+                if "/" in key_name:
+                    key_name = key_name.split("/", 1)[0].strip() # "초대자/ 초대경로" -> "초대자"로 변환
+                # ============================================================
                 extracted_data[key_name] = parts[1].strip()
 
         required_fields = ["닉네임", "년생", "나이", "성별", "지역", "결혼유무", "군필여부", "초대자", "야단라경험유무", "기존 다른방에서 나온이유", "다른 방에서 킥을 당한적 있는지"]
