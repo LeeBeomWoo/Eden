@@ -245,6 +245,13 @@ def handle_message(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
     user_message = event.message.text.strip()
     reply_text = ""
+    # ================= [이곳부터 추가하세요] =================
+    # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
+    # 현재 인증이 진행 중인 방이라면, 신입 유저(마지막 입장 유저)가 아닌 기존 멤버의 채팅은 무시(return)합니다.
+    if not (user_message == "." or user_message.startswith("/")):
+        if not is_last_joined_user(source_id, user_id):
+            return
+    # ================= [이곳까지 추가하세요] =================
 
     # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
     if user_message == ".":
