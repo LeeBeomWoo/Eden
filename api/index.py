@@ -69,6 +69,49 @@ else:
 
 
 # ==========================================
+# [Supabase 1000개 이상 데이터 처리용 헬퍼 함수]
+# ==========================================
+def get_all_supabase_data(table_name, select_query="*"):
+    """Supabase에서 1000개 이상의 데이터를 모두 가져오는 함수 (페이지네이션 적용)"""
+    if not supabase:
+        return []
+    
+    all_data = []
+    limit = 1000
+    offset = 0
+    
+    while True:
+        try:
+            res = supabase.table(table_name).select(select_query).range(offset, offset + limit - 1).execute()
+            data = res.data if res.data else []
+            all_data.extend(data)
+            
+            # 받아온 데이터가 limit보다 적으면 모든 데이터를 다 가져온 것
+            if len(data) < limit:
+                break
+            offset += limit
+        except Exception as e:
+            print(f"{table_name} 테이블 조회 에러: {e}")
+            break
+            
+    return all_data
+
+def process_in_chunks(table_name, data_list, chunk_size=500, is_insert=False):
+    """1000개 이상 데이터 삽입/업데이트 시 발생하는 에러를 방지하는 청크(분할) 처리 헬퍼 함수"""
+    if not supabase or not data_list:
+        return
+    for i in range(0, len(data_list), chunk_size):
+        chunk = data_list[i:i + chunk_size]
+        try:
+            if is_insert:
+                supabase.table(table_name).insert(chunk).execute()
+            else:
+                supabase.table(table_name).upsert(chunk).execute()
+        except Exception as e:
+            print(f"{table_name} 테이블 데이터 분할 처리 에러 ({i}~{i+chunk_size}): {e}")
+
+
+# ==========================================
 # [동시성 제어 - Supabase 분산 락]
 # ==========================================
 @contextmanager
@@ -203,10 +246,10 @@ def get_room_id_by_name(room_name):
 def get_recording_ments():
     if supabase:
         try:
-            males = supabase.table('recording_ments').select('ment').eq('gender', 'male').execute()
-            females = supabase.table('recording_ments').select('ment').eq('gender', 'female').execute()
-            col_male = [row['ment'] for row in males.data] if males.data else []
-            col_female = [row['ment'] for row in females.data] if females.data else []
+            # 1000개 이상 데이터 안전 조회를 위해 get_all_supabase_data 사용
+            all_ments = get_all_supabase_data('recording_ments', 'gender, ment')
+            col_male = [row['ment'] for row in all_ments if row['gender'] == 'male']
+            col_female = [row['ment'] for row in all_ments if row['gender'] == 'female']
             return col_male, col_female
         except Exception as e:
             print(f"녹음 멘트 DB 조회 실패: {e}")
@@ -245,21 +288,17 @@ def handle_message(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
     user_message = event.message.text.strip()
     reply_text = ""
-    # ================= [이곳부터 추가하세요] =================
+    
     # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
-    # 현재 인증이 진행 중인 방이라면, 신입 유저(마지막 입장 유저)가 아닌 기존 멤버의 채팅은 무시(return)합니다.
     if not (user_message == "." or user_message.startswith("/")):
         if not is_last_joined_user(source_id, user_id):
             return
-    # ================= [이곳까지 추가하세요] =================
 
     # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
     if user_message == ".":
-        # 1) 현재 방 세션에서 진행 중이던 신입 유저 ID 추출
         room_state = get_room_state(source_id)
         target_user_id = room_state.get('user_id') if room_state else None
 
-        # 2) 진행 중이던 신입이 존재하면 DB 및 시트 상태를 '입장대기'로 리셋
         if target_user_id:
             del_user_session(target_user_id)
             try:
@@ -276,7 +315,6 @@ def handle_message(event):
             except Exception as e:
                 print(f"유저 상태 초기화 처리 중 에러: {e}")
 
-        # 3) 해당 방 세션 삭제
         del_room_state(source_id)
 
         reply_text = "🔄 해당 방의 인증 진행 상태가 초기화되었습니다.\n신입 유저는 양식을 처음부터 다시 작성해 주세요!"
@@ -313,7 +351,7 @@ def handle_message(event):
     if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
         command_body = user_message[1:].strip()
 
-        # 1) /디비업데이트 명령어
+        # 1) /디비업데이트 명령어 (1000개 이상 데이터 대응 완료)
         if "디비업데이트" in command_body:
             try:
                 sync_reports = []
@@ -331,7 +369,7 @@ def handle_message(event):
                     
                     if ments_records and supabase:
                         supabase.table('auth_ments').delete().neq('keyword', '_DELETE_ALL_KEY_').execute()
-                        supabase.table('auth_ments').insert(ments_records).execute()
+                        process_in_chunks('auth_ments', ments_records, is_insert=True)
                         sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드")
 
                 # B. '방관리' 시트 동기화
@@ -347,7 +385,7 @@ def handle_message(event):
                                 room_records.append({"room_name": r_name, "room_id": r_id})
                     if room_records and supabase:
                         supabase.table('room_management').delete().neq('room_name', '_DELETE_ALL_KEY_').execute()
-                        supabase.table('room_management').insert(room_records).execute()
+                        process_in_chunks('room_management', room_records, is_insert=True)
                         sync_reports.append(f"• 방관리: {len(room_records)}개 방 목록")
 
                 # C. '녹음' 시트 동기화
@@ -360,12 +398,12 @@ def handle_message(event):
                         
                         if rec_records and supabase:
                             supabase.table('recording_ments').delete().gte('id', 0).execute()
-                            supabase.table('recording_ments').insert(rec_records).execute()
+                            process_in_chunks('recording_ments', rec_records, is_insert=True)
                             sync_reports.append(f"• 녹음멘트: 남성({len(males)}) / 여성({len(females)})")
                 except Exception as e:
                     print(f"녹음 시트 동기화 패스: {e}")
 
-                # D. '검증' 시트 동기화
+                # D. '검증' 시트 동기화 (기존 유저 정보 백업)
                 if validation_sheet:
                     all_val_data = validation_sheet.get_all_values()
                     if all_val_data and len(all_val_data) > 1:
@@ -385,7 +423,8 @@ def handle_message(event):
                                     "status": str(row[11]).strip() if len(row) > 11 else "입장대기"
                                 })
                         if val_records and supabase:
-                            supabase.table('user_validations').upsert(val_records).execute()
+                            # 데이터가 많을 경우를 대비해 청크(분할) 업데이트 적용
+                            process_in_chunks('user_validations', val_records, is_insert=False)
                             sync_reports.append(f"• 검증이력: {len(val_records)}명 유저 데이터")
 
                 report_str = "\n".join(sync_reports)
@@ -431,7 +470,7 @@ def handle_message(event):
     # 📌 [핵심 검증 1] 1번 양식 제출 처리 (마지막 입장 유저만 작동)
     if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
         if not is_last_joined_user(source_id, user_id):
-            return  # 기존 유저나 다른 멤버가 작성한 경우 반응하지 않고 종료
+            return 
 
         extracted_data = {}
         for line in user_message.split("\n"):
@@ -441,10 +480,8 @@ def handle_message(event):
                 key_name = parts[0].replace("-", "").strip()
                 if "(" in key_name:
                     key_name = key_name.split("(", 1)[0].strip()
-                # ================= [이동/추가] 슬래시 처리 로직 =================
                 if "/" in key_name:
-                    key_name = key_name.split("/", 1)[0].strip() # "초대자/ 초대경로" -> "초대자"로 변환
-                # ============================================================
+                    key_name = key_name.split("/", 1)[0].strip()
                 extracted_data[key_name] = parts[1].strip()
 
         required_fields = ["닉네임", "년생", "나이", "성별", "지역", "결혼유무", "군필여부", "초대자", "야단라경험유무", "기존 다른방에서 나온이유", "다른 방에서 킥을 당한적 있는지"]
@@ -481,7 +518,7 @@ def handle_message(event):
         save_success = False
         alert_text = None
 
-        # A. DB 중복/블랙리스트 조회
+        # A. DB 중복/블랙리스트 조회 (1000명 이상 안전 조회 처리 적용)
         found_duplicates = []
         highest_alert_level = 0
         alert_status_text = ""
@@ -489,8 +526,8 @@ def handle_message(event):
 
         if supabase:
             try:
-                val_res = supabase.table('user_validations').select('*').execute()
-                all_val_data = val_res.data if val_res.data else []
+                # 1000개 이상 제약 해결: 페이지네이션 기반 전체 데이터 호출
+                all_val_data = get_all_supabase_data('user_validations')
 
                 for row in all_val_data:
                     rec_id = str(row.get('user_id', '')).strip()
@@ -554,7 +591,6 @@ def handle_message(event):
             "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason
         }
         
-        # 1번 양식 제출 시 무조건 '입장대기'로 초기화하여 2번 양식이 정상 전송되도록 변경
         target_status = "입장대기"
         if supabase:
             try:
@@ -615,7 +651,6 @@ def handle_message(event):
             set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
 
-            # 2번 양식 전송
             form2_text = search_keyword("2") or search_keyword("2번")
             if form2_text:
                 reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
@@ -632,7 +667,7 @@ def handle_message(event):
     # 📌 [핵심 검증 2] 신입이 "확인" 답장 입력 시 (마지막 입장 유저만 작동)
     if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         if not is_last_joined_user(source_id, user_id):
-            return  # 마지막 입장 유저가 아니면 무시
+            return  
 
         try:
             should_respond = False
@@ -640,7 +675,6 @@ def handle_message(event):
             user_gender = ""
             inviter = ""
 
-            # DB 유저 상태 및 정보(닉네임, 성별, 초대자) 조회
             if supabase:
                 u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
                 if u_res.data:
@@ -650,12 +684,10 @@ def handle_message(event):
                         user_nickname = u_data.get('nickname', '신입')
                         user_gender = u_data.get('gender', '')
                         
-                        # 1번 양식에서 저장된 details 내 초대자 정보 추출
                         details = u_data.get('details') or {}
                         inviter = details.get('inviter', '없음')
 
             if should_respond:
-                # 성별에 따른 DB 랜덤 녹음 멘트 추출
                 col_male, col_female = get_recording_ments()
                 rec_ment = ""
                 if user_gender in ["남", "남자"] and col_male:
@@ -663,15 +695,12 @@ def handle_message(event):
                 elif user_gender in ["여", "여자"] and col_female:
                     rec_ment = random.choice(col_female)
                 
-                # DB 멘트가 없을 경우 기본 멘트 처리
                 if not rec_ment:
                     rec_ment = "잘 부탁드립니다."
 
-                # 오늘 날짜 추출 (예: 8월 21일)
                 now = datetime.datetime.now()
                 date_str = f"{now.month}월 {now.day}일"
 
-                # 요청 양식에 맞춰 문구 동적 생성
                 reply_text = (
                     f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
                     f"키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
@@ -680,7 +709,6 @@ def handle_message(event):
                     f"조용한 곳에서 천천히 또박또박 부탁드립니다."
                 )
 
-                # DB & 구글 시트 상태를 '음성대기'로 변경
                 if supabase:
                     supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
 
@@ -734,7 +762,6 @@ def handle_member_joined(event):
             if res.data:
                 is_known = True
 
-        # 📌 입장하는 신입 유저의 ID를 방 세션에 최신화하여 저장
         set_room_state(source_id, {
             "user_id": user_id,
             "status": "joined",
@@ -779,11 +806,9 @@ def handle_audio(event):
 
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
 
-    # 마지막 입장 유저가 아니면 음성 메시지 무시
     if not is_last_joined_user(source_id, user_id):
         return
 
-    # DB 상태 확인 ('음성대기' 유저인지)
     is_audio_waiting = False
     if supabase:
         res = supabase.table('user_validations').select('status').eq('user_id', user_id).execute()
