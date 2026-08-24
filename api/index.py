@@ -513,7 +513,10 @@ def handle_message(event):
         yadan = extracted_data.get("야단라경험유무", "").strip()
         leave_reason = extracted_data.get("기존 다른방에서 나온이유", "").strip()
         kick_reason = extracted_data.get("다른 방에서 킥을 당한적 있는지", "").strip()
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        # 한국 시간(KST) 기준 어제 날짜 계산
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        current_date = (datetime.datetime.now(kst) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
         save_success = False
         alert_text = None
@@ -697,9 +700,10 @@ def handle_message(event):
                 
                 if not rec_ment:
                     rec_ment = "잘 부탁드립니다."
-
-                now = datetime.datetime.now()
-                date_str = f"{now.month}월 {now.day}일"
+                    # 한국 시간(KST) 기준 오늘 날짜 계산
+                    kst = datetime.timezone(datetime.timedelta(hours=9))
+                    today = datetime.datetime.now(kst)
+                    date_str = f"{today.month}월 {today.day}일"
 
                 reply_text = (
                     f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
