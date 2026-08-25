@@ -700,10 +700,11 @@ def handle_message(event):
                 
                 if not rec_ment:
                     rec_ment = "잘 부탁드립니다."
-                    # 한국 시간(KST) 기준 오늘 날짜 계산
-                    kst = datetime.timezone(datetime.timedelta(hours=9))
-                    today = datetime.datetime.now(kst)
-                    date_str = f"{today.month}월 {today.day}일"
+                
+                # 한국 시간(KST) 기준 오늘 날짜 계산 (수정: 조건문 밖으로 이동)
+                kst = datetime.timezone(datetime.timedelta(hours=9))
+                today = datetime.datetime.now(kst)
+                date_str = f"{today.month}월 {today.day}일"
 
                 reply_text = (
                     f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
