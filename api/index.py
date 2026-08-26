@@ -436,7 +436,7 @@ def handle_message(event):
         # (자동으로 "확인" 답장을 받아 진행되지 않았거나, 관리자가 직접 재발송해야 할 때 사용)
         voice_manual_trigger = (
             cmd_prefix == "ㅇㅅㅇㅈ"
-            or (cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("음성인증", "음성"))
+            or (cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("음성인증", "음성", "ㅇㅅㅇㅈ"))
         )
         if voice_manual_trigger:
             voice_target_id = get_room_target_user_id(source_id)
