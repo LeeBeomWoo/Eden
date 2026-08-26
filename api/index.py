@@ -217,6 +217,36 @@ def del_room_state(room_id):
             print(f"room_state 삭제 에러: {e}")
     room_states_memory.pop(room_id, None)
 
+
+def reset_verification_state(source_id, target_user_id=None):
+    """해당 방의 인증 상태를 초기화합니다.
+    - '.' 명령어와 신입 유저 퇴장(MemberLeftEvent) 양쪽에서 공용으로 사용합니다.
+    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 유저를 대상으로 합니다.
+    - 반환값: 실제로 초기화된 user_id (없으면 None)
+    """
+    room_state = get_room_state(source_id)
+    if target_user_id is None:
+        target_user_id = room_state.get('user_id') if room_state else None
+
+    if target_user_id:
+        del_user_session(target_user_id)
+        try:
+            if supabase:
+                supabase.table('user_validations').update({"status": "입장대기"}).eq('user_id', target_user_id).execute()
+
+            with sheet_sync_lock():
+                if validation_sheet:
+                    raw_user_ids = validation_sheet.col_values(5)
+                    clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                    if target_user_id in clean_user_ids:
+                        row_index = clean_user_ids.index(target_user_id) + 1
+                        validation_sheet.update(range_name=f'L{row_index}', values=[["입장대기"]])
+        except Exception as e:
+            print(f"유저 상태 초기화 처리 중 에러: {e}")
+
+    del_room_state(source_id)
+    return target_user_id
+
 def is_last_joined_user(source_id, user_id):
     """그룹방에서 메시지를 보낸 유저가 가장 최근에 입장한 유저인지 검증합니다."""
     if source_id == user_id:
@@ -227,6 +257,12 @@ def is_last_joined_user(source_id, user_id):
         return room_state.get('user_id') == user_id
     
     return True
+
+
+def get_room_target_user_id(source_id):
+    """해당 방에서 현재 인증이 진행 중으로 추적되고 있는 유저의 user_id를 반환합니다."""
+    room_state = get_room_state(source_id)
+    return room_state.get('user_id') if room_state else None
 
 
 # ==========================================
@@ -265,6 +301,87 @@ def search_keyword(keyword):
             print(f"키워드 DB 검색 오류: {e}")
     return None
 
+def list_all_keywords():
+    """등록된 인증 멘트 키워드를 전부 조회합니다. ('/인증 목록', '/ㅇㅈ 목록' 명령어용)"""
+    if supabase:
+        try:
+            all_ments = get_all_supabase_data('auth_ments', 'keyword')
+            keywords = sorted({str(row.get('keyword', '')).strip() for row in all_ments if row.get('keyword')})
+            return keywords
+        except Exception as e:
+            print(f"키워드 목록 조회 오류: {e}")
+    return []
+
+
+def start_voice_auth(user_id, require_status='입장대기'):
+    """대상 유저를 음성인증 대기 상태로 전환하고 음성인증 안내 멘트를 만들어 돌려줍니다.
+    - require_status를 지정하면 유저의 현재 status가 그 값일 때만 진행합니다. (신입의 '확인' 자동 흐름용)
+    - require_status=None이면 현재 status와 무관하게 강제로 진행합니다. (관리자 수동 트리거용: /ㅇㅈ 음성인증, /ㅇㅅㅇㅈ)
+    반환값: (성공여부, 안내 멘트 또는 None)
+    """
+    if not supabase or not user_id:
+        return False, None
+
+    try:
+        u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
+    except Exception as e:
+        print(f"음성인증 시작 - 유저 조회 에러: {e}")
+        return False, None
+
+    if not u_res.data:
+        return False, None
+
+    u_data = u_res.data[0]
+    if require_status is not None and u_data.get('status') != require_status:
+        return False, None
+
+    user_nickname = u_data.get('nickname', '신입')
+    user_gender = u_data.get('gender', '')
+    details = u_data.get('details') or {}
+    inviter = details.get('inviter', '없음')
+
+    col_male, col_female = get_recording_ments()
+    rec_ment = ""
+    if user_gender in ["남", "남자"] and col_male:
+        rec_ment = random.choice(col_male)
+    elif user_gender in ["여", "여자"] and col_female:
+        rec_ment = random.choice(col_female)
+
+    if not rec_ment:
+        rec_ment = "잘 부탁드립니다."
+
+    # 한국 시간(KST) 기준 오늘 날짜 계산
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    today = datetime.datetime.now(kst)
+    date_str = f"{today.month}월 {today.day}일"
+
+    reply_text = (
+        f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
+        f"키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
+        f"아래 문구를 정확하게 읽어주세요.\n\n"
+        f"\"제 닉네임은 {user_nickname}입니다. 오늘은 {date_str}, 초대자 {inviter}입니다. {rec_ment}\"\n\n"
+        f"조용한 곳에서 천천히 또박또박 부탁드립니다."
+    )
+
+    try:
+        supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
+    except Exception as e:
+        print(f"음성인증 시작 - user_validations 상태 업데이트 에러: {e}")
+
+    # 시트 동기화는 부가 기능(백업)이므로, 여기서 실패해도 안내 멘트 전송에는 영향이 없도록 분리합니다.
+    try:
+        with sheet_sync_lock():
+            if validation_sheet:
+                raw_user_ids = validation_sheet.col_values(5)
+                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                if user_id in clean_user_ids:
+                    row_index = clean_user_ids.index(user_id) + 1
+                    validation_sheet.update(range_name=f'L{row_index}', values=[["음성대기"]])
+    except Exception as e:
+        print(f"음성인증 시작 - 시트 동기화 에러(무시하고 계속 진행): {e}")
+
+    return True, reply_text
+
 
 @app.route("/api", methods=['POST'])
 def callback():
@@ -296,26 +413,7 @@ def handle_message(event):
 
     # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
     if user_message == ".":
-        room_state = get_room_state(source_id)
-        target_user_id = room_state.get('user_id') if room_state else None
-
-        if target_user_id:
-            del_user_session(target_user_id)
-            try:
-                if supabase:
-                    supabase.table('user_validations').update({"status": "입장대기"}).eq('user_id', target_user_id).execute()
-                
-                with sheet_sync_lock():
-                    if validation_sheet:
-                        raw_user_ids = validation_sheet.col_values(5)
-                        clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                        if target_user_id in clean_user_ids:
-                            row_index = clean_user_ids.index(target_user_id) + 1
-                            validation_sheet.update(range_name=f'L{row_index}', values=[["입장대기"]])
-            except Exception as e:
-                print(f"유저 상태 초기화 처리 중 에러: {e}")
-
-        del_room_state(source_id)
+        reset_verification_state(source_id)
 
         reply_text = "🔄 해당 방의 인증 진행 상태가 초기화되었습니다.\n신입 유저는 양식을 처음부터 다시 작성해 주세요!"
         with ApiClient(configuration) as api_client:
@@ -334,13 +432,42 @@ def handle_message(event):
         parts = command.split(maxsplit=1)
         cmd_prefix = parts[0]
 
+        # 음성인증 멘트 수동 발송: /인증 음성인증, /ㅇㅈ 음성인증, /ㅇㅅㅇㅈ
+        # (자동으로 "확인" 답장을 받아 진행되지 않았거나, 관리자가 직접 재발송해야 할 때 사용)
+        voice_manual_trigger = (
+            cmd_prefix == "ㅇㅅㅇㅈ"
+            or (cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("음성인증", "음성"))
+        )
+        if voice_manual_trigger:
+            voice_target_id = get_room_target_user_id(source_id)
+            if voice_target_id:
+                v_success, v_reply_text = start_voice_auth(voice_target_id, require_status=None)
+                reply_text = v_reply_text if v_success else "❌ 해당 유저의 인증 정보를 DB에서 찾을 수 없어 음성인증 멘트를 보낼 수 없습니다."
+            else:
+                reply_text = "❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다."
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+            return
+
         if cmd_prefix in ("인증", "ㅇㅈ"):
             if len(parts) < 2 or not parts[1].strip():
-                reply_text = "사용법: /인증 [키워드] 형태로 입력해 주세요."
+                reply_text = "사용법: /인증 [키워드] 형태로 입력해 주세요.\n전체 키워드 목록은 /인증 목록, 음성인증 멘트 수동 발송은 /인증 음성인증(또는 /ㅇㅅㅇㅈ) 으로 확인할 수 있습니다."
             else:
                 keyword = parts[1].strip()
-                res_text = search_keyword(keyword)
-                reply_text = res_text if res_text else f"'{keyword}'에 해당하는 인증 멘트를 찾을 수 없습니다."
+                if keyword in ("목록", "리스트", "list", "List"):
+                    keywords = list_all_keywords()
+                    if keywords:
+                        keyword_list_str = ", ".join(keywords)
+                        reply_text = f"📋 등록된 인증 키워드 목록 ({len(keywords)}개)\n\n{keyword_list_str}"
+                        if len(reply_text) > 4900:
+                            reply_text = reply_text[:4900] + "\n...(이하 생략)"
+                    else:
+                        reply_text = "📋 등록된 인증 키워드가 없습니다."
+                else:
+                    res_text = search_keyword(keyword)
+                    reply_text = res_text if res_text else f"'{keyword}'에 해당하는 인증 멘트를 찾을 수 없습니다."
 
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -673,64 +800,15 @@ def handle_message(event):
             return  
 
         try:
-            should_respond = False
-            user_nickname = ""
-            user_gender = ""
-            inviter = ""
+            success, voice_reply_text = start_voice_auth(user_id, require_status='입장대기')
 
-            if supabase:
-                u_res = supabase.table('user_validations').select('*').eq('user_id', user_id).execute()
-                if u_res.data:
-                    u_data = u_res.data[0]
-                    if u_data.get('status') == '입장대기':
-                        should_respond = True
-                        user_nickname = u_data.get('nickname', '신입')
-                        user_gender = u_data.get('gender', '')
-                        
-                        details = u_data.get('details') or {}
-                        inviter = details.get('inviter', '없음')
-
-            if should_respond:
-                col_male, col_female = get_recording_ments()
-                rec_ment = ""
-                if user_gender in ["남", "남자"] and col_male:
-                    rec_ment = random.choice(col_male)
-                elif user_gender in ["여", "여자"] and col_female:
-                    rec_ment = random.choice(col_female)
-                
-                if not rec_ment:
-                    rec_ment = "잘 부탁드립니다."
-                
-                # 한국 시간(KST) 기준 오늘 날짜 계산 (수정: 조건문 밖으로 이동)
-                kst = datetime.timezone(datetime.timedelta(hours=9))
-                today = datetime.datetime.now(kst)
-                date_str = f"{today.month}월 {today.day}일"
-
-                reply_text = (
-                    f"⭕️ 작성이 완료되었다면 음성인증을 진행합니다.\n\n"
-                    f"키보드 상단 음성메시지를 활용해서 진행합니다.\n\n"
-                    f"아래 문구를 정확하게 읽어주세요.\n\n"
-                    f"\"제 닉네임은 {user_nickname}입니다. 오늘은 {date_str}, 초대자 {inviter}입니다. {rec_ment}\"\n\n"
-                    f"조용한 곳에서 천천히 또박또박 부탁드립니다."
-                )
-
-                if supabase:
-                    supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
-
-                with sheet_sync_lock():
-                    if validation_sheet:
-                        raw_user_ids = validation_sheet.col_values(5)
-                        clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                        if user_id in clean_user_ids:
-                            row_index = clean_user_ids.index(user_id) + 1
-                            validation_sheet.update(range_name=f'L{row_index}', values=[["음성대기"]])
-
+            if success:
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
                     line_bot_api.reply_message_with_http_info(
                         ReplyMessageRequest(
                             reply_token=event.reply_token, 
-                            messages=[TextMessage(text=reply_text)]
+                            messages=[TextMessage(text=voice_reply_text)]
                         )
                     )
                 return
@@ -796,8 +874,21 @@ def handle_member_joined(event):
 @handler.add(MemberLeftEvent)
 def handle_member_left(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', None))
-    if source_id:
+    if not source_id:
+        return
+
+    left_user_ids = {m.user_id for m in event.left.members if getattr(m, 'user_id', None)}
+
+    room_state = get_room_state(source_id)
+    tracked_user_id = room_state.get('user_id') if room_state else None
+
+    if tracked_user_id and tracked_user_id in left_user_ids:
+        # 인증 진행 중이던 신입이 실제로 나간 경우 -> user_validations 상태까지 함께 초기화
+        reset_verification_state(source_id, tracked_user_id)
+    elif not left_user_ids or tracked_user_id is None:
+        # 누가 나갔는지 알 수 없거나, 추적 중인 인증 대상이 없는 경우에는 기존처럼 room_state만 정리
         del_room_state(source_id)
+    # else: 인증과 무관한 다른 멤버가 나간 경우 -> 진행 중인 신입의 room_state를 건드리지 않음
 
 
 # ==========================================
