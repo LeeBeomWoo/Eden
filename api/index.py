@@ -654,6 +654,15 @@ def handle_message(event):
         alert_status_text = ""
         color_emoji = ""
 
+        # 현재 세션에서 이미 1번 양식을 제출한 뒤, 내용을 고쳐서 재제출하는 것인지 확인
+        # (같은 방의 room_state가 이미 form_submitted 상태 + 같은 유저라면 '수정 재제출'로 간주)
+        current_room_state = get_room_state(source_id)
+        is_edit_resubmission = bool(
+            current_room_state
+            and current_room_state.get('user_id') == user_id
+            and current_room_state.get('status') == 'form_submitted'
+        )
+
         if supabase:
             try:
                 # 1000개 이상 제약 해결: 페이지네이션 기반 전체 데이터 호출
@@ -661,11 +670,25 @@ def handle_message(event):
 
                 for row in all_val_data:
                     rec_id = str(row.get('user_id', '')).strip()
+
+                    # 본인이 이번 세션에서 양식을 수정 재제출하는 경우, 방금 전 자신이 남긴
+                    # 기록은 '중복 유저'가 아니므로 검증 대상에서 제외한다.
+                    if is_edit_resubmission and rec_id == str(user_id).strip() and rec_id != "":
+                        continue
+
                     rec_name = str(row.get('nickname', '')).strip()
                     rec_year = str(row.get('birth_year', '')).strip()
                     rec_gender = str(row.get('gender', '')).strip()
                     rec_region = str(row.get('region', '')).strip()
                     rec_black = str(row.get('black_reason', '')).strip()
+
+                    # details(JSON) 필드에서 값이 채워진 항목만 추출 (없으면 빈 dict로 처리)
+                    rec_details = row.get('details') or {}
+                    if isinstance(rec_details, str):
+                        try:
+                            rec_details = json.loads(rec_details)
+                        except Exception:
+                            rec_details = {}
 
                     is_id_matched = (rec_id == str(user_id).strip() and rec_id != "")
                     is_name_matched = (rec_name == nickname and rec_name != "")
@@ -683,6 +706,25 @@ def handle_message(event):
                         row_info = f"📍 [기존 DB 기록] ({', '.join(match_reasons)})\n - 기존정보: {rec_name} / {rec_year}년생 / {rec_gender} / {rec_region}"
                         if rec_black:
                             row_info += f"\n - 💀 블랙사유: {rec_black}"
+
+                        # 블랙사유 유무와 상관없이, 기존에 입력되어 있던 내용(나온이유/킥이력/야단라경험 우선 순)을
+                        # 개수 제한 없이 함께 보여준다. (없는 항목은 자동으로 제외됨)
+                        detail_priority = [
+                            ("leave_reason", "나온이유"),
+                            ("kick_reason", "킥이력"),
+                            ("yadan", "야단라경험"),
+                            ("inviter", "초대자"),
+                            ("marriage", "결혼유무"),
+                            ("military", "군필여부"),
+                            ("age", "나이"),
+                        ]
+                        detail_lines = []
+                        for key, label in detail_priority:
+                            val = str(rec_details.get(key, "")).strip()
+                            if val:
+                                detail_lines.append(f"{label}: {val}")
+                        if detail_lines:
+                            row_info += f"\n - 📝 기존 입력 내용: {' / '.join(detail_lines)}"
                         found_duplicates.append(row_info)
 
                         current_level = 0
