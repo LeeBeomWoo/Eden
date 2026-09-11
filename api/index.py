@@ -56,11 +56,14 @@ room_states_memory = {}
 local_sheet_lock = threading.Lock()
 
 # 구글 스프레드시트 연결
+GOOGLE_SHEET_ID = "1ZOBZX7tZvEsDmIU1QwIlg54mqaRAVKj1aMOy_zIpFYg"
+
 if client:
     try:
-        sheet = client.open("인증멘트").worksheet("멘트")
-        validation_sheet = client.open("인증멘트").worksheet("검증")
-        room_manage_sheet = client.open("인증멘트").worksheet("방관리")
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        sheet = spreadsheet.worksheet("멘트")
+        validation_sheet = spreadsheet.worksheet("검증")
+        room_manage_sheet = spreadsheet.worksheet("방관리")
     except Exception as e:
         print(f"⚠️ 시트 연결 중 일부 실패: {e}")
         room_manage_sheet = None
