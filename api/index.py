@@ -411,6 +411,14 @@ def handle_message(event):
         if not is_last_joined_user(source_id, user_id):
             return
 
+    # 📌 [친구추가 후 재시작] 프로필 조회 실패로 '친구추가+시작'을 안내받은 유저가
+    # 실제로 친구추가 후 '시작'을 입력하면, 최초 입장 시 로직(1번 환영 멘트)부터 다시 진행합니다.
+    if user_message == "시작":
+        room_state = get_room_state(source_id)
+        if room_state and room_state.get('user_id') == user_id and room_state.get('status') == 'pending_friend':
+            send_join_welcome(source_id, user_id, event.reply_token)
+            return
+
     # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
     if user_message == ".":
         reset_verification_state(source_id)
@@ -869,6 +877,49 @@ def handle_message(event):
 # ==========================================
 # [핸들러 2] 방 입장 이벤트 처리 핸들러
 # ==========================================
+def send_join_welcome(source_id, user_id, reply_token):
+    """신입 입장 시 최초 안내(1번 멘트 전송 + room_state 세팅) 로직.
+    - MemberJoinedEvent 정상 처리 시 그리고
+    - 프로필 조회 실패 후 '시작' 재입력으로 재시도할 때 양쪽에서 공용으로 사용합니다.
+    """
+    is_known = False
+    if supabase:
+        res = supabase.table('user_validations').select('user_id').eq('user_id', user_id).execute()
+        if res.data:
+            is_known = True
+
+    set_room_state(source_id, {
+        "user_id": user_id,
+        "status": "joined",
+        "is_known": is_known
+    }, ttl=3600)
+
+    welcome_message = search_keyword("1") or search_keyword("1번")
+    if not welcome_message:
+        welcome_message = "👋 환영합니다! (DB에 '1'번 키워드 멘트가 없으니 등록해 주세요.)"
+
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text=welcome_message)]
+                )
+            )
+    except Exception as e:
+        print(f"신입 안내 메시지 전송 실패: {e}")
+
+
+def fetch_member_profile(line_bot_api, source, user_id):
+    """그룹채팅방 신입 유저 프로필 조회. 유저의 프라이버시 설정(예: '봇의 프로필 조회 허용' 꺼짐)
+    등으로 인해 친구추가가 안 되어 있으면 조회가 실패(예외 발생)할 수 있습니다."""
+    group_id = getattr(source, 'group_id', None)
+    if group_id:
+        return line_bot_api.get_group_member_profile(group_id, user_id)
+    return None
+
+
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', None))
@@ -881,33 +932,44 @@ def handle_member_joined(event):
         if not user_id:
             continue
 
-        is_known = False
-        if supabase:
-            res = supabase.table('user_validations').select('user_id').eq('user_id', user_id).execute()
-            if res.data:
-                is_known = True
+        # 신입 유저 프로필 조회 시도 (설정값/친구추가 여부 등으로 실패할 수 있음)
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                fetch_member_profile(line_bot_api, event.source, user_id)
+        except Exception as e:
+            print(f"신입 프로필 조회 실패(친구추가 필요 추정): {e}")
 
-        set_room_state(source_id, {
-            "user_id": user_id,
-            "status": "joined",
-            "is_known": is_known
-        }, ttl=3600)
+            set_room_state(source_id, {
+                "user_id": user_id,
+                "status": "pending_friend"
+            }, ttl=3600)
 
-    welcome_message = search_keyword("1") or search_keyword("1번")
-    if not welcome_message:
-        welcome_message = "👋 환영합니다! (DB에 '1'번 키워드 멘트가 없으니 등록해 주세요.)"
+            # /ㅇㅈ 1ㅂㅊㄱ, /ㅇㅈ 2ㅂㅊㄱ 두 키워드 멘트를 순서대로 전송
+            ment1 = search_keyword("1ㅂㅊㄱ")
+            ment2 = search_keyword("2ㅂㅊㄱ")
+            guide_messages = [TextMessage(text=t) for t in (ment1, ment2) if t]
 
-    try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=welcome_message)]
-                )
-            )
-    except Exception as e:
-        print(f"신입 안내 메시지 전송 실패: {e}")
+            if not guide_messages:
+                guide_messages = [TextMessage(text=(
+                    "저를 추가해주셔야 인증진행이 가능해요.\n"
+                    "친구추가 해주시고 채팅창에 '시작'이라고 입력해 주세요."
+                ))]
+
+            try:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=guide_messages
+                        )
+                    )
+            except Exception as e2:
+                print(f"친구추가 안내 메시지 전송 실패: {e2}")
+            continue
+
+        send_join_welcome(source_id, user_id, event.reply_token)
 
 
 # ==========================================
