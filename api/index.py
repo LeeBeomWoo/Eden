@@ -498,7 +498,7 @@ def handle_message(event):
             try:
                 sync_reports = []
 
-                # A. '멘트' 시트 동기화
+                # A. '멘트' 시트 동기화 (전체삭제 대신 차이만 반영 - 타임아웃 방지)
                 if sheet:
                     ments_data = sheet.get_all_records()
                     ments_records = []
@@ -508,11 +508,22 @@ def handle_message(event):
                         if k_raw and v_text:
                             for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
                                 ments_records.append({"keyword": k, "reply_text": v_text})
-                    
+
                     if ments_records and supabase:
-                        supabase.table('auth_ments').delete().neq('keyword', '_DELETE_ALL_KEY_').execute()
-                        process_in_chunks('auth_ments', ments_records, is_insert=True)
-                        sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드")
+                        new_keywords = {r["keyword"] for r in ments_records}
+                        existing_rows = get_all_supabase_data('auth_ments', 'keyword')
+                        existing_keywords = {str(r.get('keyword', '')).strip() for r in existing_rows if r.get('keyword')}
+                        removed_keywords = list(existing_keywords - new_keywords)
+
+                        # 시트에서 사라진 키워드만 삭제 (전체삭제 아님)
+                        if removed_keywords:
+                            for i in range(0, len(removed_keywords), 200):
+                                chunk = removed_keywords[i:i + 200]
+                                supabase.table('auth_ments').delete().in_('keyword', chunk).execute()
+
+                        # 나머지는 upsert (있으면 갱신, 없으면 추가)
+                        process_in_chunks('auth_ments', ments_records, is_insert=False)
+                        sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드 (삭제 {len(removed_keywords)}개)")
 
                 # B. '방관리' 시트 동기화
                 if room_manage_sheet:
@@ -781,10 +792,15 @@ def handle_message(event):
         target_status = "입장대기"
         if supabase:
             try:
-                user_res = supabase.table('user_validations').select('retry_count, status').eq('user_id', user_id).execute()
+                user_res = supabase.table('user_validations').select('retry_count, status, entry_date').eq('user_id', user_id).execute()
                 retry_cnt = 1
+                existing_entry_date = None
                 if user_res.data:
                     retry_cnt = user_res.data[0].get('retry_count', 1) + 1
+                    existing_entry_date = user_res.data[0].get('entry_date')
+
+                # 기존 입장일 기록에 이번 날짜를 콤마로 이어붙임 (덮어쓰지 않고 누적)
+                entry_date_to_save = f"{existing_entry_date},{current_date}" if existing_entry_date else current_date
 
                 supabase.table('user_validations').upsert({
                     "user_id": user_id,
@@ -792,7 +808,7 @@ def handle_message(event):
                     "gender": gender,
                     "region": region,
                     "birth_year": birth_year,
-                    "entry_date": current_date,
+                    "entry_date": entry_date_to_save,
                     "retry_count": retry_cnt,
                     "status": target_status,
                     "details": update_data_details
@@ -815,7 +831,11 @@ def handle_message(event):
                         count_val = row_data[7] if len(row_data) >= 8 else "0"
                         current_retry_count = int(count_val) if count_val.isdigit() else 0
 
-                        update_data_basic = [nickname, gender, region, birth_year, user_id, current_date, "", current_retry_count + 1]
+                        # F열(입장일)도 덮어쓰지 않고 콤마로 이어붙여 누적
+                        existing_entry_date_sheet = row_data[5].strip() if len(row_data) > 5 and row_data[5].strip() else ""
+                        entry_date_to_save_sheet = f"{existing_entry_date_sheet},{current_date}" if existing_entry_date_sheet else current_date
+
+                        update_data_basic = [nickname, gender, region, birth_year, user_id, entry_date_to_save_sheet, "", current_retry_count + 1]
                         validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
                         validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
                         validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
@@ -906,7 +926,7 @@ def send_join_welcome(source_id, user_id, reply_token):
 
     welcome_message = search_keyword("1") or search_keyword("1번")
     if not welcome_message:
-        welcome_message = "👋 환영합니다! (DB에 '1'번 키워드 멘트가 없으니 등록해 주세요.)"
+        welcome_message = "인증봇을 추가해주세요\nhttps://lin.ee/ttJ0cUk"
 
     try:
         with ApiClient(configuration) as api_client:
