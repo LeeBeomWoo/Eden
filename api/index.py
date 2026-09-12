@@ -394,6 +394,10 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        # 예상 못한 에러(예: Supabase 일시 장애)로 500이 나가면 LINE이 재시도를 반복하며
+        # reply_token 만료 등으로 결국 유저가 응답을 못 받게 되므로, 로그만 남기고 200으로 응답합니다.
+        print(f"⚠️ 콜백 처리 중 예외 발생(무시하고 200 응답): {e}")
     return 'OK'
 
 
@@ -887,9 +891,12 @@ def send_join_welcome(source_id, user_id, reply_token):
     """
     is_known = False
     if supabase:
-        res = supabase.table('user_validations').select('user_id').eq('user_id', user_id).execute()
-        if res.data:
-            is_known = True
+        try:
+            res = supabase.table('user_validations').select('user_id').eq('user_id', user_id).execute()
+            if res.data:
+                is_known = True
+        except Exception as e:
+            print(f"user_validations 조회 에러(무시하고 진행): {e}")
 
     set_room_state(source_id, {
         "user_id": user_id,
