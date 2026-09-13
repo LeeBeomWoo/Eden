@@ -493,7 +493,10 @@ def handle_message(event):
         )
         if complete_trigger:
             completed_user_id = complete_verification_state(source_id)
-            reply_text = "✅ 인증 상태를 완료로 변경했습니다." if completed_user_id else "❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다."
+            if completed_user_id:
+                reply_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증 상태를 완료로 변경했습니다."
+            else:
+                reply_text = "❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다."
 
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
