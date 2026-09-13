@@ -895,11 +895,15 @@ def handle_message(event):
             set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
 
-            form2_text = search_keyword("2") or search_keyword("2번")
-            if form2_text:
-                reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
+            if is_edit_resubmission:
+                # 이미 1번 양식을 제출한 상태에서 내용만 고쳐서 재제출한 경우: DB만 갱신하고 2번 멘트는 다시 보내지 않음
+                reply_text = f"✏️ [{nickname}]님, 수정하신 내용이 반영되었습니다."
             else:
-                reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
+                form2_text = search_keyword("2") or search_keyword("2번")
+                if form2_text:
+                    reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
+                else:
+                    reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
         else:
             reply_text = "⚠️ 서버 통신 문제로 저장에 실패했습니다. 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
 
