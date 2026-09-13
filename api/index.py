@@ -222,8 +222,9 @@ def del_room_state(room_id):
 
 
 def reset_verification_state(source_id, target_user_id=None):
-    """해당 방의 인증 상태를 초기화합니다.
-    - '.' 명령어와 신입 유저 퇴장(MemberLeftEvent) 양쪽에서 공용으로 사용합니다.
+    """해당 방의 인증 진행 상태(room_state, 세션)만 초기화합니다. (신입 유저 퇴장(MemberLeftEvent)에서 사용)
+    - user_validations의 status는 더 이상 건드리지 않습니다. 재입장 시 마지막 status를 기준으로
+      대화가 어디서 끊겼는지 안내하는 기능(send_join_welcome)이 이 값을 그대로 활용합니다.
     - target_user_id를 명시하지 않으면 현재 room_state에 기록된 유저를 대상으로 합니다.
     - 반환값: 실제로 초기화된 user_id (없으면 None)
     """
@@ -233,9 +234,24 @@ def reset_verification_state(source_id, target_user_id=None):
 
     if target_user_id:
         del_user_session(target_user_id)
+
+    del_room_state(source_id)
+    return target_user_id
+
+def complete_verification_state(source_id, target_user_id=None):
+    """관리자가 '/ㅇㅈ 퇴장' 또는 '/ㅇㅈ ㅌㅈ'을 입력했을 때, 진행 중이던 인증 상태를 '완료'로 종료합니다.
+    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 유저를 대상으로 합니다.
+    - 반환값: 실제로 완료 처리된 user_id (없으면 None)
+    """
+    room_state = get_room_state(source_id)
+    if target_user_id is None:
+        target_user_id = room_state.get('user_id') if room_state else None
+
+    if target_user_id:
+        del_user_session(target_user_id)
         try:
             if supabase:
-                supabase.table('user_validations').update({"status": "입장대기"}).eq('user_id', target_user_id).execute()
+                supabase.table('user_validations').update({"status": "완료"}).eq('user_id', target_user_id).execute()
 
             with sheet_sync_lock():
                 if validation_sheet:
@@ -243,11 +259,12 @@ def reset_verification_state(source_id, target_user_id=None):
                     clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
                     if target_user_id in clean_user_ids:
                         row_index = clean_user_ids.index(target_user_id) + 1
-                        validation_sheet.update(range_name=f'L{row_index}', values=[["입장대기"]])
+                        validation_sheet.update(range_name=f'L{row_index}', values=[["완료"]])
         except Exception as e:
-            print(f"유저 상태 초기화 처리 중 에러: {e}")
+            print(f"유저 상태 완료 처리 중 에러: {e}")
 
-    del_room_state(source_id)
+        del_room_state(source_id)
+
     return target_user_id
 
 def is_last_joined_user(source_id, user_id):
@@ -426,9 +443,13 @@ def handle_message(event):
             send_join_welcome(source_id, user_id, event.reply_token)
             return
 
-    # 0. 점(.) 입력 시 해당 방의 인증 상태 초기화 (관리자 또는 누구나 실행 가능)
+    # 0. 점(.) 입력 시 해당 방의 인증 진행 상태(room_state)만 초기화 (DB status는 변경하지 않음)
     if user_message == ".":
-        reset_verification_state(source_id)
+        room_state = get_room_state(source_id)
+        tracked_user_id = room_state.get('user_id') if room_state else None
+        if tracked_user_id:
+            del_user_session(tracked_user_id)
+        del_room_state(source_id)
 
         reply_text = "🔄 해당 방의 인증 진행 상태가 초기화되었습니다.\n신입 유저는 양식을 처음부터 다시 작성해 주세요!"
         with ApiClient(configuration) as api_client:
@@ -460,6 +481,19 @@ def handle_message(event):
                 reply_text = v_reply_text if v_success else "❌ 해당 유저의 인증 정보를 DB에서 찾을 수 없어 음성인증 멘트를 보낼 수 없습니다."
             else:
                 reply_text = "❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다."
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+            return
+
+        # 진행 중이던 인증을 완료 처리: /인증 퇴장, /ㅇㅈ 퇴장, /인증 ㅌㅈ, /ㅇㅈ ㅌㅈ
+        complete_trigger = (
+            cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("퇴장", "ㅌㅈ")
+        )
+        if complete_trigger:
+            completed_user_id = complete_verification_state(source_id)
+            reply_text = "✅ 인증 상태를 완료로 변경했습니다." if completed_user_id else "❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다."
 
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -908,15 +942,22 @@ def send_join_welcome(source_id, user_id, reply_token):
     """신입 입장 시 최초 안내(1번 멘트 전송 + room_state 세팅) 로직.
     - MemberJoinedEvent 정상 처리 시 그리고
     - 프로필 조회 실패 후 '시작' 재입력으로 재시도할 때 양쪽에서 공용으로 사용합니다.
+    - 재입장인 경우, DB에 남아있는 마지막 status를 확인해서 대화가 끊긴 지점을 안내하고
+      해당 단계부터 이어서 진행할 수 있도록 합니다.
     """
-    is_known = False
+    existing = None
     if supabase:
         try:
-            res = supabase.table('user_validations').select('user_id').eq('user_id', user_id).execute()
+            res = supabase.table('user_validations').select('status, nickname').eq('user_id', user_id).execute()
             if res.data:
-                is_known = True
+                existing = res.data[0]
         except Exception as e:
             print(f"user_validations 조회 에러(무시하고 진행): {e}")
+
+    is_known = existing is not None
+    last_status = (existing or {}).get('status')
+    nickname = (existing or {}).get('nickname') or ""
+    name_prefix = f"{nickname}님, " if nickname else ""
 
     set_room_state(source_id, {
         "user_id": user_id,
@@ -924,7 +965,27 @@ def send_join_welcome(source_id, user_id, reply_token):
         "is_known": is_known
     }, ttl=3600)
 
-    welcome_message = search_keyword("1") or search_keyword("1번")
+    welcome_message = None
+
+    # 재입장 + 이전에 진행 중이던 status가 남아있는 경우 -> 끊긴 지점 안내 + 해당 단계로 이어서 진행
+    if last_status == "음성대기":
+        v_success, v_reply_text = start_voice_auth(user_id, require_status=None)
+        if v_success:
+            welcome_message = f"🔄 {name_prefix}이전 대화가 [음성인증] 단계에서 끊겼어요. 이어서 진행할게요.\n\n{v_reply_text}"
+    elif last_status == "승인대기":
+        welcome_message = f"🔄 {name_prefix}이전 대화가 [운영진 승인 대기] 단계에서 끊겼어요.\n운영진 확인 후 승인될 예정이니 잠시만 기다려 주세요."
+    elif last_status == "입장대기" and nickname:
+        # nickname이 있다는 건 1번 양식까지는 이미 제출했었다는 뜻 -> '확인' 답장 대기 단계로 이어서 진행
+        form2_text = search_keyword("2") or search_keyword("2번")
+        if form2_text:
+            resume_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
+        else:
+            resume_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
+        welcome_message = f"🔄 {name_prefix}이전 대화가 [1번 양식 제출 후 확인 대기] 단계에서 끊겼어요.\n\n{resume_text}"
+    # last_status가 "완료"이거나, 기록이 없거나, 위에서 안내문을 못 만든 경우 -> 처음 입장한 것처럼 1번 멘트부터 진행
+
+    if not welcome_message:
+        welcome_message = search_keyword("1") or search_keyword("1번")
     if not welcome_message:
         welcome_message = "인증봇을 추가해주세요\nhttps://lin.ee/ttJ0cUk"
 
