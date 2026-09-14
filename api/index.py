@@ -114,6 +114,27 @@ def process_in_chunks(table_name, data_list, chunk_size=500, is_insert=False):
             print(f"{table_name} 테이블 데이터 분할 처리 에러 ({i}~{i+chunk_size}): {e}")
 
 
+def supabase_execute(query_fn, retries=2, delay=0.4, default=None, label=""):
+    """Supabase 쿼리 실행 시 504 Gateway Timeout 등 일시적 에러에 대해 짧게 재시도하는 헬퍼.
+
+    query_fn: 인자 없이 호출하면 .execute()까지 실행하는 콜러블
+              예) lambda: supabase.table('user_validations').select('status').eq('user_id', uid).execute()
+    실패 시 default를 반환하고, 호출부에서는 반환값이 None/default인지 확인해서 처리하면 됨.
+    """
+    if not supabase:
+        return default
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return query_fn()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(delay)
+    print(f"Supabase 쿼리 재시도 실패{f' ({label})' if label else ''}: {last_err}")
+    return default
+
+
 # ==========================================
 # [동시성 제어 - Supabase 분산 락]
 # ==========================================
@@ -1109,13 +1130,21 @@ def handle_audio(event):
 
     is_audio_waiting = False
     if supabase:
-        res = supabase.table('user_validations').select('status').eq('user_id', user_id).execute()
-        if res.data and res.data[0].get('status') == '음성대기':
+        res = supabase_execute(
+            lambda: supabase.table('user_validations').select('status').eq('user_id', user_id).execute(),
+            label="음성대기 상태 조회"
+        )
+        if res and res.data and res.data[0].get('status') == '음성대기':
             is_audio_waiting = True
 
     if is_audio_waiting:
         if supabase:
-            supabase.table('user_validations').update({"status": "승인대기"}).eq('user_id', user_id).execute()
+            update_res = supabase_execute(
+                lambda: supabase.table('user_validations').update({"status": "승인대기"}).eq('user_id', user_id).execute(),
+                label="음성인증 승인대기 업데이트"
+            )
+            if update_res is None:
+                print(f"⚠️ user_id={user_id} 승인대기 상태 업데이트 실패 — 재시도에도 실패, 시트/알림은 계속 진행")
 
         with sheet_sync_lock():
             try:
