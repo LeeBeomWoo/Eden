@@ -450,7 +450,13 @@ def handle_message(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
     user_message = event.message.text.strip()
     reply_text = ""
-    
+
+    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)에서는 신입 검증 플로우
+    # ("." 초기화, 1번 양식 제출, "확인" 답장 처리)를 전혀 실행/기록하지 않는다.
+    # 이 방에서는 관리진 명령어(/인증, /ㅇㅈ, /디비업데이트, /O번방 확인 등)와
+    # 그 외 슬래시(/)로 시작하는 일반 명령어(DB 키워드로 등록된 멘트 포함)만 동작한다.
+    is_admin_room = (source_id == ADMIN_GROUP_CHAT_ID)
+
     # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
     if not (user_message == "." or user_message.startswith("/")):
         if not is_last_joined_user(source_id, user_id):
@@ -458,14 +464,14 @@ def handle_message(event):
 
     # 📌 [친구추가 후 재시작] 프로필 조회 실패로 '친구추가+시작'을 안내받은 유저가
     # 실제로 친구추가 후 '시작'을 입력하면, 최초 입장 시 로직(1번 환영 멘트)부터 다시 진행합니다.
-    if user_message == "시작":
+    if not is_admin_room and user_message == "시작":
         room_state = get_room_state(source_id)
         if room_state and room_state.get('user_id') == user_id and room_state.get('status') == 'pending_friend':
             send_join_welcome(source_id, user_id, event.reply_token)
             return
 
     # 0. 점(.) 입력 시 해당 방의 인증 진행 상태(room_state)만 초기화 (DB status는 변경하지 않음)
-    if user_message == ".":
+    if not is_admin_room and user_message == ".":
         room_state = get_room_state(source_id)
         tracked_user_id = room_state.get('user_id') if room_state else None
         if tracked_user_id:
@@ -679,7 +685,7 @@ def handle_message(event):
             return
 
     # 📌 [핵심 검증 1] 1번 양식 제출 처리 (마지막 입장 유저만 작동)
-    if all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
+    if not is_admin_room and all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
         if not is_last_joined_user(source_id, user_id):
             return 
 
@@ -934,7 +940,7 @@ def handle_message(event):
         return
 
     # 📌 [핵심 검증 2] 신입이 "확인" 답장 입력 시 (마지막 입장 유저만 작동)
-    if not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
+    if not is_admin_room and not user_message.startswith("/") and any(word in user_message for word in ["확인", "확인했습니다", "확인완료"]):
         if not is_last_joined_user(source_id, user_id):
             return  
 
@@ -1045,6 +1051,11 @@ def handle_member_joined(event):
     if not source_id:
         return
 
+    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)은 신입 검증 대상 방이 아니므로,
+    # 여기서 누가 입장하든 환영 멘트/프로필 조회/room_state 기록을 하지 않는다.
+    if source_id == ADMIN_GROUP_CHAT_ID:
+        return
+
     joined_members = event.joined.members
     for member in joined_members:
         user_id = member.user_id
@@ -1098,6 +1109,11 @@ def handle_member_joined(event):
 def handle_member_left(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', None))
     if not source_id:
+        return
+
+    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)은 신입 검증 대상 방이 아니므로,
+    # 여기서 누가 나가든 room_state/인증 상태를 건드리지 않는다.
+    if source_id == ADMIN_GROUP_CHAT_ID:
         return
 
     left_user_ids = {m.user_id for m in event.left.members if getattr(m, 'user_id', None)}
