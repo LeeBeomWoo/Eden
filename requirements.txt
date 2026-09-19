@@ -4,3 +4,4 @@ gspread
 oauth2client
 upstash-redis
 supabase>=2.3.0
+requests
