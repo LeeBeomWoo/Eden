@@ -37,7 +37,7 @@ def warmup_voice_service():
     if not voice_service_url:
         return
     try:
-        requests.get(f"{voice_service_url.rstrip('/')}/health", timeout=3)
+        requests.get(f"{voice_service_url.rstrip('/')}/healthz", timeout=3)
     except Exception:
         pass
 
