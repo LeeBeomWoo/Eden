@@ -33,7 +33,8 @@ analyze_new_member_voice()는 내부에서 발생하는 모든 예외(Cloud Run 
 
 import os
 import time
-
+import google.auth.transport.requests
+import google.oauth2.id_token
 import requests
 
 VOICE_SERVICE_URL = os.environ.get("VOICE_SERVICE_URL", "")
@@ -44,18 +45,25 @@ VOICE_SERVICE_TIMEOUT = 90
 
 
 def analyze_audio_via_cloud_run(raw_audio_bytes: bytes) -> dict:
-    """Cloud Run의 /analyze 엔드포인트에 원본 오디오를 보내고 결과를 받아옵니다.
-
-    반환: {"embedding": [...], "estimated_gender": "남"|"여"|None, "pitch_hz": float|None}
-    실패 시 예외를 던집니다 (호출부 analyze_new_member_voice가 잡아서 처리).
-    """
     if not VOICE_SERVICE_URL:
         raise RuntimeError("VOICE_SERVICE_URL 환경변수가 설정되지 않았습니다.")
+    
+    target_audience = VOICE_SERVICE_URL.rstrip('/')
 
+    # 1. Cloud Run 호출을 위한 인증 토큰(ID Token) 발급
+    auth_req = google.auth.transport.requests.Request()
+    token = google.oauth2.id_token.fetch_id_token(auth_req, target_audience)
+
+    # 2. 기존 헤더에 Authorization(Bearer 토큰) 추가
+    headers = {"Authorization": f"Bearer {token}"}
+    if VOICE_SERVICE_API_KEY:
+        headers["X-API-Key"] = VOICE_SERVICE_API_KEY
+
+    # 3. 요청 전송
     resp = requests.post(
-        f"{VOICE_SERVICE_URL.rstrip('/')}/analyze",
+        f"{target_audience}/analyze",
         files={"audio": ("audio", raw_audio_bytes)},
-        headers={"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {},
+        headers=headers,
         timeout=VOICE_SERVICE_TIMEOUT,
     )
     resp.raise_for_status()
