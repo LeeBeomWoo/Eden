@@ -36,6 +36,7 @@ import time
 import google.auth.transport.requests
 import google.oauth2.id_token
 import requests
+from google.oauth2 import service_account  # 이 줄을 추가로 임포트하세요.
 
 VOICE_SERVICE_URL = os.environ.get("VOICE_SERVICE_URL", "")
 VOICE_SERVICE_API_KEY = os.environ.get("VOICE_SERVICE_API_KEY", "")
@@ -50,16 +51,27 @@ def analyze_audio_via_cloud_run(raw_audio_bytes: bytes) -> dict:
     
     target_audience = VOICE_SERVICE_URL.rstrip('/')
 
-    # 1. Cloud Run 호출을 위한 인증 토큰(ID Token) 발급
-    auth_req = google.auth.transport.requests.Request()
-    token = google.oauth2.id_token.fetch_id_token(auth_req, target_audience)
+    # 1. Vercel 환경변수에서 JSON 문자열 불러오기
+    gcp_json_str = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if not gcp_json_str:
+        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON 환경변수가 없습니다.")
+    
+    # 2. JSON 문자열을 딕셔너리로 변환 후 ID 토큰 인증 객체 생성
+    creds_dict = json.loads(gcp_json_str)
+    creds = service_account.IDTokenCredentials.from_service_account_info(
+        creds_dict, target_audience=target_audience
+    )
 
-    # 2. 기존 헤더에 Authorization(Bearer 토큰) 추가
+    # 3. 토큰 새로고침 및 발급
+    auth_req = google.auth.transport.requests.Request()
+    creds.refresh(auth_req)
+    token = creds.token
+
+    # 4. 헤더 설정 및 요청
     headers = {"Authorization": f"Bearer {token}"}
     if VOICE_SERVICE_API_KEY:
         headers["X-API-Key"] = VOICE_SERVICE_API_KEY
 
-    # 3. 요청 전송
     resp = requests.post(
         f"{target_audience}/analyze",
         files={"audio": ("audio", raw_audio_bytes)},
