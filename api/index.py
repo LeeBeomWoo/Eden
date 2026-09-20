@@ -5,6 +5,7 @@ import json
 import gspread
 import datetime
 import threading
+import requests
 from contextlib import contextmanager
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
@@ -26,6 +27,20 @@ from linebot.v3.webhooks import (
 from voice_analysis import analyze_new_member_voice
 
 app = Flask(__name__)
+
+
+def warmup_voice_service():
+    """신입 입장 시 Cloud Run 음성분석 서비스를 미리 깨워둔다 (콜드스타트 완화용).
+    응답을 기다리지 않고 짧은 타임아웃으로 요청만 보내고, 실패/타임아웃 나도 무시한다.
+    (요청이 타임아웃 나더라도 Cloud Run 쪽 컨테이너 기동은 이미 시작됨)"""
+    voice_service_url = os.environ.get("VOICE_SERVICE_URL", "")
+    if not voice_service_url:
+        return
+    try:
+        requests.get(f"{voice_service_url.rstrip('/')}/health", timeout=3)
+    except Exception:
+        pass
+
 
 # 인증자방(관리자 그룹방) ID 고정 설정
 ADMIN_GROUP_CHAT_ID = "C1fdb3b771a6bd0686fa7dbf1b5145a70"
@@ -1146,6 +1161,9 @@ def handle_member_joined(event):
     # 여기서 누가 입장하든 환영 멘트/프로필 조회/room_state 기록을 하지 않는다.
     if source_id == ADMIN_GROUP_CHAT_ID:
         return
+
+    # ✨ [추가됨] 신입 입장 즉시 Cloud Run 음성서비스 웜업 (백그라운드, 응답 안 기다림)
+    threading.Thread(target=warmup_voice_service, daemon=True).start()
 
     joined_members = event.joined.members
     for member in joined_members:
