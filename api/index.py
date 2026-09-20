@@ -22,6 +22,9 @@ from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, MemberJoinedEvent, MemberLeftEvent, AudioMessageContent
 )
 
+# ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
+from voice_analysis import analyze_new_member_voice
+
 app = Flask(__name__)
 
 # 인증자방(관리자 그룹방) ID 고정 설정
@@ -1131,6 +1134,66 @@ def handle_member_left(event):
 
 
 # ==========================================
+# ✨ [추가됨] 음성 자동분석 결과를 운영진방에 참고용으로 알리는 헬퍼
+# ==========================================
+# 블랙리스트 유사도가 이 값 이상이면 "동일인 의심"으로 강조 표시한다.
+VOICE_MATCH_ALERT_THRESHOLD = 0.90
+
+# 신청서 성별 표기("남"/"남자"/"여"/"여자")를 "남"/"여"로 정규화하기 위한 매핑
+_GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"}
+
+
+def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, voice_result):
+    """음성 자동분석 결과 중 운영진이 참고할 만한 내용이 있을 때만 운영진방에 push한다.
+
+    알림 조건:
+    - 블랙리스트 유사도가 VOICE_MATCH_ALERT_THRESHOLD(기본 90%) 이상인 경우
+    - 또는 신청서에 적은 성별과 음성 기반 추정 성별이 다른 경우
+    둘 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
+
+    ⚠️ 어디까지나 참고 정보다. 자동 판정/자동 승인·차단이 아니며,
+    최종 판단은 반드시 운영진이 음성을 직접 듣고 내려야 한다.
+    """
+    if not voice_result or voice_result.get("error"):
+        return
+
+    matches = voice_result.get("matches") or []
+    strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
+
+    est_gender = voice_result.get("estimated_gender")
+    claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
+    gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
+
+    if not strong_matches and not gender_mismatch:
+        return
+
+    lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
+
+    if est_gender:
+        pitch_note = f" (추정 피치 {voice_result.get('pitch_hz')}Hz)" if voice_result.get("pitch_hz") else ""
+        mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
+        lines.append(f"- 음성 기반 추정 성별: {est_gender}{pitch_note}{mismatch_note}")
+
+    if strong_matches:
+        lines.append("- ⚠️⚠️ 블랙리스트 음성과 매우 유사 (동일인 의심):")
+        for m in strong_matches[:3]:
+            pct = round((m.get("similarity") or 0) * 100, 1)
+            lines.append(f"    • '{m.get('nickname') or '(닉네임 미상)'}' — 유사도 {pct}%")
+        lines.append("  ※ 자동 판정이 아니니 반드시 직접 음성 대조 후 최종 판단해 주세요.")
+
+    alert_text = "\n".join(lines)
+
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message_with_http_info(
+                PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=alert_text)])
+            )
+    except Exception as e:
+        print(f"⚠️ 운영진방 음성분석 알림 전송 실패: {e}")
+
+
+# ==========================================
 # [핸들러 4] 📌 음성 메시지 처리 핸들러 (마지막 입장 유저만 작동)
 # ==========================================
 @handler.add(MessageEvent, message=AudioMessageContent)
@@ -1145,13 +1208,16 @@ def handle_audio(event):
         return
 
     is_audio_waiting = False
+    claimed_nickname, claimed_gender = "", ""
     if supabase:
         res = supabase_execute(
-            lambda: supabase.table('user_validations').select('status').eq('user_id', user_id).execute(),
+            lambda: supabase.table('user_validations').select('status, nickname, gender').eq('user_id', user_id).execute(),
             label="음성대기 상태 조회"
         )
         if res and res.data and res.data[0].get('status') == '음성대기':
             is_audio_waiting = True
+            claimed_nickname = res.data[0].get('nickname') or ""
+            claimed_gender = res.data[0].get('gender') or ""
 
     if is_audio_waiting:
         if supabase:
@@ -1172,6 +1238,26 @@ def handle_audio(event):
                         validation_sheet.update(range_name=f'L{row_index}', values=[["승인대기"]])
             except Exception as e:
                 print(f"음성 제출 시트 업데이트 에러: {e}")
+
+        # ✨ [추가됨] 음성 자동분석 (성별 추정 + 블랙리스트 화자 유사도 검색)
+        # 실패해도 아래 유저 응답/기존 수동 인증 흐름에는 절대 영향을 주지 않는다
+        # (분석 실패 시 조용히 로그만 남기고, 사람이 직접 판단하는 기존 흐름 그대로 진행).
+        if supabase:
+            try:
+                voice_result = analyze_new_member_voice(
+                    supabase, configuration,
+                    message_id=event.message.id,
+                    user_id=user_id,
+                    nickname=claimed_nickname,
+                )
+                notify_admin_voice_analysis(
+                    claimed_nickname=claimed_nickname,
+                    claimed_gender=claimed_gender,
+                    user_id=user_id,
+                    voice_result=voice_result,
+                )
+            except Exception as e:
+                print(f"⚠️ 음성 자동분석/운영진 알림 실패(수동 인증 흐름에는 영향 없음): {e}")
 
         reply_text = "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n운영진이 확인 후 최종 승인 처리해 드릴 예정이니 잠시만 기다려 주세요."
         with ApiClient(configuration) as api_client:
