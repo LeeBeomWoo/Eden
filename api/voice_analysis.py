@@ -40,7 +40,7 @@ VOICE_SERVICE_URL = os.environ.get("VOICE_SERVICE_URL", "")
 VOICE_SERVICE_API_KEY = os.environ.get("VOICE_SERVICE_API_KEY", "")
 # Cloud Run이 무료 티어 안에서 스케일-투-제로로 동작하면 콜드스타트(첫 요청 시
 # 모델 로딩)에 시간이 걸릴 수 있어서 넉넉하게 잡습니다.
-VOICE_SERVICE_TIMEOUT = 45
+VOICE_SERVICE_TIMEOUT = 90
 
 
 def analyze_audio_via_cloud_run(raw_audio_bytes: bytes) -> dict:
