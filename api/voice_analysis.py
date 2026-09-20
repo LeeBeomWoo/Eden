@@ -112,8 +112,7 @@ def insert_voice_profile(
 def match_blacklist_voices(supabase, embedding, match_count: int = 5):
     """블랙리스트(members)로 등록된 음성들 중 이 임베딩과 가장 유사한 것들을 찾습니다.
     Postgres 쪽 match_voice_profiles() 함수(코사인 유사도, pgvector)를 RPC로 호출합니다.
-
-    반환: [{"id":.., "member_id":.., "nickname":.., "similarity": 0.0~1.0}, ...] (유사도 내림차순)
+    반환: [{"id":..., "member_id":..., "nickname":..., "similarity": 0.8~1.0, "gender":..., "status":...}, ...] (유사도 내림차순)
     """
     try:
         res = supabase.rpc(
