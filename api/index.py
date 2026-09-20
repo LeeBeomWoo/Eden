@@ -323,6 +323,51 @@ def get_room_id_by_name(room_name):
             print(f"방 DB 조회 실패: {e}")
     return None
 
+
+# ==========================================
+# ✨ [추가됨] 구글시트 → DB 동기화용 안전장치
+# ==========================================
+def find_header_col_index(header_row, keywords):
+    """헤더 행(1행)에서 keywords 중 하나라도 포함된 첫 번째 열의 인덱스(0-based)를 찾습니다.
+    관리자가 '검증' 시트에 열을 삽입/삭제/이동해도, 위치가 아니라 '이름'으로 찾기 때문에
+    엉뚱한 열의 값이 잘못된 필드에 저장되는 사고를 막기 위한 안전장치입니다.
+    못 찾으면 None을 반환합니다.
+    """
+    for idx, cell in enumerate(header_row):
+        cell_clean = str(cell).replace(" ", "")
+        for kw in keywords:
+            if kw in cell_clean:
+                return idx
+    return None
+
+
+def build_validation_sheet_col_map(header_row):
+    """'검증' 시트 헤더 행을 보고 각 필드가 몇 번째 열인지 찾아 dict로 돌려줍니다.
+    user_id 열을 못 찾으면 동기화 자체가 불가능하므로 None을 반환해서 호출부가
+    (엉뚱한 데이터를 쓰는 대신) 동기화를 안전하게 중단하도록 합니다.
+    """
+    col_map = {
+        "user_id": find_header_col_index(header_row, ["아이디", "ID", "유저", "id"]),
+        "nickname": find_header_col_index(header_row, ["닉네임"]),
+        "gender": find_header_col_index(header_row, ["성별"]),
+        "region": find_header_col_index(header_row, ["지역"]),
+        "birth_year": find_header_col_index(header_row, ["년생", "생년"]),
+        "entry_date": find_header_col_index(header_row, ["입장"]),
+        "black_reason": find_header_col_index(header_row, ["블랙"]),
+        "retry_count": find_header_col_index(header_row, ["재시도", "횟수"]),
+        "status": find_header_col_index(header_row, ["상태"]),
+    }
+    if col_map["user_id"] is None:
+        return None
+    return col_map
+
+
+def get_cell(row, idx, default=""):
+    """row[idx]를 안전하게 꺼냅니다. idx가 None이거나 행이 그 길이만큼 없으면 default."""
+    if idx is None or len(row) <= idx:
+        return default
+    return str(row[idx]).strip()
+
 def get_recording_ments():
     if supabase:
         try:
@@ -627,25 +672,63 @@ def handle_message(event):
                 if validation_sheet:
                     all_val_data = validation_sheet.get_all_values()
                     if all_val_data and len(all_val_data) > 1:
-                        val_records = []
-                        for row in all_val_data[1:]:
-                            u_id = str(row[4]).strip() if len(row) > 4 else ""
-                            if u_id:
-                                val_records.append({
+                        col_map = build_validation_sheet_col_map(all_val_data[0])
+
+                        if col_map is None:
+                            sync_reports.append(
+                                "• ⚠️ 검증이력: 건너뜀 — 헤더 행에서 'user_id/아이디' 열을 찾지 못했습니다. "
+                                "시트 1행(헤더)이 지워졌거나 이름이 바뀐 것 같아요. 잘못된 데이터가 저장될 위험이 있어 동기화를 중단했습니다."
+                            )
+                        else:
+                            # ✨ [변경됨] 위치(인덱스) 하드코딩 대신 헤더 이름으로 찾은 열에서 값을 읽습니다.
+                            # (시트에 열이 삽입/삭제/이동돼도 엉뚱한 필드에 값이 들어가지 않도록)
+                            grouped_records = {}
+                            skipped_short_rows = 0
+                            for row in all_val_data[1:]:
+                                u_id = get_cell(row, col_map["user_id"])
+                                if not u_id:
+                                    continue
+
+                                record = {
                                     "user_id": u_id,
-                                    "nickname": str(row[0]).strip() if len(row) > 0 else "",
-                                    "gender": str(row[1]).strip() if len(row) > 1 else "",
-                                    "region": str(row[2]).strip() if len(row) > 2 else "",
-                                    "birth_year": str(row[3]).strip() if len(row) > 3 else "",
-                                    "entry_date": str(row[5]).strip() if len(row) > 5 else "",
-                                    "black_reason": str(row[6]).strip() if len(row) > 6 else "",
-                                    "retry_count": int(row[7]) if len(row) > 7 and row[7].isdigit() else 1,
-                                    "status": str(row[11]).strip() if len(row) > 11 else "입장대기"
-                                })
-                        if val_records and supabase:
-                            # 데이터가 많을 경우를 대비해 청크(분할) 업데이트 적용
-                            process_in_chunks('user_validations', val_records, is_insert=False)
-                            sync_reports.append(f"• 검증이력: {len(val_records)}명 유저 데이터")
+                                    "nickname": get_cell(row, col_map["nickname"]),
+                                    "gender": get_cell(row, col_map["gender"]),
+                                    "region": get_cell(row, col_map["region"]),
+                                    "birth_year": get_cell(row, col_map["birth_year"]),
+                                    "entry_date": get_cell(row, col_map["entry_date"]),
+                                    "black_reason": get_cell(row, col_map["black_reason"]),
+                                }
+
+                                # ✨ [변경됨] 재시도횟수/상태는 그 유저의 '진행 단계'를 의미하는 값이라,
+                                # 셀이 아예 없어서(=행이 짧아서) 못 읽은 경우엔 기본값(1, 입장대기)으로
+                                # 덮어쓰지 않고 아예 이 dict에서 빼버립니다. → upsert 시 DB에 남아있던
+                                # 기존 값(예: 승인대기/완료, retry_count 3 등)이 그대로 보존됩니다.
+                                retry_idx = col_map["retry_count"]
+                                if retry_idx is not None and len(row) > retry_idx and row[retry_idx].strip().isdigit():
+                                    record["retry_count"] = int(row[retry_idx])
+                                else:
+                                    skipped_short_rows += 1
+
+                                status_idx = col_map["status"]
+                                if status_idx is not None and len(row) > status_idx:
+                                    record["status"] = row[status_idx].strip()
+
+                                # 같은 필드 구성(key 조합)끼리 묶어서 upsert (배치 안에서 필드가
+                                # 들쭉날쭉하면 일부 행이 의도치 않게 NULL로 덮어써질 수 있어서, 반드시
+                                # 완전히 동일한 key 조합끼리만 같은 배치로 묶습니다.)
+                                sig = tuple(sorted(record.keys()))
+                                grouped_records.setdefault(sig, []).append(record)
+
+                            total_synced = 0
+                            if supabase:
+                                for records in grouped_records.values():
+                                    process_in_chunks('user_validations', records, is_insert=False)
+                                    total_synced += len(records)
+
+                            report_line = f"• 검증이력: {total_synced}명 유저 데이터"
+                            if skipped_short_rows:
+                                report_line += f" (재시도횟수/상태 정보가 없어 기존 값을 유지한 행 {skipped_short_rows}건 포함)"
+                            sync_reports.append(report_line)
 
                 report_str = "\n".join(sync_reports)
                 reply_text = f"✅ 모든 구글 시트 데이터가 DB에 동기화되었습니다!\n\n{report_str}"
@@ -670,6 +753,7 @@ def handle_message(event):
                 else:
                     status = room_state.get('status')
                     is_known = room_state.get('is_known', False)
+                    tracked_user_id = room_state.get('user_id')
                     if status == 'joined':
                         if is_known:
                             reply_text = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
@@ -678,6 +762,10 @@ def handle_message(event):
                     elif status == 'form_submitted':
                         alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
                         reply_text = alert_report
+
+                    # ✨ [추가됨] 음성검증까지 확인되었는지 여부 + 확인된 시점이라면 그 확인 내용을 함께 출력
+                    if reply_text and tracked_user_id:
+                        reply_text = f"{reply_text}\n\n{format_voice_check_status(tracked_user_id)}"
             else:
                 reply_text = f"❌ '{room_name_input}' 정보를 DB/방관리 시트에서 찾을 수 없습니다."
 
@@ -1143,6 +1231,94 @@ VOICE_MATCH_ALERT_THRESHOLD = 0.90
 _GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"}
 
 
+def build_voice_check_report_lines(*, claimed_gender, voice_result):
+    """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
+    (운영진방 알림, 'N번방 확인' 저장용 리포트에서 공통으로 사용)
+    특이사항이 없으면 빈 리스트를 반환합니다.
+    """
+    lines = []
+    if not voice_result or voice_result.get("error"):
+        return lines
+
+    est_gender = voice_result.get("estimated_gender")
+    claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
+    gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
+
+    if est_gender:
+        pitch_note = f" (추정 피치 {voice_result.get('pitch_hz')}Hz)" if voice_result.get("pitch_hz") else ""
+        mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
+        lines.append(f"- 음성 기반 추정 성별: {est_gender}{pitch_note}{mismatch_note}")
+
+    matches = voice_result.get("matches") or []
+    strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
+    if strong_matches:
+        lines.append("- ⚠️⚠️ 블랙리스트 음성과 매우 유사 (동일인 의심):")
+        for m in strong_matches:
+            similarity = (m.get("similarity") or 0) * 100
+            nickname = m.get("nickname", "알 수 없음")
+            match_gender = m.get("gender", "알 수 없음")
+            match_status = m.get("status", "상태 없음")
+            lines.append(f"  └ 닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
+
+    return lines
+
+
+def build_voice_check_report_text(*, claimed_gender, voice_result):
+    """'N번방 확인' 명령어 응답 및 DB(voice_check_report) 저장에 쓰는 한 덩어리 요약 텍스트."""
+    if not voice_result or voice_result.get("error"):
+        reason = (voice_result or {}).get("error", "결과 없음")
+        return f"자동분석 실패({reason}) — 운영진이 음성을 직접 듣고 판단해 주세요."
+
+    lines = build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result)
+    if not lines:
+        return "자동분석 결과 특이사항 없음 (블랙리스트 유사 음성 없음 / 신청 성별과 일치)"
+    return "\n".join(lines)
+
+
+def format_voice_check_status(user_id):
+    """'N번방 확인' 명령어에서 특정 유저의 음성검증 진행 상태를 사람이 읽기 좋은 문장으로 만들어 돌려줍니다.
+    - 음성검증까지 확인이 끝났는지 여부
+    - 확인이 된 시점이라면(=음성 파일이 제출된 시점) 그때 저장해 둔 확인 내용(자동분석 요약)
+    항상 문자열을 반환합니다 (조회 실패/정보 없음이어도 안내 문구를 반환).
+    """
+    if not supabase or not user_id:
+        return "🎙️ 음성검증: 조회 불가 (DB 연결 없음)"
+
+    res = supabase_execute(
+        lambda: supabase.table('user_validations')
+            .select('status, voice_checked_at, voice_check_report')
+            .eq('user_id', user_id).execute(),
+        label="음성검증 상태 조회(방확인)"
+    )
+    if not res or not res.data:
+        return "🎙️ 음성검증: 해당 유저의 인증 기록을 찾을 수 없습니다."
+
+    row = res.data[0]
+    status = row.get('status')
+    checked_at = row.get('voice_checked_at')
+    report = row.get('voice_check_report')
+
+    if status in (None, "", "입장대기"):
+        return "🎙️ 음성검증: ❌ 아직 진행 전 (양식 작성 단계)"
+    if status == "음성대기":
+        return "🎙️ 음성검증: ⏳ 안내 멘트는 발송됨, 아직 음성 파일 미제출"
+    if status in ("승인대기", "완료"):
+        if status == "승인대기":
+            header = "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)"
+        else:
+            header = "🎙️ 음성검증: ✅ 음성 파일 제출 + 운영진 최종 승인까지 완료"
+        lines = [header]
+        if checked_at:
+            lines.append(f"- 확인 시점: {checked_at}")
+        if report:
+            lines.append(f"- 확인 내용:\n{report}")
+        else:
+            lines.append("- 확인 내용: (자동분석 기록 없음)")
+        return "\n".join(lines)
+
+    return f"🎙️ 음성검증: 상태 확인 불가 (status={status})"
+
+
 def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, voice_result):
     """음성 자동분석 결과 중 운영진이 참고할 만한 내용이 있을 때만 운영진방에 push한다.
 
@@ -1168,26 +1344,10 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
         return
 
     lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
-
-    if est_gender:
-        pitch_note = f" (추정 피치 {voice_result.get('pitch_hz')}Hz)" if voice_result.get("pitch_hz") else ""
-        mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
-        lines.append(f"- 음성 기반 추정 성별: {est_gender}{pitch_note}{mismatch_note}")
+    lines.extend(build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result))
 
     if strong_matches:
-        lines.append("- ⚠️⚠️ 블랙리스트 음성과 매우 유사 (동일인 의심):")
-        for m in strong_matches:
-            similarity = (m.get("similarity") or 0) * 100
-            nickname = m.get("nickname", "알 수 없음")
-            
-            # 새롭게 반환받은 gender, status 데이터 추출
-            match_gender = m.get("gender", "알 수 없음")
-            match_status = m.get("status", "상태 없음")
-            
-            # 알림 텍스트에 포함
-            lines.append(f"  └ 닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
-        
-        # ▼ for 반복문이 모두 끝난 직후에 경고 문구 추가 (줄바꿈 \n 포함) ▼
+        # ▼ 블랙리스트 유사 매칭이 있을 때만 경고 문구 추가 (줄바꿈 \n 포함) ▼
         lines.append("\n※ 자동 판정이 아니니 반드시 직접 음성 대조 후 최종 판단해 주세요.")
 
     alert_text = "\n".join(lines)
@@ -1251,6 +1411,12 @@ def handle_audio(event):
         # ✨ [추가됨] 음성 자동분석 (성별 추정 + 블랙리스트 화자 유사도 검색)
         # 실패해도 아래 유저 응답/기존 수동 인증 흐름에는 절대 영향을 주지 않는다
         # (분석 실패 시 조용히 로그만 남기고, 사람이 직접 판단하는 기존 흐름 그대로 진행).
+        # ✨ [추가됨] 여기서 만든 '확인 시점 / 확인 내용'은 user_validations에 저장해서
+        # '/O번방 확인' 명령어가 그대로 읽어갈 수 있게 한다.
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        voice_checked_at_str = datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M")
+        voice_check_report_text = "자동분석 시도 실패 — 운영진이 음성을 직접 듣고 판단해 주세요."
+
         if supabase:
             try:
                 voice_result = analyze_new_member_voice(
@@ -1265,8 +1431,20 @@ def handle_audio(event):
                     user_id=user_id,
                     voice_result=voice_result,
                 )
+                voice_check_report_text = build_voice_check_report_text(
+                    claimed_gender=claimed_gender,
+                    voice_result=voice_result,
+                )
             except Exception as e:
                 print(f"⚠️ 음성 자동분석/운영진 알림 실패(수동 인증 흐름에는 영향 없음): {e}")
+
+            supabase_execute(
+                lambda: supabase.table('user_validations').update({
+                    "voice_checked_at": voice_checked_at_str,
+                    "voice_check_report": voice_check_report_text,
+                }).eq('user_id', user_id).execute(),
+                label="음성검증 확인정보 저장"
+            )
 
         reply_text = "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n운영진이 확인 후 최종 승인 처리해 드릴 예정이니 잠시만 기다려 주세요."
         with ApiClient(configuration) as api_client:

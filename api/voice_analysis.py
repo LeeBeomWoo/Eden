@@ -125,52 +125,83 @@ def match_blacklist_voices(supabase, embedding, match_count: int = 5):
         return []
 
 
-def analyze_new_member_voice(supabase, audio_bytes, user_id, nickname):
-    # 1. Cloud Run 서버로 음성 데이터를 보내서 분석 결과(임베딩, 성별 등)를 받아옵니다. (기존 코드 유지)
-    # response = requests.post(...)
-    # embedding = response.get("embedding")
-    # gender = response.get("gender")
+def analyze_new_member_voice(supabase, configuration, *, message_id, user_id, nickname=""):
+    """LINE 오디오 메시지 하나를 받아 (1) LINE에서 원본 다운로드 (2) Cloud Run 분석
+    (3) 블랙리스트 유사도 대조 (4) 중복이 아니면 저장 까지 한 번에 처리합니다.
+
+    실패해도 예외를 던지지 않고 항상 {"error": "..."} 또는 정상 결과 dict를 반환합니다.
+    (index.py의 handle_audio가 이 결과가 비어 있어도 기존 수동 인증 흐름을 그대로
+    진행하도록 설계되어 있으므로, 이 함수는 절대 raise 하지 않습니다.)
+    """
+    if not supabase:
+        return {"error": "Supabase 미설정"}
+
+    # 1. LINE에서 오디오 원본 바이트 다운로드
+    try:
+        audio_bytes = download_line_audio(message_id, configuration)
+    except Exception as e:
+        return {"error": f"LINE 오디오 다운로드 실패: {e}"}
+
+    # 2. Cloud Run에 위임해서 임베딩 / 추정 성별 / 피치 받아오기
+    try:
+        cr_result = analyze_audio_via_cloud_run(audio_bytes)
+    except Exception as e:
+        return {"error": f"Cloud Run 음성분석 실패: {e}"}
+
+    embedding = cr_result.get("embedding")
+    estimated_gender = cr_result.get("estimated_gender")
+    pitch_hz = cr_result.get("pitch_hz")
 
     if not embedding:
-        return {"error": "임베딩 추출 실패"}
+        return {
+            "error": "임베딩 추출 실패",
+            "estimated_gender": estimated_gender,
+            "pitch_hz": pitch_hz,
+        }
 
     # =================================================================
-    # ✨ [추가/변경 위치] 스토리지에 올리기 전에 유사도를 먼저 검사합니다.
+    # ✨ 스토리지에 올리기 전에 블랙리스트 유사도부터 검사합니다.
     # =================================================================
-    # 기존에는 맨 마지막에 하던 대조 작업을 위로 끌어올립니다.
     matches = match_blacklist_voices(supabase, embedding, match_count=5)
-    
+
     # 중복(유사도 98% 이상) 여부 판별
     is_duplicate = False
     if matches:
-        highest_similarity = matches[0].get("similarity", 0)
-        if highest_similarity >= 0.98: # 98% 이상 일치하면 동일/중복 음성으로 간주
+        highest_similarity = matches[0].get("similarity", 0) or 0
+        if highest_similarity >= 0.98:  # 98% 이상 일치하면 동일/중복 음성으로 간주
             is_duplicate = True
             print(f"⚠️ 중복 음성 감지 (일치율: {highest_similarity*100:.1f}%). 스토리지 저장을 생략합니다.")
 
     # =================================================================
     # ✨ 중복이 아닐 때만(is_duplicate == False) 스토리지 업로드와 DB 인서트를 진행합니다.
     # =================================================================
-    storage_path = None
+    storage_path = "duplicate_skipped"
     if not is_duplicate:
         try:
-            # 2. Supabase Storage에 음성 파일 업로드 (기존 업로드 코드)
-            # storage_path = upload_to_storage(supabase, audio_bytes, ...)
-            
-            # 3. voice_profiles 테이블에 데이터 인서트 (기존 DB 저장 코드)
-            # insert_voice_profile(supabase, user_id, nickname, storage_path, embedding, gender)
-            pass
+            storage_path = upload_voice_sample(
+                supabase,
+                audio_bytes,
+                storage_path=f"new_members/{user_id}_{int(time.time())}.m4a",
+            )
+            insert_voice_profile(
+                supabase,
+                embedding=embedding,
+                storage_path=storage_path,
+                nickname=nickname,
+                user_id=user_id,
+                estimated_gender=estimated_gender,
+                pitch_hz=pitch_hz,
+                source="new_member",
+            )
         except Exception as e:
-            print(f"저장 중 오류: {e}")
-    else:
-        # 중복일 경우, DB에 저장하지 않았음을 알기 위해 더미 경로나 안내 문구를 넣을 수 있습니다.
-        storage_path = "duplicate_skipped"
+            print(f"음성 프로필 저장 중 오류: {e}")
 
-    # 4. 최종 결과 반환 (기존 코드 유지)
-    # 반환할 때 스토리지 경로나 매칭 결과를 함께 돌려줍니다.
+    # 4. 최종 결과 반환 (index.py에서 관리자 알림 + 'N번방 확인' 리포트 저장에 사용)
     return {
         "status": "success",
-        "matches": matches,         # index.py로 넘어가서 관리자 알림에 쓰일 데이터
+        "estimated_gender": estimated_gender,
+        "pitch_hz": pitch_hz,
+        "matches": matches,          # index.py로 넘어가서 관리자 알림/방확인 리포트에 쓰일 데이터
         "is_duplicate": is_duplicate,
-        "gender_estimated": gender
-    }result
+        "storage_path": storage_path,
+    }
