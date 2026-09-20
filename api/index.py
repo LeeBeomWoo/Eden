@@ -25,7 +25,7 @@ from linebot.v3.webhooks import (
 )
 
 # ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
-from voice_analysis import .analyze_new_member_voice
+from voice_analysis import analyze_new_member_voice
 
 app = Flask(__name__)
 
