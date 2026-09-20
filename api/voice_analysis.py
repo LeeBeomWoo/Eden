@@ -33,6 +33,7 @@ analyze_new_member_voice()는 내부에서 발생하는 모든 예외(Cloud Run 
 
 import os
 import time
+import json  # <--- 이 줄을 추가해 주세요.
 import google.auth.transport.requests
 import google.oauth2.id_token
 import requests
