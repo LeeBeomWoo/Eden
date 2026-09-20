@@ -1,10 +1,12 @@
-import os
+import sys,os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import time
 import random
 import json
 import gspread
 import datetime
 import threading
+
 from contextlib import contextmanager
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, request, abort
