@@ -1176,10 +1176,19 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
 
     if strong_matches:
         lines.append("- ⚠️⚠️ 블랙리스트 음성과 매우 유사 (동일인 의심):")
-        for m in strong_matches[:3]:
-            pct = round((m.get("similarity") or 0) * 100, 1)
-            lines.append(f"    • '{m.get('nickname') or '(닉네임 미상)'}' — 유사도 {pct}%")
-        lines.append("  ※ 자동 판정이 아니니 반드시 직접 음성 대조 후 최종 판단해 주세요.")
+        for m in strong_matches:
+            similarity = (m.get("similarity") or 0) * 100
+            nickname = m.get("nickname", "알 수 없음")
+            
+            # 새롭게 반환받은 gender, status 데이터 추출
+            match_gender = m.get("gender", "알 수 없음")
+            match_status = m.get("status", "상태 없음")
+            
+            # 알림 텍스트에 포함
+            lines.append(f"  └ 닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
+        
+        # ▼ for 반복문이 모두 끝난 직후에 경고 문구 추가 (줄바꿈 \n 포함) ▼
+        lines.append("\n※ 자동 판정이 아니니 반드시 직접 음성 대조 후 최종 판단해 주세요.")
 
     alert_text = "\n".join(lines)
 
