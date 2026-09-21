@@ -154,6 +154,53 @@ def supabase_execute(query_fn, retries=2, delay=0.4, default=None, label=""):
     return default
 
 
+def cas_update_status(user_id, from_status, to_status, label=""):
+    """user_validations.status를 from_status일 때만 to_status로 '원자적으로' 전환합니다.
+
+    ✨ [추가됨] 음성 자동분석과 신입의 '문제없음' 답장은 서로 다른 요청(타이밍)으로 들어오고
+    어느 쪽이 먼저 끝날지 알 수 없습니다. update(...).eq('status', from_status)로 조건부 업데이트를
+    걸면, 두 요청이 동시에 들어와도 실제로 status가 from_status였던 '딱 한쪽'만 성공하는 간단한
+    CAS(compare-and-swap) 락 역할을 합니다.
+
+    반환값: 성공(=이 요청이 전환을 해낸 쪽)이면 True, 이미 다른 상태로 바뀌어 있어(=다른 요청이
+    먼저 처리함) 조건이 맞지 않으면 False.
+    """
+    if not supabase or not user_id:
+        return False
+    res = supabase_execute(
+        lambda: supabase.table('user_validations')
+            .update({"status": to_status})
+            .eq('user_id', user_id)
+            .eq('status', from_status)
+            .execute(),
+        label=label or f"상태 전환 CAS({from_status}->{to_status})"
+    )
+    return bool(res and res.data)
+
+
+def sync_status_to_sheet(user_id, status_text):
+    """구글 시트(검증 탭) L열의 상태값만 별도로 동기화합니다. 실패해도 무시합니다."""
+    try:
+        with sheet_sync_lock():
+            if validation_sheet:
+                raw_user_ids = validation_sheet.col_values(5)
+                clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
+                if user_id in clean_user_ids:
+                    row_index = clean_user_ids.index(user_id) + 1
+                    validation_sheet.update(range_name=f'L{row_index}', values=[[status_text]])
+    except Exception as e:
+        print(f"상태 시트 동기화 에러({status_text}): {e}")
+
+
+# 음성 확인이 모두 끝났을 때(자동분석 완료 + 신입의 '문제없음' 확인) 보내는 최종 안내 문구.
+# analyze_new_member_voice가 끝난 시점과 신입이 '문제없음'이라고 답장한 시점 중
+# '나중에' 완료되는 쪽에서 이 문구를 전송합니다.
+FINAL_APPROVAL_WAIT_TEXT = (
+    "✅ 음성 확인까지 모두 완료되었습니다!\n\n"
+    "기본 인증과 음성인증 결과를 운영진이 확인 후 안내해 드릴 예정이니 잠시만 기다려 주세요."
+)
+
+
 # ==========================================
 # [동시성 제어 - Supabase 분산 락]
 # ==========================================
@@ -439,6 +486,11 @@ def start_voice_auth(user_id, require_status='입장대기'):
     u_data = u_res.data[0]
     if require_status is not None and u_data.get('status') != require_status:
         return False, None
+
+    # ✨ [추가됨] 콜드스타트 완화용 웜업 호출 시점을 "입장" 시점에서 "음성인증 시작(확인 답장)"
+    # 시점으로 옮김 — 신입이 실제로 녹음해서 보내기까지 걸리는 시간이 자연스러운 버퍼가 되어,
+    # '문제없음' 답장 때 크라우드런을 호출할 즈음엔 이미 웜업이 끝나 있을 확률이 높다.
+    threading.Thread(target=warmup_voice_service, daemon=True).start()
 
     user_nickname = u_data.get('nickname', '신입')
     user_gender = u_data.get('gender', '')
@@ -1067,6 +1119,62 @@ def handle_message(event):
         except Exception as e:
             print(f"확인 답변 처리 에러: {e}")
 
+    # 📌 [핵심 검증 2-1] 신입이 "문제없음" 답장 입력 시 (음성 파일 제출 후, 마지막 입장 유저만 작동)
+    # ✨ [변경됨] push 없이 이 요청의 reply_token만으로 끝까지 처리한다.
+    # 무거운 자동분석을 여기서 동기 실행 → 끝나면 바로 최종 안내까지 회신.
+    # (만약 이 요청이 타임아웃/에러로 죽으면 상태를 "음성확인중"으로 되돌려 두므로,
+    #  신입이 "문제없음"을 다시 보내면 그대로 재시도된다 — 영구히 붕 뜨는 상태가 없음)
+    if not is_admin_room and not user_message.startswith("/") and any(
+        word in user_message for word in ["문제없음", "문제 없음", "문제없어요", "문제 없어요"]
+    ):
+        if not is_last_joined_user(source_id, user_id):
+            return
+
+        # 동시에 두 번 들어와도(예: LINE 웹훅 재시도) 분석이 중복 실행되지 않도록
+        # "음성확인중" -> "분석중"으로 CAS 선점. 실패하면 이미 처리 중이거나 이미 끝난 것.
+        if not cas_update_status(user_id, "음성확인중", "분석중", label="문제없음 확인(분석 시작)"):
+            return
+
+        claimed_nickname, claimed_gender = "", ""
+        if supabase:
+            res = supabase_execute(
+                lambda: supabase.table('user_validations').select('nickname, gender').eq('user_id', user_id).execute(),
+                label="문제없음 처리용 닉네임/성별 조회"
+            )
+            if res and res.data:
+                claimed_nickname = res.data[0].get('nickname') or ""
+                claimed_gender = res.data[0].get('gender') or ""
+
+        try:
+            final_text = run_voice_analysis_and_get_final_text(
+                user_id=user_id, source_id=source_id,
+                claimed_nickname=claimed_nickname, claimed_gender=claimed_gender,
+            )
+            cas_update_status(user_id, "분석중", "승인대기", label="문제없음 확인(분석 완료)")
+            sync_status_to_sheet(user_id, "승인대기")
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=final_text)])
+                )
+        except Exception as e:
+            print(f"⚠️ 문제없음 처리(자동분석 포함) 중 예외 — 재시도 가능하도록 상태 되돌림: {e}")
+            # 재시도 가능하도록 상태를 원복. 분석 자체는 이미 끝났을 수도 있으니 DB는 그대로 두고 상태만 되돌린다.
+            cas_update_status(user_id, "분석중", "음성확인중", label="문제없음 처리 실패 롤백")
+            sync_status_to_sheet(user_id, "음성확인중")
+            try:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="⚠️ 확인 중 일시적인 오류가 발생했습니다. '문제없음'이라고 다시 한번 답장해 주세요.")]
+                        )
+                    )
+            except Exception:
+                pass
+        return
+
     # 3. 일반 DB 키워드 검색
     matched_reply = search_keyword(user_message)
     if matched_reply:
@@ -1113,6 +1221,11 @@ def send_join_welcome(source_id, user_id, reply_token):
         v_success, v_reply_text = start_voice_auth(user_id, require_status=None)
         if v_success:
             welcome_message = f"🔄 {name_prefix}이전 대화가 [음성인증] 단계에서 끊겼어요. 이어서 진행할게요.\n\n{v_reply_text}"
+    elif last_status in ("음성확인중", "분석중"):
+        # ✨ [추가됨] 음성 파일은 받았지만 아직 '문제없음' 확인이 안 끝난 중간 단계
+        three_text = search_keyword("3") or search_keyword("3번")
+        resume_text = three_text or "음성 파일이 정상적으로 접수되었는지 확인 중입니다.\n문제가 없다면 '문제없음'이라고 답장해 주세요."
+        welcome_message = f"🔄 {name_prefix}이전 대화가 [음성 확인] 단계에서 끊겼어요.\n\n{resume_text}"
     elif last_status == "승인대기":
         welcome_message = f"🔄 {name_prefix}이전 대화가 [운영진 승인 대기] 단계에서 끊겼어요.\n운영진 확인 후 승인될 예정이니 잠시만 기다려 주세요."
     elif last_status == "입장대기" and nickname:
@@ -1163,8 +1276,9 @@ def handle_member_joined(event):
     if source_id == ADMIN_GROUP_CHAT_ID:
         return
 
-    # ✨ [추가됨] 신입 입장 즉시 Cloud Run 음성서비스 웜업 (백그라운드, 응답 안 기다림)
-    threading.Thread(target=warmup_voice_service, daemon=True).start()
+    # ✨ [변경됨] Cloud Run 웜업은 더 이상 입장 시점이 아니라 start_voice_auth()(=신입이
+    # "확인"이라고 답장해서 음성인증이 실제로 시작되는 시점)에서 호출한다. 입장~확인 사이에는
+    # 시간차가 커서 웜업이 식어버릴 수 있어, 실제 녹음 직전에 깨우는 게 더 효과적이다.
 
     joined_members = event.joined.members
     for member in joined_members:
@@ -1321,6 +1435,11 @@ def format_voice_check_status(user_id):
         return "🎙️ 음성검증: ❌ 아직 진행 전 (양식 작성 단계)"
     if status == "음성대기":
         return "🎙️ 음성검증: ⏳ 안내 멘트는 발송됨, 아직 음성 파일 미제출"
+    if status in ("음성확인중", "분석중"):
+        # ✨ [추가됨] 음성 파일은 받았지만 아직 '문제없음' 확인 전(=분석도 아직 실행 전) 중간 단계.
+        # 분석은 '문제없음' 답장 시점에 실행되므로, 이 상태에서는 아직 자동분석 결과가 없는 게 정상.
+        note = "자동분석 진행 중" if status == "분석중" else "'문제없음' 답장 대기 중"
+        return f"🎙️ 음성검증: ⏳ 음성 파일 제출 완료, {note}"
     if status in ("승인대기", "완료"):
         if status == "승인대기":
             header = "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)"
@@ -1408,67 +1527,91 @@ def handle_audio(event):
             claimed_gender = res.data[0].get('gender') or ""
 
     if is_audio_waiting:
+        # ✨ [변경됨/단순화] push 메시지를 전혀 쓰지 않고 "응답(reply) 메시지"만으로 처리하도록 재설계.
+        # - 음성 파일 수신 시점엔 무거운 분석을 절대 실행하지 않는다 (Vercel 함수가 오래 붙잡혀 있다가
+        #   죽거나 타임아웃 나는 걸 방지) → 3번 멘트만 즉시 reply하고 끝낸다.
+        # - 실제 무거운 자동분석(Cloud Run 호출)은 신입이 "문제없음"이라고 답장하는 그 요청 안에서
+        #   동기적으로 실행하고, 그 답장의 reply_token으로 최종 안내까지 그대로 회신한다.
+        #   → push가 필요 없고, 만약 그 요청이 죽거나 타임아웃 나도 신입이 "문제없음"을 다시 보내면
+        #     그대로 재시도되는 구조라 상태가 영구히 붕 뜨지 않는다.
         if supabase:
             update_res = supabase_execute(
-                lambda: supabase.table('user_validations').update({"status": "승인대기"}).eq('user_id', user_id).execute(),
-                label="음성인증 승인대기 업데이트"
+                lambda: supabase.table('user_validations').update({"status": "음성확인중"}).eq('user_id', user_id).execute(),
+                label="음성인증 음성확인중 업데이트"
             )
             if update_res is None:
-                print(f"⚠️ user_id={user_id} 승인대기 상태 업데이트 실패 — 재시도에도 실패, 시트/알림은 계속 진행")
+                print(f"⚠️ user_id={user_id} 음성확인중 상태 업데이트 실패 — 재시도에도 실패, 시트/알림은 계속 진행")
 
-        with sheet_sync_lock():
-            try:
-                if validation_sheet:
-                    raw_user_ids = validation_sheet.col_values(5)
-                    clean_user_ids = [str(uid).strip() for uid in raw_user_ids]
-                    if user_id in clean_user_ids:
-                        row_index = clean_user_ids.index(user_id) + 1
-                        validation_sheet.update(range_name=f'L{row_index}', values=[["승인대기"]])
-            except Exception as e:
-                print(f"음성 제출 시트 업데이트 에러: {e}")
+        sync_status_to_sheet(user_id, "음성확인중")
 
-        # ✨ [추가됨] 음성 자동분석 (성별 추정 + 블랙리스트 화자 유사도 검색)
-        # 실패해도 아래 유저 응답/기존 수동 인증 흐름에는 절대 영향을 주지 않는다
-        # (분석 실패 시 조용히 로그만 남기고, 사람이 직접 판단하는 기존 흐름 그대로 진행).
-        # ✨ [추가됨] 여기서 만든 '확인 시점 / 확인 내용'은 user_validations에 저장해서
-        # '/O번방 확인' 명령어가 그대로 읽어갈 수 있게 한다.
-        kst = datetime.timezone(datetime.timedelta(hours=9))
-        voice_checked_at_str = datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M")
-        voice_check_report_text = "자동분석 시도 실패 — 운영진이 음성을 직접 듣고 판단해 주세요."
+        # ✨ [추가됨] 나중에 "문제없음" 답장 시점에 이 오디오를 다시 찾아 분석할 수 있도록
+        # LINE 메시지 ID를 user_session에 저장해 둔다 (nickname/gender는 그대로 유지하며 병합).
+        session_data = get_user_session(user_id) or {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+        session_data["pending_voice_message_id"] = event.message.id
+        session_data.setdefault("nickname", claimed_nickname)
+        session_data.setdefault("gender", claimed_gender)
+        set_user_session(user_id, session_data)
 
-        if supabase:
-            try:
-                voice_result = analyze_new_member_voice(
-                    supabase, configuration,
-                    message_id=event.message.id,
-                    user_id=user_id,
-                    nickname=claimed_nickname,
-                )
-                notify_admin_voice_analysis(
-                    claimed_nickname=claimed_nickname,
-                    claimed_gender=claimed_gender,
-                    user_id=user_id,
-                    voice_result=voice_result,
-                )
-                voice_check_report_text = build_voice_check_report_text(
-                    claimed_gender=claimed_gender,
-                    voice_result=voice_result,
-                )
-            except Exception as e:
-                print(f"⚠️ 음성 자동분석/운영진 알림 실패(수동 인증 흐름에는 영향 없음): {e}")
-
-            supabase_execute(
-                lambda: supabase.table('user_validations').update({
-                    "voice_checked_at": voice_checked_at_str,
-                    "voice_check_report": voice_check_report_text,
-                }).eq('user_id', user_id).execute(),
-                label="음성검증 확인정보 저장"
-            )
-
-        reply_text = "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n운영진이 확인 후 최종 승인 처리해 드릴 예정이니 잠시만 기다려 주세요."
+        # 무거운 분석 없이, 접수 확인 겸 '/ㅇㅈ 3' 멘트만 즉시 회신한다.
+        three_text = search_keyword("3") or search_keyword("3번")
+        immediate_reply_text = three_text or (
+            "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n"
+            "내용 확인 후 문제가 없다면 '문제없음'이라고 답장해 주세요."
+        )
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=immediate_reply_text)])
+            )
+
+
+def run_voice_analysis_and_get_final_text(*, user_id, source_id, claimed_nickname, claimed_gender):
+    """'문제없음' 답장을 받았을 때, 그 요청 안에서 동기적으로 자동분석을 실행하고
+    유저에게 회신할 최종 안내 문구를 만들어 돌려준다 (push 없이 이 요청의 reply_token으로 바로 회신하기 위함).
+    분석 자체가 실패해도(analyze_new_member_voice는 예외를 던지지 않음) 항상 최종 안내 문구를 반환한다.
+    """
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    voice_checked_at_str = datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M")
+    voice_check_report_text = "자동분석 시도 실패 — 운영진이 음성을 직접 듣고 판단해 주세요."
+
+    session_data = get_user_session(user_id) or {}
+    message_id = session_data.get("pending_voice_message_id") if isinstance(session_data, dict) else None
+
+    if supabase and message_id:
+        try:
+            voice_result = analyze_new_member_voice(
+                supabase, configuration,
+                message_id=message_id,
+                user_id=user_id,
+                nickname=claimed_nickname,
+            )
+            notify_admin_voice_analysis(
+                claimed_nickname=claimed_nickname,
+                claimed_gender=claimed_gender,
+                user_id=user_id,
+                voice_result=voice_result,
+            )
+            voice_check_report_text = build_voice_check_report_text(
+                claimed_gender=claimed_gender,
+                voice_result=voice_result,
+            )
+        except Exception as e:
+            print(f"⚠️ 음성 자동분석/운영진 알림 실패(수동 인증 흐름에는 영향 없음): {e}")
+    elif not message_id:
+        voice_check_report_text = "자동분석 실패(원본 음성 메시지 정보 없음) — 운영진이 음성을 직접 듣고 판단해 주세요."
+
+    if supabase:
+        supabase_execute(
+            lambda: supabase.table('user_validations').update({
+                "voice_checked_at": voice_checked_at_str,
+                "voice_check_report": voice_check_report_text,
+            }).eq('user_id', user_id).execute(),
+            label="음성검증 확인정보 저장"
+        )
+
+    return FINAL_APPROVAL_WAIT_TEXT
 
 
 if __name__ == "__main__":
