@@ -1406,7 +1406,7 @@ def format_voice_check_status(user_id):
 
     res = supabase_execute(
         lambda: supabase.table('user_validations')
-            .select('status, voice_checked_at, voice_check_report')
+            .select('status, voice_checked_at, voice_check_report, voice_analysis_state, voice_analysis_error')
             .eq('user_id', user_id).execute(),
         label="음성검증 상태 조회(방확인)"
     )
@@ -1418,6 +1418,13 @@ def format_voice_check_status(user_id):
     checked_at = row.get('voice_checked_at')
     report = row.get('voice_check_report')
 
+    # ✨ [추가됨] 자동분석 에러는 신입에게는 절대 보여주지 않고, 운영진이 'N번방 확인'을 했을 때만
+    # 노출한다. voice_analysis_state는 '문제없음' 답장 여부(status)와 무관하게 오디오 도착 시점부터
+    # 백그라운드로 갱신되므로, 아래에서 status 분기와 별개로 항상 먼저 체크한다.
+    analysis_error_note = ""
+    if row.get('voice_analysis_state') == "에러":
+        analysis_error_note = f"\n🔴 자동분석 오류: {row.get('voice_analysis_error') or '(사유 미상)'}"
+
     if status in (None, "", "입장대기"):
         return "🎙️ 음성검증: ❌ 아직 진행 전 (양식 작성 단계)"
     if status == "음성대기":
@@ -1426,7 +1433,7 @@ def format_voice_check_status(user_id):
         # ✨ [추가됨] 음성 파일은 받았지만 아직 '문제없음' 확인 전(=분석도 아직 실행 전) 중간 단계.
         # 분석은 '문제없음' 답장 시점에 실행되므로, 이 상태에서는 아직 자동분석 결과가 없는 게 정상.
         note = "자동분석 진행 중" if status == "분석중" else "'문제없음' 답장 대기 중"
-        return f"🎙️ 음성검증: ⏳ 음성 파일 제출 완료, {note}"
+        return f"🎙️ 음성검증: ⏳ 음성 파일 제출 완료, {note}{analysis_error_note}"
     if status in ("승인대기", "완료"):
         if status == "승인대기":
             header = "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)"
@@ -1439,9 +1446,9 @@ def format_voice_check_status(user_id):
             lines.append(f"- 확인 내용:\n{report}")
         else:
             lines.append("- 확인 내용: (자동분석 기록 없음)")
-        return "\n".join(lines)
+        return "\n".join(lines) + analysis_error_note
 
-    return f"🎙️ 음성검증: 상태 확인 불가 (status={status})"
+    return f"🎙️ 음성검증: 상태 확인 불가 (status={status}){analysis_error_note}"
 
 
 def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, voice_result):
@@ -1572,12 +1579,22 @@ def format_voice_analysis_reply_text(user_id):
 
     🔵 = 분석 완료, 결과 조회 가능
     🟡 = 아직 분석 진행 중 (또는 접수 기록조차 아직 없는 경우 — 오디오 도착 처리와의 경합)
-    🔴 = 분석 중 에러 발생
+
+    ✨ [변경됨] 자동분석 에러(🔴)는 신입이 있는 방에는 절대 노출하지 않는다 — 시스템 내부 사정을
+    신입에게 드러낼 이유가 없고, 괜히 불안하게 만들 수 있다. 에러 상세는 운영진이 'N번방 확인'
+    명령어(format_voice_check_status)를 실행했을 때만 보여준다. 신입에게는 정상 진행 중(🟡)과
+    똑같은 문구로 안내한다.
 
     상태와 무관하게 항상 문자열을 반환하고, 예외를 던지지 않는다 — 수동 인증 흐름을 막지 않기 위함.
     """
+    PENDING_TEXT_FOR_MEMBER = (
+        "🟡 자동분석이 아직 진행 중입니다. 완료되는 대로 운영진 확인 시 함께 반영됩니다.\n\n"
+        f"{FINAL_APPROVAL_WAIT_TEXT}"
+    )
+
     if not supabase or not user_id:
-        return f"🔴 결과를 조회할 수 없습니다 (DB 연결 없음)\n\n{FINAL_APPROVAL_WAIT_TEXT}"
+        # DB 연결 실패 같은 내부 사정도 신입에게는 노출하지 않는다.
+        return PENDING_TEXT_FOR_MEMBER
 
     res = supabase_execute(
         lambda: supabase.table('user_validations')
@@ -1590,7 +1607,6 @@ def format_voice_analysis_reply_text(user_id):
     claimed_gender = row.get('gender') or ""
     state = row.get('voice_analysis_state')
     result = row.get('voice_analysis_result') or {}
-    error = row.get('voice_analysis_error')
 
     if state == "완료":
         # voice_analysis_result는 analyze_new_member_voice()가 반환하던 것과 같은 모양(estimated_gender/
@@ -1612,17 +1628,9 @@ def format_voice_analysis_reply_text(user_id):
         )
         return f"🔵 자동분석 결과를 조회했습니다.\n{report_text}\n\n{FINAL_APPROVAL_WAIT_TEXT}"
 
-    if state == "에러":
-        return (
-            f"🔴 자동분석 중 오류가 발생했습니다{f' ({error})' if error else ''}. "
-            f"운영진이 음성을 직접 듣고 판단합니다.\n\n{FINAL_APPROVAL_WAIT_TEXT}"
-        )
-
-    # state가 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두 진행 중으로 안내.
-    return (
-        "🟡 자동분석이 아직 진행 중입니다. 완료되는 대로 운영진 확인 시 함께 반영됩니다.\n\n"
-        f"{FINAL_APPROVAL_WAIT_TEXT}"
-    )
+    # state가 "에러"이거나 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두
+    # 신입에게는 똑같이 '진행 중'으로만 안내한다. 에러 상세는 운영진이 N번방 확인 시에만 본다.
+    return PENDING_TEXT_FOR_MEMBER
 
 
 if __name__ == "__main__":
