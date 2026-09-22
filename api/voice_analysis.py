@@ -98,8 +98,10 @@ def mark_voice_analysis_state(supabase, user_id, state, *, result=None, error=No
 
 def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname=""):
     """오디오 도착 시점(index.py의 handle_audio)에 호출됩니다. Cloud Run의 /analyze-async에
-    '접수'만 시키고 결과는 기다리지 않습니다 — 실제 분석/저장/최종 상태 기록은 Cloud Run(app.py)이
-    백그라운드로 전부 끝낸 뒤 Supabase에 직접 씁니다.
+    오디오를 전달하되, 그 응답(분석 완료까지)은 기다리지 않고 짧은 타임아웃으로 넘어갑니다.
+    실제 분석/저장/최종 상태 기록은 Cloud Run(app.py)이 같은 요청 안에서 끝까지 처리한 뒤
+    Supabase에 직접 씁니다 — 이쪽(Vercel)이 응답을 기다리지 않아도 Cloud Run 쪽 처리는
+    계속 진행됩니다.
 
     이 함수는 예외를 던지지 않습니다(호출부의 즉시 응답 흐름을 막지 않기 위함). 접수 자체가
     실패하면(다운로드 실패, URL 미설정, 네트워크 에러 등) 상태를 바로 '에러'로 남겨서
@@ -124,10 +126,21 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
             files={"audio": ("audio", audio_bytes)},
             data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
             headers=headers,
-            timeout=20,  # 접수(202) 확인용 — 분석 완료까지 기다리는 게 아님
+            # (연결 10초, 응답대기 20초) — 오디오 업로드가 다소 크거나 네트워크가 느려도
+            # 여유있게 끝날 수 있도록 넉넉히 잡는다. 그 이후 Cloud Run이 분석을 계속 진행 중이어도
+            # 여기서는 응답을 기다리지 않고 넘어간다.
+            # ✨ [변경됨] Cloud Run이 더는 202를 즉시 반환하지 않고 분석을 끝낸 뒤에야 응답하므로,
+            # 이 요청은 거의 항상 ReadTimeout으로 끝나는 게 정상이다(아래에서 별도 처리).
+            timeout=(10, 20),
         )
         resp.raise_for_status()
+    except requests.exceptions.ReadTimeout:
+        # 오디오 전송(요청 자체)은 성공적으로 끝났고, Cloud Run이 이어서 분석 중인 상태다.
+        # 접수 실패가 아니므로 에러로 남기지 않는다 — 상태는 그대로 '처리중'으로 두고,
+        # 최종 '완료'/'에러'는 Cloud Run이 분석을 마친 뒤 Supabase에 직접 기록한다.
+        pass
     except Exception as e:
+        # 연결 자체가 안 됐거나(URL 오류, 네트워크 문제 등) 4xx/5xx 응답을 받은 경우 — 진짜 접수 실패.
         mark_voice_analysis_state(supabase, user_id, "에러", error=f"클라우드런 접수 실패: {e}")
         return
     # 접수 성공 시엔 상태를 그대로 '처리중'으로 둔다. 최종 '완료'/'에러'는

@@ -1380,6 +1380,17 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
             match_status = m.get("status", "상태 없음")
             lines.append(f"  └ 닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
 
+    # ✨ [추가됨] Cloud Run(app.py)이 80% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
+    # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
+    if voice_result.get("is_strong_match"):
+        lines.append("- ℹ️ 블랙리스트 일치율 80% 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
+
+    # ✨ [추가됨] 분석 자체는 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우.
+    # 신입에게는 노출되지 않고(🔵 완료로만 보임) 운영진만 이 리포트로 확인할 수 있다.
+    save_error = voice_result.get("save_error")
+    if save_error:
+        lines.append(f"- ⚠️ 음성 원본/프로필 저장 실패: {save_error} (voice_profiles 미등록 — 재확인 필요)")
+
     return lines
 
 
@@ -1456,8 +1467,10 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
 
     알림 조건:
     - 블랙리스트 유사도가 VOICE_MATCH_ALERT_THRESHOLD(기본 90%) 이상인 경우
-    - 또는 신청서에 적은 성별과 음성 기반 추정 성별이 다른 경우
-    둘 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
+    - 신청서에 적은 성별과 음성 기반 추정 성별이 다른 경우
+    - ✨ [추가됨] 음성 원본/프로필 저장 자체가 실패한 경우 (분석은 성공했지만 DB에는 안 남음 — 방치하면
+      나중에 'N번방 확인'을 할 때까지 아무도 모를 수 있으므로 발생 즉시 알린다)
+    셋 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
 
     ⚠️ 어디까지나 참고 정보다. 자동 판정/자동 승인·차단이 아니며,
     최종 판단은 반드시 운영진이 음성을 직접 듣고 내려야 한다.
@@ -1472,7 +1485,9 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
     claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
     gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
 
-    if not strong_matches and not gender_mismatch:
+    save_error = voice_result.get("save_error")
+
+    if not strong_matches and not gender_mismatch and not save_error:
         return
 
     lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
