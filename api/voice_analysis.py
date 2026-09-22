@@ -30,8 +30,11 @@ analyze_new_member_voice()는 내부에서 발생하는 모든 예외(Cloud Run 
 수 있습니다. 보관 기간, 삭제 요청 처리 방법을 함께 마련해 두는 것을
 권장합니다.
 """
+
 import os
 import time
+import datetime
+
 import requests
 
 VOICE_SERVICE_URL = os.environ.get("VOICE_SERVICE_URL", "")
@@ -42,24 +45,23 @@ VOICE_SERVICE_TIMEOUT = 90
 
 
 def analyze_audio_via_cloud_run(raw_audio_bytes: bytes) -> dict:
+    """Cloud Run의 /analyze 엔드포인트에 원본 오디오를 보내고 결과를 받아옵니다.
+
+    반환: {"embedding": [...], "estimated_gender": "남"|"여"|None, "pitch_hz": float|None}
+    실패 시 예외를 던집니다 (호출부 analyze_new_member_voice가 잡아서 처리).
+    """
     if not VOICE_SERVICE_URL:
         raise RuntimeError("VOICE_SERVICE_URL 환경변수가 설정되지 않았습니다.")
-    
-    target_audience = VOICE_SERVICE_URL.rstrip('/')
-
-    # API Key만 헤더에 담아서 간편하게 요청
-    headers = {}
-    if VOICE_SERVICE_API_KEY:
-        headers["X-API-Key"] = VOICE_SERVICE_API_KEY
 
     resp = requests.post(
-        f"{target_audience}/analyze",
+        f"{VOICE_SERVICE_URL.rstrip('/')}/analyze",
         files={"audio": ("audio", raw_audio_bytes)},
-        headers=headers,
+        headers={"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {},
         timeout=VOICE_SERVICE_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()
+
 
 def download_line_audio(message_id: str, configuration) -> bytes:
     """LINE 메시징 API로 오디오 원본 바이트를 다운로드합니다."""
@@ -68,6 +70,68 @@ def download_line_audio(message_id: str, configuration) -> bytes:
     with ApiClient(configuration) as api_client:
         blob_api = MessagingApiBlob(api_client)
         return blob_api.get_message_content(message_id)
+
+
+def mark_voice_analysis_state(supabase, user_id, state, *, result=None, error=None):
+    """user_validations.voice_analysis_state(및 관련 컬럼)를 갱신합니다.
+    Cloud Run(app.py)의 _write_analysis_state()와 반드시 같은 컬럼 계약을 써야 합니다:
+      voice_analysis_state       ('처리중' | '완료' | '에러')
+      voice_analysis_result      jsonb
+      voice_analysis_error       text
+      voice_analysis_synced_at   timestamptz
+    """
+    if not supabase or not user_id:
+        return
+    payload = {
+        "voice_analysis_state": state,
+        "voice_analysis_synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if result is not None:
+        payload["voice_analysis_result"] = result
+    if error is not None:
+        payload["voice_analysis_error"] = error
+    try:
+        supabase.table('user_validations').update(payload).eq('user_id', user_id).execute()
+    except Exception as e:
+        print(f"⚠️ voice_analysis_state 업데이트 실패: {e}")
+
+
+def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname=""):
+    """오디오 도착 시점(index.py의 handle_audio)에 호출됩니다. Cloud Run의 /analyze-async에
+    '접수'만 시키고 결과는 기다리지 않습니다 — 실제 분석/저장/최종 상태 기록은 Cloud Run(app.py)이
+    백그라운드로 전부 끝낸 뒤 Supabase에 직접 씁니다.
+
+    이 함수는 예외를 던지지 않습니다(호출부의 즉시 응답 흐름을 막지 않기 위함). 접수 자체가
+    실패하면(다운로드 실패, URL 미설정, 네트워크 에러 등) 상태를 바로 '에러'로 남겨서
+    '문제없음' 답장 시 즉시 🔴로 안내되고 운영진 수동 확인으로 넘어가게 합니다.
+    """
+    mark_voice_analysis_state(supabase, user_id, "처리중")
+
+    try:
+        audio_bytes = download_line_audio(message_id, configuration)
+    except Exception as e:
+        mark_voice_analysis_state(supabase, user_id, "에러", error=f"LINE 오디오 다운로드 실패: {e}")
+        return
+
+    if not VOICE_SERVICE_URL:
+        mark_voice_analysis_state(supabase, user_id, "에러", error="VOICE_SERVICE_URL 미설정")
+        return
+
+    headers = {"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {}
+    try:
+        resp = requests.post(
+            f"{VOICE_SERVICE_URL.rstrip('/')}/analyze-async",
+            files={"audio": ("audio", audio_bytes)},
+            data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
+            headers=headers,
+            timeout=20,  # 접수(202) 확인용 — 분석 완료까지 기다리는 게 아님
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        mark_voice_analysis_state(supabase, user_id, "에러", error=f"클라우드런 접수 실패: {e}")
+        return
+    # 접수 성공 시엔 상태를 그대로 '처리중'으로 둔다. 최종 '완료'/'에러'는
+    # Cloud Run(app.py)이 백그라운드 분석을 마친 뒤 Supabase에 직접 쓴다.
 
 
 def upload_voice_sample(supabase, file_bytes: bytes, storage_path: str, bucket: str = "voice-samples") -> str:
@@ -111,7 +175,8 @@ def insert_voice_profile(
 def match_blacklist_voices(supabase, embedding, match_count: int = 5):
     """블랙리스트(members)로 등록된 음성들 중 이 임베딩과 가장 유사한 것들을 찾습니다.
     Postgres 쪽 match_voice_profiles() 함수(코사인 유사도, pgvector)를 RPC로 호출합니다.
-    반환: [{"id":..., "member_id":..., "nickname":..., "similarity": 0.8~1.0, "gender":..., "status":...}, ...] (유사도 내림차순)
+
+    반환: [{"id":.., "member_id":.., "nickname":.., "similarity": 0.0~1.0}, ...] (유사도 내림차순)
     """
     try:
         res = supabase.rpc(
@@ -124,83 +189,61 @@ def match_blacklist_voices(supabase, embedding, match_count: int = 5):
         return []
 
 
-def analyze_new_member_voice(supabase, configuration, *, message_id, user_id, nickname=""):
-    """LINE 오디오 메시지 하나를 받아 (1) LINE에서 원본 다운로드 (2) Cloud Run 분석
-    (3) 블랙리스트 유사도 대조 (4) 중복이 아니면 저장 까지 한 번에 처리합니다.
+def analyze_new_member_voice(
+    supabase,
+    configuration,
+    *,
+    message_id,
+    user_id,
+    nickname,
+    storage_prefix="new_member",
+):
+    """신입이 보낸 음성 메시지 한 건을 분석하는 전체 파이프라인입니다.
 
-    실패해도 예외를 던지지 않고 항상 {"error": "..."} 또는 정상 결과 dict를 반환합니다.
-    (index.py의 handle_audio가 이 결과가 비어 있어도 기존 수동 인증 흐름을 그대로
-    진행하도록 설계되어 있으므로, 이 함수는 절대 raise 하지 않습니다.)
+    실패해도 예외를 던지지 않고 부분 결과(dict)를 돌려줍니다 — 호출부는
+    결과가 비어있어도 기존 수동 인증 흐름을 그대로 진행하면 됩니다.
+
+    반환 예:
+    {
+        "estimated_gender": "여", "pitch_hz": 210.3,
+        "matches": [{"nickname": "골드", "similarity": 0.93, "member_id": 1482}, ...],
+        "storage_path": "new_member/Uxxxx_1234567890.m4a",
+        "error": None,
+    }
     """
-    if not supabase:
-        return {"error": "Supabase 미설정"}
-
-    # 1. LINE에서 오디오 원본 바이트 다운로드
+    result = {
+        "estimated_gender": None,
+        "pitch_hz": None,
+        "matches": [],
+        "storage_path": None,
+        "error": None,
+    }
     try:
-        audio_bytes = download_line_audio(message_id, configuration)
-    except Exception as e:
-        return {"error": f"LINE 오디오 다운로드 실패: {e}"}
+        raw_bytes = download_line_audio(message_id, configuration)
 
-    # 2. Cloud Run에 위임해서 임베딩 / 추정 성별 / 피치 받아오기
-    try:
-        cr_result = analyze_audio_via_cloud_run(audio_bytes)
-    except Exception as e:
-        return {"error": f"Cloud Run 음성분석 실패: {e}"}
+        analysis = analyze_audio_via_cloud_run(raw_bytes)
+        embedding = analysis.get("embedding")
+        result["estimated_gender"] = analysis.get("estimated_gender")
+        result["pitch_hz"] = analysis.get("pitch_hz")
 
-    embedding = cr_result.get("embedding")
-    estimated_gender = cr_result.get("estimated_gender")
-    pitch_hz = cr_result.get("pitch_hz")
+        storage_path = f"{storage_prefix}/{user_id}_{int(time.time())}.m4a"
+        upload_voice_sample(supabase, raw_bytes, storage_path)
+        result["storage_path"] = storage_path
 
-    if not embedding:
-        return {
-            "error": "임베딩 추출 실패",
-            "estimated_gender": estimated_gender,
-            "pitch_hz": pitch_hz,
-        }
-
-    # =================================================================
-    # ✨ 스토리지에 올리기 전에 블랙리스트 유사도부터 검사합니다.
-    # =================================================================
-    matches = match_blacklist_voices(supabase, embedding, match_count=5)
-
-    # 중복(유사도 98% 이상) 여부 판별
-    is_duplicate = False
-    if matches:
-        highest_similarity = matches[0].get("similarity", 0) or 0
-        if highest_similarity >= 0.98:  # 98% 이상 일치하면 동일/중복 음성으로 간주
-            is_duplicate = True
-            print(f"⚠️ 중복 음성 감지 (일치율: {highest_similarity*100:.1f}%). 스토리지 저장을 생략합니다.")
-
-    # =================================================================
-    # ✨ 중복이 아닐 때만(is_duplicate == False) 스토리지 업로드와 DB 인서트를 진행합니다.
-    # =================================================================
-    storage_path = "duplicate_skipped"
-    if not is_duplicate:
-        try:
-            storage_path = upload_voice_sample(
-                supabase,
-                audio_bytes,
-                storage_path=f"new_members/{user_id}_{int(time.time())}.m4a",
-            )
+        if embedding:
             insert_voice_profile(
                 supabase,
                 embedding=embedding,
                 storage_path=storage_path,
                 nickname=nickname,
                 user_id=user_id,
-                estimated_gender=estimated_gender,
-                pitch_hz=pitch_hz,
+                estimated_gender=result["estimated_gender"],
+                pitch_hz=result["pitch_hz"],
                 source="new_member",
             )
-        except Exception as e:
-            print(f"음성 프로필 저장 중 오류: {e}")
+            result["matches"] = match_blacklist_voices(supabase, embedding)
+    except Exception as e:
+        print(f"⚠️ 음성 자동분석 파이프라인 실패(수동 인증 흐름은 계속 진행됨): {e}")
+        result["error"] = str(e)
 
-    # 4. 최종 결과 반환 (index.py에서 관리자 알림 + 'N번방 확인' 리포트 저장에 사용)
-    return {
-        "status": "success",
-        "estimated_gender": estimated_gender,
-        "pitch_hz": pitch_hz,
-        "matches": matches,          # index.py로 넘어가서 관리자 알림/방확인 리포트에 쓰일 데이터
-        "is_duplicate": is_duplicate,
-        "storage_path": storage_path,
-    }
+    return result

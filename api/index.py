@@ -25,7 +25,7 @@ from linebot.v3.webhooks import (
 )
 
 # ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
-from voice_analysis import analyze_new_member_voice
+from voice_analysis import submit_voice_analysis_job
 
 app = Flask(__name__)
 
@@ -1120,8 +1120,8 @@ def handle_message(event):
             print(f"확인 답변 처리 에러: {e}")
 
     # 📌 [핵심 검증 2-1] 신입이 "문제없음" 답장 입력 시 (음성 파일 제출 후, 마지막 입장 유저만 작동)
-    # ✨ [변경됨] push 없이 이 요청의 reply_token만으로 끝까지 처리한다.
-    # 무거운 자동분석을 여기서 동기 실행 → 끝나면 바로 최종 안내까지 회신.
+    # ✨ [변경됨] 클라우드런을 여기서 다시 호출하지 않는다. 분석은 이미 오디오 도착 시점에
+    # 클라우드런 쪽에서 백그라운드로 시작돼 있으므로, 여기선 그 결과를 "조회"만 한다.
     # (만약 이 요청이 타임아웃/에러로 죽으면 상태를 "음성확인중"으로 되돌려 두므로,
     #  신입이 "문제없음"을 다시 보내면 그대로 재시도된다 — 영구히 붕 뜨는 상태가 없음)
     if not is_admin_room and not user_message.startswith("/") and any(
@@ -1130,36 +1130,23 @@ def handle_message(event):
         if not is_last_joined_user(source_id, user_id):
             return
 
-        # 동시에 두 번 들어와도(예: LINE 웹훅 재시도) 분석이 중복 실행되지 않도록
+        # 동시에 두 번 들어와도(예: LINE 웹훅 재시도) 중복 처리되지 않도록
         # "음성확인중" -> "분석중"으로 CAS 선점. 실패하면 이미 처리 중이거나 이미 끝난 것.
-        if not cas_update_status(user_id, "음성확인중", "분석중", label="문제없음 확인(분석 시작)"):
+        # (여기서의 "분석중"은 클라우드런 작업 상태가 아니라 이 요청 자체의 처리 락 용도)
+        if not cas_update_status(user_id, "음성확인중", "분석중", label="문제없음 확인(결과 조회 시작)"):
             return
 
-        claimed_nickname, claimed_gender = "", ""
-        if supabase:
-            res = supabase_execute(
-                lambda: supabase.table('user_validations').select('nickname, gender').eq('user_id', user_id).execute(),
-                label="문제없음 처리용 닉네임/성별 조회"
-            )
-            if res and res.data:
-                claimed_nickname = res.data[0].get('nickname') or ""
-                claimed_gender = res.data[0].get('gender') or ""
-
         try:
-            final_text = run_voice_analysis_and_get_final_text(
-                user_id=user_id, source_id=source_id,
-                claimed_nickname=claimed_nickname, claimed_gender=claimed_gender,
-            )
-            cas_update_status(user_id, "분석중", "승인대기", label="문제없음 확인(분석 완료)")
+            reply_text = format_voice_analysis_reply_text(user_id)
+            cas_update_status(user_id, "분석중", "승인대기", label="문제없음 확인(결과 조회 완료)")
             sync_status_to_sheet(user_id, "승인대기")
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=final_text)])
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                 )
         except Exception as e:
-            print(f"⚠️ 문제없음 처리(자동분석 포함) 중 예외 — 재시도 가능하도록 상태 되돌림: {e}")
-            # 재시도 가능하도록 상태를 원복. 분석 자체는 이미 끝났을 수도 있으니 DB는 그대로 두고 상태만 되돌린다.
+            print(f"⚠️ 문제없음 처리(결과 조회) 중 예외 — 재시도 가능하도록 상태 되돌림: {e}")
             cas_update_status(user_id, "분석중", "음성확인중", label="문제없음 처리 실패 롤백")
             sync_status_to_sheet(user_id, "음성확인중")
             try:
@@ -1554,7 +1541,18 @@ def handle_audio(event):
         session_data.setdefault("gender", claimed_gender)
         set_user_session(user_id, session_data)
 
-        # 무거운 분석 없이, 접수 확인 겸 '/ㅇㅈ 3' 멘트만 즉시 회신한다.
+        # ✨ [변경됨] 여기서 클라우드런에 분석을 "접수"만 시키고 끝난다(결과를 기다리지 않음).
+        # 실제 무거운 분석(임베딩 추출 등)은 클라우드런이 백그라운드로 계속 진행하다가
+        # 끝나면 Supabase에 직접 결과를 기록한다. '문제없음' 답장이 왔을 땐 그 결과를
+        # 조회만 하면 되므로 그 요청이 무거워질 일이 없다.
+        # (submit_voice_analysis_job은 '접수 확인(202)'까지만 기다리도록 설계되어 있어
+        #  아래 reply가 크게 지연되지는 않지만, 콜드스타트 시엔 지연될 수 있다 — warmup으로 완화)
+        submit_voice_analysis_job(
+            supabase, configuration,
+            message_id=event.message.id, user_id=user_id, nickname=claimed_nickname,
+        )
+
+        # 접수 확인 겸 '/ㅇㅈ 3' 멘트만 즉시 회신한다.
         three_text = search_keyword("3") or search_keyword("3번")
         immediate_reply_text = three_text or (
             "🎤 음성인증 파일이 정상적으로 접수되었습니다!\n\n"
@@ -1567,51 +1565,64 @@ def handle_audio(event):
             )
 
 
-def run_voice_analysis_and_get_final_text(*, user_id, source_id, claimed_nickname, claimed_gender):
-    """'문제없음' 답장을 받았을 때, 그 요청 안에서 동기적으로 자동분석을 실행하고
-    유저에게 회신할 최종 안내 문구를 만들어 돌려준다 (push 없이 이 요청의 reply_token으로 바로 회신하기 위함).
-    분석 자체가 실패해도(analyze_new_member_voice는 예외를 던지지 않음) 항상 최종 안내 문구를 반환한다.
+def format_voice_analysis_reply_text(user_id):
+    """'문제없음' 답장을 받았을 때 호출된다. 클라우드런을 다시 부르지 않고,
+    오디오 도착 시점에 이미 시작된 백그라운드 분석의 현재 상태(voice_analysis_state)를
+    DB에서 "조회"만 해서, 앞에 상태 이모지를 붙인 안내 문구를 만들어 돌려준다.
+
+    🔵 = 분석 완료, 결과 조회 가능
+    🟡 = 아직 분석 진행 중 (또는 접수 기록조차 아직 없는 경우 — 오디오 도착 처리와의 경합)
+    🔴 = 분석 중 에러 발생
+
+    상태와 무관하게 항상 문자열을 반환하고, 예외를 던지지 않는다 — 수동 인증 흐름을 막지 않기 위함.
     """
-    kst = datetime.timezone(datetime.timedelta(hours=9))
-    voice_checked_at_str = datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M")
-    voice_check_report_text = "자동분석 시도 실패 — 운영진이 음성을 직접 듣고 판단해 주세요."
+    if not supabase or not user_id:
+        return f"🔴 결과를 조회할 수 없습니다 (DB 연결 없음)\n\n{FINAL_APPROVAL_WAIT_TEXT}"
 
-    session_data = get_user_session(user_id) or {}
-    message_id = session_data.get("pending_voice_message_id") if isinstance(session_data, dict) else None
+    res = supabase_execute(
+        lambda: supabase.table('user_validations')
+            .select('nickname, gender, voice_analysis_state, voice_analysis_result, voice_analysis_error')
+            .eq('user_id', user_id).execute(),
+        label="음성분석 결과 조회(문제없음)"
+    )
+    row = (res.data[0] if res and res.data else {}) or {}
+    claimed_nickname = row.get('nickname') or ""
+    claimed_gender = row.get('gender') or ""
+    state = row.get('voice_analysis_state')
+    result = row.get('voice_analysis_result') or {}
+    error = row.get('voice_analysis_error')
 
-    if supabase and message_id:
-        try:
-            voice_result = analyze_new_member_voice(
-                supabase, configuration,
-                message_id=message_id,
-                user_id=user_id,
-                nickname=claimed_nickname,
-            )
-            notify_admin_voice_analysis(
-                claimed_nickname=claimed_nickname,
-                claimed_gender=claimed_gender,
-                user_id=user_id,
-                voice_result=voice_result,
-            )
-            voice_check_report_text = build_voice_check_report_text(
-                claimed_gender=claimed_gender,
-                voice_result=voice_result,
-            )
-        except Exception as e:
-            print(f"⚠️ 음성 자동분석/운영진 알림 실패(수동 인증 흐름에는 영향 없음): {e}")
-    elif not message_id:
-        voice_check_report_text = "자동분석 실패(원본 음성 메시지 정보 없음) — 운영진이 음성을 직접 듣고 판단해 주세요."
-
-    if supabase:
+    if state == "완료":
+        # voice_analysis_result는 analyze_new_member_voice()가 반환하던 것과 같은 모양(estimated_gender/
+        # matches/pitch_hz 등)으로 클라우드런이 채워 넣는다는 전제 → 기존 리포트/알림 함수를 그대로 재사용.
+        report_text = build_voice_check_report_text(claimed_gender=claimed_gender, voice_result=result)
+        notify_admin_voice_analysis(
+            claimed_nickname=claimed_nickname, claimed_gender=claimed_gender,
+            user_id=user_id, voice_result=result,
+        )
+        kst = datetime.timezone(datetime.timedelta(hours=9))
         supabase_execute(
             lambda: supabase.table('user_validations').update({
-                "voice_checked_at": voice_checked_at_str,
-                "voice_check_report": voice_check_report_text,
+                # ✨ 기존 'N번방 확인' 명령어(format_voice_check_status)가 이 두 컬럼을 그대로 읽으므로
+                # 하위 호환을 위해 함께 채워 둔다.
+                "voice_checked_at": datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M"),
+                "voice_check_report": report_text,
             }).eq('user_id', user_id).execute(),
-            label="음성검증 확인정보 저장"
+            label="음성검증 확인정보 저장(비동기 파이프라인)"
+        )
+        return f"🔵 자동분석 결과를 조회했습니다.\n{report_text}\n\n{FINAL_APPROVAL_WAIT_TEXT}"
+
+    if state == "에러":
+        return (
+            f"🔴 자동분석 중 오류가 발생했습니다{f' ({error})' if error else ''}. "
+            f"운영진이 음성을 직접 듣고 판단합니다.\n\n{FINAL_APPROVAL_WAIT_TEXT}"
         )
 
-    return FINAL_APPROVAL_WAIT_TEXT
+    # state가 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두 진행 중으로 안내.
+    return (
+        "🟡 자동분석이 아직 진행 중입니다. 완료되는 대로 운영진 확인 시 함께 반영됩니다.\n\n"
+        f"{FINAL_APPROVAL_WAIT_TEXT}"
+    )
 
 
 if __name__ == "__main__":
