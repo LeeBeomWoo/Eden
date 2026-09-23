@@ -20,6 +20,14 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
 )
+# ✨ [추가됨] 인증방 전체 멘션(@전체) 완료 알림용. 설치된 line-bot-sdk 버전이 텍스트 메시지 v2(멘션)를
+# 지원하지 않는 경우를 대비해 임포트 실패 시에도 나머지 기능은 정상 동작하도록 예외처리합니다.
+try:
+    from linebot.v3.messaging import TextMessageV2, MentionSubstitutionObject, AllMentionTarget
+    _MENTION_SUPPORTED = True
+except ImportError:
+    _MENTION_SUPPORTED = False
+    print("⚠️ 설치된 line-bot-sdk 버전이 텍스트 메시지 v2(멘션)를 지원하지 않아, 완료 알림 시 멘션 없이 일반 텍스트로 전송됩니다.")
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, MemberJoinedEvent, MemberLeftEvent, AudioMessageContent
 )
@@ -538,6 +546,123 @@ def start_voice_auth(user_id, require_status='입장대기'):
         print(f"음성인증 시작 - 시트 동기화 에러(무시하고 계속 진행): {e}")
 
     return True, reply_text
+
+
+# ==========================================
+# ✨ [추가됨] "닉변" → "변경완료" → 헤르페스 확인 플로우용 헬퍼 함수
+# ==========================================
+def build_all_mention_message(text_body):
+    """방 전체(@전체)를 멘션하면서 안내 문구를 붙인 메시지 객체를 만듭니다.
+    설치된 line-bot-sdk 버전이 텍스트 메시지 v2(멘션)를 지원하지 않으면 멘션 없이 일반 텍스트로 대체합니다."""
+    if _MENTION_SUPPORTED:
+        try:
+            return TextMessageV2(
+                text="{전체} " + text_body,
+                substitution={
+                    "전체": MentionSubstitutionObject(
+                        type="mention",
+                        mentionee=AllMentionTarget(type="all")
+                    )
+                }
+            )
+        except Exception as e:
+            print(f"⚠️ 멘션 메시지 생성 실패(일반 텍스트로 대체): {e}")
+    return TextMessage(text=text_body)
+
+
+def get_validation_row(user_id, fields="*"):
+    """user_validations에서 지정한 컬럼만 조회합니다. 실패/미존재 시 빈 dict."""
+    if not supabase or not user_id:
+        return {}
+    res = supabase_execute(
+        lambda: supabase.table('user_validations').select(fields).eq('user_id', user_id).execute(),
+        label="유저 검증정보 조회"
+    )
+    return (res.data[0] if res and res.data else {}) or {}
+
+
+def get_current_display_name(source_id, user_id):
+    """신입의 현재 LINE 그룹 표시 닉네임을 조회합니다. 조회 실패 시 빈 문자열."""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            profile = line_bot_api.get_group_member_profile(source_id, user_id)
+            return getattr(profile, 'display_name', '') or ''
+    except Exception as e:
+        print(f"닉네임 변경 확인 - 프로필 조회 실패: {e}")
+        return ''
+
+
+def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
+    """실제 LINE 닉네임에 신청 시 적어낸 '생년'과 '닉네임'이 모두 반영되었는지 확인합니다.
+    (공백 유무 등 사소한 차이는 무시하고 두 값이 포함되어 있는지만 느슨하게 검사합니다.)"""
+    current_name = get_current_display_name(source_id, user_id)
+    if not current_name or not birth_year or not nickname:
+        return False
+    current_clean = current_name.replace(" ", "")
+    return (str(birth_year).strip() in current_clean) and (str(nickname).strip() in current_clean)
+
+
+def has_blacklist_issue(user_id):
+    """DB에 저장된 음성 자동분석 결과 기준으로 블랙리스트 유사 매칭(강한 의심)이 남아있는지 재확인합니다."""
+    row = get_validation_row(user_id, "voice_analysis_result")
+    voice_result = row.get('voice_analysis_result') or {}
+    matches = voice_result.get('matches') or []
+    return any((m.get('similarity') or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
+
+
+def finalize_after_nickname_check(source_id, user_id, reply_token):
+    """'헤르페스확인대기' 상태에서 (헤르페스 무증상 답변, 또는 닉네임 재수정 후 '확인')이 왔을 때
+    실제 LINE 닉네임 변경 여부와 블랙리스트 재조회 결과를 확인해 최종 분기 처리합니다.
+
+    - 닉네임 미변경          -> 닉네임/프사 재설정 요청 후 대기 (상태는 '헤르페스확인대기' 유지)
+    - 닉네임 변경 + 블랙리스트 문제 없음 -> '/ㅇㅈ 퇴장' 멘트 출력, 상태를 '퇴장대기'로 전환
+      (실제 퇴장 시 handle_member_left에서 운영진에게 완료 알림)
+    - 닉네임 변경 + 블랙리스트 문제 있음 -> 운영진 확인 대기 안내, 상태를 '관리자검토대기'로 전환
+    """
+    row = get_validation_row(user_id, "nickname, birth_year")
+    nickname = row.get('nickname') or ""
+    birth_year = row.get('birth_year') or ""
+
+    if not is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
+        reply_text = "닉네임을 변경하여 주시고 프사를 설정하여 주세요. 그리고 다시 확인이라고 입력하여 주세요."
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_text)])
+            )
+        return
+
+    if has_blacklist_issue(user_id):
+        if supabase:
+            supabase_execute(
+                lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
+                label="관리자검토대기 상태 전환"
+            )
+        sync_status_to_sheet(user_id, "관리자검토대기")
+
+        reply_text = "인증자의 확인 후 인증과정이 마무리 될 예정이니 잠시대기하여주세요."
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_text)])
+            )
+        return
+
+    # 닉네임 변경 확인 + 블랙리스트 문제 없음 -> 퇴장 안내, 실제 퇴장 시(handle_member_left) 운영진에게 완료 알림
+    if supabase:
+        supabase_execute(
+            lambda: supabase.table('user_validations').update({"status": "퇴장대기"}).eq('user_id', user_id).execute(),
+            label="퇴장대기 상태 전환"
+        )
+    sync_status_to_sheet(user_id, "퇴장대기")
+
+    exit_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증이 모두 완료되었습니다. 안내에 따라 방을 나가주세요."
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=exit_text)])
+        )
 
 
 @app.route("/api", methods=['POST'])
@@ -1103,6 +1228,54 @@ def handle_message(event):
         if not is_last_joined_user(source_id, user_id):
             return  
 
+        current_row_for_check = get_validation_row(user_id, "status")
+        current_status_for_check = current_row_for_check.get('status')
+
+        # ✨ [추가됨] '승인대기' 상태에서 온 "확인" -> '/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임으로 채워서 전송하고 '닉변대기'로 전환
+        # (남성은 보통 운영진이 먼저 '/ㅇㅈ 4번' 멘트를 보낸 뒤 이 "확인"을 받지만, 여성은 '4번' 과정 없이
+        #  '문제없음' 확인 직후 바로 이 "확인"을 받아도 동일하게 진행됩니다 — 코드상 '4번' 발송 여부는 확인하지 않습니다.)
+        if current_status_for_check == "승인대기":
+            row = get_validation_row(user_id, "nickname, birth_year, gender")
+            nickname = row.get('nickname') or ""
+            birth_year = row.get('birth_year') or ""
+            gender = row.get('gender') or ""
+            # 여성은 닉네임 뒤에 붙는 이모지만 다르게(⚖️), 그 외(남성 등)는 기존과 동일(🧨)
+            nickname_emoji = "⚖️" if gender in ("여", "여자") else "🧨"
+
+            nickchange_template = search_keyword("닉변")
+            if nickchange_template:
+                nickchange_text = (
+                    nickchange_template
+                    .replace("{생년}", birth_year).replace("{birth_year}", birth_year)
+                    .replace("{닉네임}", nickname).replace("{nickname}", nickname)
+                    .replace("{닉네임이모지}", nickname_emoji).replace("{emoji}", nickname_emoji)
+                )
+            else:
+                nickchange_text = (
+                    "닉네임을 아래 형식으로 복사하여 변경해 주세요.\n\n"
+                    f"{birth_year} {nickname}{nickname_emoji}\n\n"
+                    "변경 후 프로필 사진도 도용 사진이 아닌 사진으로 설정해 주시고, '변경완료'라고 답장해 주세요."
+                )
+
+            if supabase:
+                supabase_execute(
+                    lambda: supabase.table('user_validations').update({"status": "닉변대기"}).eq('user_id', user_id).execute(),
+                    label="닉변대기 상태 전환"
+                )
+            sync_status_to_sheet(user_id, "닉변대기")
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=nickchange_text)])
+                )
+            return
+
+        # ✨ [추가됨] '헤르페스확인대기' 상태에서 (닉네임/프사를 다시 고친 뒤) 온 "확인" -> 최종 판정 재시도
+        if current_status_for_check == "헤르페스확인대기":
+            finalize_after_nickname_check(source_id, user_id, event.reply_token)
+            return
+
         try:
             success, voice_reply_text = start_voice_auth(user_id, require_status='입장대기')
 
@@ -1160,6 +1333,48 @@ def handle_message(event):
                     )
             except Exception:
                 pass
+        return
+
+    # 📌 [핵심 검증 2-2] 신입이 "변경완료" 답장 입력 시 ('닉변대기' 상태, 마지막 입장 유저만 작동)
+    if not is_admin_room and not user_message.startswith("/") and any(
+        word in user_message for word in ["변경완료", "변경 완료", "닉변완료", "닉변 완료"]
+    ):
+        if not is_last_joined_user(source_id, user_id):
+            return
+
+        current_row = get_validation_row(user_id, "status")
+        if current_row.get('status') == "닉변대기":
+            # ✨ [추가됨] 한 번 더 음성 자동분석 결과를 DB에서 재확인 (완료 상태가 아니어도 흐름은 막지 않고 로그만 남김
+            #  - 최종 블랙리스트 판정은 어차피 헤르페스 확인 단계에서 has_blacklist_issue()로 다시 검사함)
+            voice_row = get_validation_row(user_id, "voice_analysis_state")
+            if voice_row.get('voice_analysis_state') != "완료":
+                print(f"⚠️ user_id={user_id} 변경완료 시점에도 음성 자동분석이 아직 '완료' 상태가 아님 (재확인 필요)")
+
+            if supabase:
+                supabase_execute(
+                    lambda: supabase.table('user_validations').update({"status": "헤르페스확인대기"}).eq('user_id', user_id).execute(),
+                    label="헤르페스확인대기 상태 전환"
+                )
+            sync_status_to_sheet(user_id, "헤르페스확인대기")
+
+            reply_text = "✅ 확인되었습니다. 위 안내 사항(질문 포함)에 답변해 주세요."
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                )
+        return
+
+    # 📌 [핵심 검증 2-3] 헤르페스 질문에 "없음(무증상/미감염)"류로 답변 시 ('헤르페스확인대기' 상태)
+    if not is_admin_room and not user_message.startswith("/") and any(
+        word in user_message for word in ["없습니다", "없어요", "없다", "없음", "아니요", "아니오"]
+    ):
+        if not is_last_joined_user(source_id, user_id):
+            return
+
+        current_row = get_validation_row(user_id, "status")
+        if current_row.get('status') == "헤르페스확인대기":
+            finalize_after_nickname_check(source_id, user_id, event.reply_token)
         return
 
     # 3. 일반 DB 키워드 검색
@@ -1333,8 +1548,33 @@ def handle_member_left(event):
     tracked_user_id = room_state.get('user_id') if room_state else None
 
     if tracked_user_id and tracked_user_id in left_user_ids:
+        # ✨ [추가됨] '/ㅇㅈ 닉변' -> '변경완료' -> 헤르페스 확인까지 모두 통과해서
+        # 자동으로 '/ㅇㅈ 퇴장' 멘트가 나간 뒤 신입이 실제로 나간 경우인지 확인
+        leave_row = get_validation_row(tracked_user_id, "status, nickname")
+        was_auto_completed = leave_row.get('status') == "퇴장대기"
+        leaving_nickname = leave_row.get('nickname') or "신입"
+
         # 인증 진행 중이던 신입이 실제로 나간 경우 -> user_validations 상태까지 함께 초기화
         reset_verification_state(source_id, tracked_user_id)
+
+        if was_auto_completed:
+            if supabase:
+                supabase_execute(
+                    lambda: supabase.table('user_validations').update({"status": "완료"}).eq('user_id', tracked_user_id).execute(),
+                    label="자동 인증완료 상태 반영"
+                )
+            sync_status_to_sheet(tracked_user_id, "완료")
+            try:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.push_message_with_http_info(
+                        PushMessageRequest(
+                            to=source_id,
+                            messages=[build_all_mention_message(f"[{leaving_nickname}]님 인증이 완료되었습니다.")]
+                        )
+                    )
+            except Exception as e:
+                print(f"인증방 완료 알림 전송 실패: {e}")
     elif not left_user_ids or tracked_user_id is None:
         # 누가 나갔는지 알 수 없거나, 추적 중인 인증 대상이 없는 경우에는 기존처럼 room_state만 정리
         del_room_state(source_id)
