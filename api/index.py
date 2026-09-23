@@ -1347,6 +1347,9 @@ def handle_member_left(event):
 # 블랙리스트 유사도가 이 값 이상이면 "동일인 의심"으로 강조 표시한다.
 VOICE_MATCH_ALERT_THRESHOLD = 0.90
 
+# ✨ [추가됨] 오토튠/피치보정 의심도(%)가 이 값 이상이면 운영진방 알림 조건에 포함시킨다.
+AUTOTUNE_ALERT_THRESHOLD = 50.0
+
 # 신청서 성별 표기("남"/"남자"/"여"/"여자")를 "남"/"여"로 정규화하기 위한 매핑
 _GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"}
 
@@ -1368,6 +1371,17 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
         pitch_note = f" (추정 피치 {voice_result.get('pitch_hz')}Hz)" if voice_result.get("pitch_hz") else ""
         mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
         lines.append(f"- 음성 기반 추정 성별: {est_gender}{pitch_note}{mismatch_note}")
+
+    # ✨ [추가됨] 오토튠/피치보정 의심도. 확정 판정이 아니라 정황 지표이므로 항상 그 취지를 함께 남긴다.
+    autotune_prob = voice_result.get("autotune_probability")
+    if autotune_prob is not None:
+        if autotune_prob >= AUTOTUNE_ALERT_THRESHOLD:
+            level = "⚠️ 높음(의심)"
+        elif autotune_prob >= 20:
+            level = "중간"
+        else:
+            level = "낮음"
+        lines.append(f"- 오토튠/피치보정 의심도: {autotune_prob:.1f}% ({level}) — 참고용 정황 지표, 확정 판정 아님")
 
     matches = voice_result.get("matches") or []
     strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
@@ -1406,6 +1420,32 @@ def build_voice_check_report_text(*, claimed_gender, voice_result):
     return "\n".join(lines)
 
 
+# ✨ [추가됨] '처리중' 상태 워치독
+# 클라우드런 쪽에서 OOM/강제종료/네이티브 크래시처럼 파이썬 try/except로도 못 잡는 방식으로
+# 죽으면, voice_analysis_state가 '완료'도 '에러'도 아닌 '처리중'에 영원히 멈춘 채 방치될 수 있다.
+# voice_analysis_synced_at(마지막 상태 갱신 시각) 기준으로 일정 시간 이상 그대로면 "멈춘 것"으로
+# 간주해서 운영진에게만 알려준다 (신입에게는 노출하지 않음 — 기존 analysis_error_note와 동일 원칙).
+VOICE_ANALYSIS_STALE_MINUTES = 5
+
+
+def _voice_analysis_is_stale(row):
+    """row(voice_analysis_state, voice_analysis_synced_at 포함)를 보고, '처리중'인 채로
+    VOICE_ANALYSIS_STALE_MINUTES 이상 갱신이 없으면 True를 반환한다."""
+    if row.get('voice_analysis_state') != "처리중":
+        return False
+    synced_at = row.get('voice_analysis_synced_at')
+    if not synced_at:
+        return False
+    try:
+        synced_dt = datetime.datetime.fromisoformat(str(synced_at).replace('Z', '+00:00'))
+        if synced_dt.tzinfo is None:
+            synced_dt = synced_dt.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return False
+    elapsed = datetime.datetime.now(datetime.timezone.utc) - synced_dt
+    return elapsed > datetime.timedelta(minutes=VOICE_ANALYSIS_STALE_MINUTES)
+
+
 def format_voice_check_status(user_id):
     """'N번방 확인' 명령어에서 특정 유저의 음성검증 진행 상태를 사람이 읽기 좋은 문장으로 만들어 돌려줍니다.
     - 음성검증까지 확인이 끝났는지 여부
@@ -1418,7 +1458,8 @@ def format_voice_check_status(user_id):
     res = supabase_execute(
         lambda: supabase.table('user_validations')
             .select('status, nickname, gender, voice_checked_at, voice_check_report, '
-                    'voice_analysis_state, voice_analysis_result, voice_analysis_error')
+                    'voice_analysis_state, voice_analysis_result, voice_analysis_error, '
+                    'voice_analysis_synced_at')
             .eq('user_id', user_id).execute(),
         label="음성검증 상태 조회(방확인)"
     )
@@ -1446,6 +1487,12 @@ def format_voice_check_status(user_id):
     analysis_error_note = ""
     if row.get('voice_analysis_state') == "에러":
         analysis_error_note = f"\n🔴 자동분석 오류: {row.get('voice_analysis_error') or '(사유 미상)'}"
+    elif _voice_analysis_is_stale(row):
+        # ✨ [추가됨] OOM/강제종료 등으로 조용히 멈춘 '처리중' 감지 — 운영진에게만 노출
+        analysis_error_note = (
+            f"\n🔴 자동분석이 {VOICE_ANALYSIS_STALE_MINUTES}분 넘게 '처리중'에서 멈춰 있습니다 "
+            "(응답 없이 중단된 것으로 추정 — 운영진이 직접 확인해 주세요)"
+        )
 
     if status in (None, "", "입장대기"):
         return "🎙️ 음성검증: ❌ 아직 진행 전 (양식 작성 단계)"
@@ -1481,7 +1528,9 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
     - 신청서에 적은 성별과 음성 기반 추정 성별이 다른 경우
     - ✨ [추가됨] 음성 원본/프로필 저장 자체가 실패한 경우 (분석은 성공했지만 DB에는 안 남음 — 방치하면
       나중에 'N번방 확인'을 할 때까지 아무도 모를 수 있으므로 발생 즉시 알린다)
-    셋 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
+    - ✨ [추가됨] 오토튠/피치보정 의심도가 AUTOTUNE_ALERT_THRESHOLD(기본 50%) 이상인 경우
+      (확정 판정 아님 — 운영진이 직접 들어보고 최종 판단해야 함)
+    넷 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
 
     ⚠️ 어디까지나 참고 정보다. 자동 판정/자동 승인·차단이 아니며,
     최종 판단은 반드시 운영진이 음성을 직접 듣고 내려야 한다.
@@ -1498,7 +1547,10 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
 
     save_error = voice_result.get("save_error")
 
-    if not strong_matches and not gender_mismatch and not save_error:
+    autotune_prob = voice_result.get("autotune_probability")
+    autotune_suspected = bool(autotune_prob is not None and autotune_prob >= AUTOTUNE_ALERT_THRESHOLD)
+
+    if not strong_matches and not gender_mismatch and not save_error and not autotune_suspected:
         return
 
     lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
