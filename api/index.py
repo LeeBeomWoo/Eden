@@ -1417,7 +1417,8 @@ def format_voice_check_status(user_id):
 
     res = supabase_execute(
         lambda: supabase.table('user_validations')
-            .select('status, voice_checked_at, voice_check_report, voice_analysis_state, voice_analysis_error')
+            .select('status, nickname, gender, voice_checked_at, voice_check_report, '
+                    'voice_analysis_state, voice_analysis_result, voice_analysis_error')
             .eq('user_id', user_id).execute(),
         label="음성검증 상태 조회(방확인)"
     )
@@ -1428,6 +1429,16 @@ def format_voice_check_status(user_id):
     status = row.get('status')
     checked_at = row.get('voice_checked_at')
     report = row.get('voice_check_report')
+
+    # ✅ [수정] '문제없음' 답장이 클라우드런 분석 완료보다 먼저 와서 voice_check_report가
+    # DB에 저장되지 못한 경우를 구제한다. voice_analysis_result(클라우드런이 저장한 원본
+    # 결과)가 있으면 그 자리에서 읽기 전용으로만 리포트 문자열을 재구성해서 보여준다
+    # — DB에는 아무것도 쓰지 않는다 (DB 기록은 여전히 클라우드런의 몫).
+    if not report and row.get('voice_analysis_state') == "완료" and row.get('voice_analysis_result'):
+        report = build_voice_check_report_text(
+            claimed_gender=row.get('gender'),
+            voice_result=row.get('voice_analysis_result'),
+        )
 
     # ✨ [추가됨] 자동분석 에러는 신입에게는 절대 보여주지 않고, 운영진이 'N번방 확인'을 했을 때만
     # 노출한다. voice_analysis_state는 '문제없음' 답장 여부(status)와 무관하게 오디오 도착 시점부터
