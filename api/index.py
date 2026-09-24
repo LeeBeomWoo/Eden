@@ -42,13 +42,14 @@ def warmup_voice_service():
     """신입 입장 시 Cloud Run 음성분석 서비스를 미리 깨워둔다 (콜드스타트 완화용).
     응답을 기다리지 않고 짧은 타임아웃으로 요청만 보내고, 실패/타임아웃 나도 무시한다.
     (요청이 타임아웃 나더라도 Cloud Run 쪽 컨테이너 기동은 이미 시작됨)"""
-    voice_service_url = os.environ.get("VOICE_SERVICE_URL", "")
-    if not voice_service_url:
-        return
-    try:
-        requests.get(f"{voice_service_url.rstrip('/')}/healthz", timeout=3)
-    except Exception:
-        pass
+    """신입 입장 시 Cloud Run 음성분석 서비스들을 미리 깨워둔다 (콜드스타트 완화용).
+    어느 방이 어느 인스턴스로 갈지는 room_id 해시로 결정되므로, 웜업 시점엔 특정하기 어려워
+    등록된 URL 전부를 깨운다."""
+    for url in VOICE_SERVICE_URLS:
+        try:
+            requests.get(f"{url}/healthz", timeout=3)
+        except Exception:
+            pass
 
 
 # 인증자방(관리자 그룹방) ID 고정 설정
@@ -1966,6 +1967,7 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
         supabase, configuration,
         message_id=event.message.id, nickname=nickname, gender=gender,
         black_reason=reason, registered_by=admin_user_id,
+        room_id=ADMIN_GROUP_CHAT_ID,   # ✨ 추가
     )
 
     if result.get("error"):
@@ -2069,6 +2071,7 @@ def handle_audio(event):
         submit_voice_analysis_job(
             supabase, configuration,
             message_id=event.message.id, user_id=user_id, nickname=claimed_nickname,
+            room_id=source_id,   # ✨ 추가
         )
 
         # 접수 확인 겸 '/ㅇㅈ 3' 멘트만 즉시 회신한다.
