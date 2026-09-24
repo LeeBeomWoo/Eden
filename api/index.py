@@ -658,10 +658,18 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
     sync_status_to_sheet(user_id, "퇴장대기")
 
     exit_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증이 모두 완료되었습니다. 안내에 따라 방을 나가주세요."
+
+    # ✨ [변경됨] 완료멘션(@전체)을 "신입이 실제로 나간 뒤" push로 보내던 방식에서,
+    # 이 퇴장 안내 reply에 함께 묶어서 무료 reply로 보내는 방식으로 변경.
+    # (LINE의 memberLeft 웹훅 이벤트에는 replyToken 자체가 없어서, 실제로 나간 시점에는
+    #  reply로 응답하는 것이 API 구조상 불가능함 — 그래서 퇴장 안내를 보내는 지금 이 시점에
+    #  미리 함께 보낸다. 즉, "실제로 나갔는지" 확정 확인 후 발송이 아니라 안내와 동시 발송임.)
+    completion_message = build_all_mention_message(f"[{nickname or '신입'}]님 인증이 완료되었습니다.")
+
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=exit_text)])
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=exit_text), completion_message])
         )
 
 
@@ -1310,13 +1318,28 @@ def handle_message(event):
             return
 
         try:
-            reply_text = format_voice_analysis_reply_text(user_id)
+            reply_text, claimed_gender = format_voice_analysis_reply_text(user_id)
             cas_update_status(user_id, "분석중", "승인대기", label="문제없음 확인(결과 조회 완료)")
             sync_status_to_sheet(user_id, "승인대기")
+
+            reply_messages = [TextMessage(text=reply_text)]
+
+            # ✨ [추가됨] 운영진이 문제 없을 때도 매번 수동으로 보내던 '/ㅇㅈ 4번' 멘트를 자동화.
+            # 여성은 원래 '4번' 과정 없이 바로 "확인"을 받아도 동일하게 진행되므로,
+            # 남성/성별 미상('여'가 아닌 모든 경우)에만 이어서 자동 발송한다.
+            # (운영진 개입은 문제가 있을 때만 하도록 하기 위함 — 정상 케이스는 완전 자동 진행)
+            claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
+            if claimed_gender_norm != "여":
+                four_text = search_keyword("4번") or search_keyword("4")
+                if four_text:
+                    reply_messages.append(TextMessage(text=four_text))
+                else:
+                    print(f"⚠️ user_id={user_id} '4번' 인증 멘트가 DB(auth_ments)에 등록되어 있지 않아 자동 발송을 건너뜁니다. 키워드 '4번'을 등록해 주세요.")
+
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=reply_messages)
                 )
         except Exception as e:
             print(f"⚠️ 문제없음 처리(결과 조회) 중 예외 — 재시도 가능하도록 상태 되돌림: {e}")
@@ -1550,31 +1573,23 @@ def handle_member_left(event):
     if tracked_user_id and tracked_user_id in left_user_ids:
         # ✨ [추가됨] '/ㅇㅈ 닉변' -> '변경완료' -> 헤르페스 확인까지 모두 통과해서
         # 자동으로 '/ㅇㅈ 퇴장' 멘트가 나간 뒤 신입이 실제로 나간 경우인지 확인
-        leave_row = get_validation_row(tracked_user_id, "status, nickname")
+        leave_row = get_validation_row(tracked_user_id, "status")
         was_auto_completed = leave_row.get('status') == "퇴장대기"
-        leaving_nickname = leave_row.get('nickname') or "신입"
 
         # 인증 진행 중이던 신입이 실제로 나간 경우 -> user_validations 상태까지 함께 초기화
         reset_verification_state(source_id, tracked_user_id)
 
         if was_auto_completed:
+            # ✨ [변경됨] 완료멘션(@전체)은 이제 push가 아니라, 퇴장 안내를 보내는 시점
+            # (finalize_after_nickname_check)에 reply로 이미 함께 발송되었으므로 여기서는
+            # DB 상태만 '완료'로 반영한다. (memberLeft 이벤트에는 replyToken이 없어
+            # 이 시점에는 애초에 reply를 보낼 수 없음)
             if supabase:
                 supabase_execute(
                     lambda: supabase.table('user_validations').update({"status": "완료"}).eq('user_id', tracked_user_id).execute(),
                     label="자동 인증완료 상태 반영"
                 )
             sync_status_to_sheet(tracked_user_id, "완료")
-            try:
-                with ApiClient(configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.push_message_with_http_info(
-                        PushMessageRequest(
-                            to=source_id,
-                            messages=[build_all_mention_message(f"[{leaving_nickname}]님 인증이 완료되었습니다.")]
-                        )
-                    )
-            except Exception as e:
-                print(f"인증방 완료 알림 전송 실패: {e}")
     elif not left_user_ids or tracked_user_id is None:
         # 누가 나갔는지 알 수 없거나, 추적 중인 인증 대상이 없는 경우에는 기존처럼 room_state만 정리
         del_room_state(source_id)
@@ -1904,6 +1919,9 @@ def format_voice_analysis_reply_text(user_id):
     똑같은 문구로 안내한다.
 
     상태와 무관하게 항상 문자열을 반환하고, 예외를 던지지 않는다 — 수동 인증 흐름을 막지 않기 위함.
+
+    ✨ [변경됨] 반환값이 (안내 문구, 신청 시 적은 성별) 튜플로 바뀌었다. 호출부에서 성별에 따라
+    '/ㅇㅈ 4번' 멘트 자동 발송 여부를 판단하는 데 사용한다.
     """
     PENDING_TEXT_FOR_MEMBER = (
         "🟡 자동분석이 아직 진행 중입니다. 완료되는 대로 운영진 확인 시 함께 반영됩니다.\n\n"
@@ -1912,7 +1930,7 @@ def format_voice_analysis_reply_text(user_id):
 
     if not supabase or not user_id:
         # DB 연결 실패 같은 내부 사정도 신입에게는 노출하지 않는다.
-        return PENDING_TEXT_FOR_MEMBER
+        return PENDING_TEXT_FOR_MEMBER, ""
 
     res = supabase_execute(
         lambda: supabase.table('user_validations')
@@ -1944,11 +1962,11 @@ def format_voice_analysis_reply_text(user_id):
             }).eq('user_id', user_id).execute(),
             label="음성검증 확인정보 저장(비동기 파이프라인)"
         )
-        return f"🔵 자동분석 결과를 조회했습니다.\n{report_text}\n\n{FINAL_APPROVAL_WAIT_TEXT}"
+        return f"🔵 자동분석 결과를 조회했습니다.\n{report_text}\n\n{FINAL_APPROVAL_WAIT_TEXT}", claimed_gender
 
     # state가 "에러"이거나 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두
     # 신입에게는 똑같이 '진행 중'으로만 안내한다. 에러 상세는 운영진이 N번방 확인 시에만 본다.
-    return PENDING_TEXT_FOR_MEMBER
+    return PENDING_TEXT_FOR_MEMBER, claimed_gender
 
 
 if __name__ == "__main__":
