@@ -38,13 +38,22 @@ import hashlib  # 파일 상단 import 구역에 추가
 import requests
 
 # ✨ [변경됨] 단일 VOICE_SERVICE_URL → 콤마 구분 리스트로 확장 (하위호환: 리스트가 비어있으면
-# 기존 VOICE_SERVICE_URL 단일값을 그대로 사용)
+def _parse_url_list(raw: str) -> list:
+    """콤마로 구분된 URL 목록을 파싱합니다. 앞뒤 공백/슬래시 제거."""
+    return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+
 _raw_urls = os.environ.get("VOICE_SERVICE_URLS", "")
-VOICE_SERVICE_URLS = [u.strip().rstrip("/") for u in _raw_urls.split(",") if u.strip()]
+VOICE_SERVICE_URLS = _parse_url_list(_raw_urls)
 if not VOICE_SERVICE_URLS:
-    _legacy_url = os.environ.get("VOICE_SERVICE_URL", "").strip()
-    if _legacy_url:
-        VOICE_SERVICE_URLS = [_legacy_url.rstrip("/")]
+    # ✨ [수정됨] 변수명을 VOICE_SERVICE_URL(기존 단수형)로 잘못 넣어도, 콤마가 섞여 있으면
+    # 여기서도 동일하게 split해서 방어한다 (이전 버전의 버그: split 없이 통째로 넣어서
+    # "url1,url2,url3"이 하나의 target_url로 취급되던 문제 수정)
+    VOICE_SERVICE_URLS = _parse_url_list(os.environ.get("VOICE_SERVICE_URL", ""))
+
+if not VOICE_SERVICE_URLS:
+    print("⚠️ VOICE_SERVICE_URLS(또는 VOICE_SERVICE_URL) 환경변수가 설정되지 않았습니다.")
+else:
+    print(f"✅ voice-service 인스턴스 {len(VOICE_SERVICE_URLS)}개 로드됨: {VOICE_SERVICE_URLS}")
 VOICE_SERVICE_API_KEY = os.environ.get("VOICE_SERVICE_API_KEY", "")
 # Cloud Run이 무료 티어 안에서 스케일-투-제로로 동작하면 콜드스타트(첫 요청 시
 # 모델 로딩)에 시간이 걸릴 수 있어서 넉넉하게 잡습니다.
