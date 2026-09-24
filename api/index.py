@@ -1317,7 +1317,7 @@ def handle_message(event):
         # ✨ [추가됨] '승인대기' 상태에서 온 "확인" -> '/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임으로 채워서 전송하고 '닉변대기'로 전환
         # (남성은 보통 운영진이 먼저 '/ㅇㅈ 4번' 멘트를 보낸 뒤 이 "확인"을 받지만, 여성은 '4번' 과정 없이
         #  '문제없음' 확인 직후 바로 이 "확인"을 받아도 동일하게 진행됩니다 — 코드상 '4번' 발송 여부는 확인하지 않습니다.)
-                if current_status_for_check == "승인대기":
+        if current_status_for_check == "승인대기":
             row = get_validation_row(user_id, "nickname, birth_year, gender")
             nickname = row.get('nickname') or ""
             birth_year = row.get('birth_year') or ""
