@@ -162,15 +162,16 @@ def insert_voice_profile(
     storage_path,
     nickname="",
     user_id=None,
-    member_id=None,
     estimated_gender=None,
     pitch_hz=None,
     source="new_member",
 ):
-    """voice_profiles 테이블에 한 건 저장합니다."""
+    """voice_profiles 테이블에 한 건 저장합니다.
+    ✨ [수정됨] member_id 필드 제거 — voice-service/app.py의 insert_voice_profile()이
+    실제 스키마 기준(app.py가 백그라운드 분석 결과를 직접 저장하는 쪽이므로 이게 정본)이며,
+    거기엔 member_id 컬럼이 없습니다. 여기서도 동일하게 맞춥니다."""
     row = {
         "user_id": user_id,
-        "member_id": member_id,
         "nickname": nickname,
         "storage_path": storage_path,
         "embedding": embedding,
@@ -182,10 +183,10 @@ def insert_voice_profile(
 
 
 def match_blacklist_voices(supabase, embedding, match_count: int = 5):
-    """블랙리스트(members)로 등록된 음성들 중 이 임베딩과 가장 유사한 것들을 찾습니다.
+    """블랙리스트로 등록된 음성들 중 이 임베딩과 가장 유사한 것들을 찾습니다.
     Postgres 쪽 match_voice_profiles() 함수(코사인 유사도, pgvector)를 RPC로 호출합니다.
 
-    반환: [{"id":.., "member_id":.., "nickname":.., "similarity": 0.0~1.0}, ...] (유사도 내림차순)
+    반환: [{"id":.., "nickname":.., "gender":.., "status":.., "similarity": 0.0~1.0}, ...] (유사도 내림차순)
     """
     try:
         res = supabase.rpc(
@@ -215,7 +216,7 @@ def analyze_new_member_voice(
     반환 예:
     {
         "estimated_gender": "여", "pitch_hz": 210.3,
-        "matches": [{"nickname": "골드", "similarity": 0.93, "member_id": 1482}, ...],
+        "matches": [{"nickname": "골드", "similarity": 0.93, ...}, ...],
         "storage_path": "new_member/Uxxxx_1234567890.m4a",
         "error": None,
     }
@@ -253,6 +254,94 @@ def analyze_new_member_voice(
             result["matches"] = match_blacklist_voices(supabase, embedding)
     except Exception as e:
         print(f"⚠️ 음성 자동분석 파이프라인 실패(수동 인증 흐름은 계속 진행됨): {e}")
+        result["error"] = str(e)
+
+    return result
+
+
+# ==========================================
+# ✨ [추가됨] 관리자방 '/음성업로드' — 운영진이 직접 제출한 음성을 블랙리스트에 수동 등록
+# ==========================================
+def insert_blacklist_validation(supabase, *, nickname="", gender="", black_reason="", registered_by=""):
+    """관리자가 '/음성업로드'로 수동 등록하는 블랙리스트 인물을 user_validations 테이블에 저장합니다.
+    (별도의 members 테이블은 쓰지 않고, 기존 신입 검증에 쓰는 user_validations를 그대로 재사용합니다.)
+
+    실제 LINE 유저가 아니므로 고유한 가짜 user_id(BL_타임스탬프_닉네임)를 발급해서 사용합니다.
+    이렇게 하면 기존 1번 양식 제출 시 닉네임/블랙사유 중복검사 로직(handle_message의
+    "DB 중복/블랙리스트 조회" 구간)이 이 레코드를 그대로 블랙리스트로 잡아냅니다.
+
+    반환: 생성된 user_id (실패 시 None)
+    """
+    if not supabase:
+        return None
+
+    synthetic_user_id = f"BL_{int(time.time())}_{(nickname or 'unknown').strip()}"
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    row = {
+        "user_id": synthetic_user_id,
+        "nickname": nickname,
+        "gender": gender,
+        "black_reason": black_reason,
+        "status": "블랙",
+        "entry_date": datetime.datetime.now(kst).strftime("%Y-%m-%d"),
+        "details": {"registered_by": registered_by, "source": "admin_voice_upload"},
+    }
+    try:
+        supabase.table("user_validations").insert(row).execute()
+        return synthetic_user_id
+    except Exception as e:
+        print(f"⚠️ 블랙리스트 user_validations 등록 실패: {e}")
+        return None
+
+
+def process_admin_blacklist_voice_upload(
+    supabase, configuration, *, message_id, nickname, gender, black_reason="", registered_by="",
+    storage_prefix="admin_blacklist",
+):
+    """운영진이 '/음성업로드'로 직접 제출한 음성을 분석해 블랙리스트(user_validations + voice_profiles)에
+    등록하는 파이프라인입니다. analyze_new_member_voice()와 거의 동일하되,
+    - 가짜 user_id로 user_validations에 블랙 레코드를 새로 만들어서 연결하고
+    - voice_profiles.source를 'admin_blacklist_upload'로 남깁니다.
+    실패해도 예외를 던지지 않고 부분 결과(dict)를 돌려줍니다.
+    """
+    result = {
+        "blacklist_user_id": None,
+        "estimated_gender": None,
+        "pitch_hz": None,
+        "matches": [],
+        "storage_path": None,
+        "error": None,
+    }
+    try:
+        raw_bytes = download_line_audio(message_id, configuration)
+        analysis = analyze_audio_via_cloud_run(raw_bytes)
+        embedding = analysis.get("embedding")
+        result["estimated_gender"] = analysis.get("estimated_gender")
+        result["pitch_hz"] = analysis.get("pitch_hz")
+
+        # 등록 전에 기존 블랙리스트와 먼저 대조 (같은 인물 중복 등록 여부 확인용)
+        if embedding:
+            result["matches"] = match_blacklist_voices(supabase, embedding)
+
+        blacklist_user_id = insert_blacklist_validation(
+            supabase, nickname=nickname, gender=gender,
+            black_reason=black_reason, registered_by=registered_by,
+        )
+        result["blacklist_user_id"] = blacklist_user_id
+
+        storage_path = f"{storage_prefix}/{(blacklist_user_id or nickname or 'unknown')}_{int(time.time())}.m4a"
+        upload_voice_sample(supabase, raw_bytes, storage_path)
+        result["storage_path"] = storage_path
+
+        if embedding:
+            insert_voice_profile(
+                supabase, embedding=embedding, storage_path=storage_path,
+                nickname=nickname, user_id=blacklist_user_id,
+                estimated_gender=result["estimated_gender"], pitch_hz=result["pitch_hz"],
+                source="admin_blacklist_upload",
+            )
+    except Exception as e:
+        print(f"⚠️ 관리자 블랙리스트 음성 업로드 파이프라인 실패: {e}")
         result["error"] = str(e)
 
     return result
