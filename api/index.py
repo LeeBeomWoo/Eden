@@ -646,7 +646,11 @@ def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
     if not current_name or not birth_year or not nickname:
         return False
     current_clean = current_name.replace(" ", "")
-    return (str(birth_year).strip() in current_clean) and (str(nickname).strip() in current_clean)
+    
+    # ✨ [수정됨] 넘어온 생년(4자리)을 무조건 2자리로 자른 뒤 검사
+    short_year = str(birth_year)[-2:].strip()
+    
+    return (short_year in current_clean) and (str(nickname).strip() in current_clean)
 
 
 def has_blacklist_issue(user_id):
@@ -1313,26 +1317,28 @@ def handle_message(event):
         # ✨ [추가됨] '승인대기' 상태에서 온 "확인" -> '/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임으로 채워서 전송하고 '닉변대기'로 전환
         # (남성은 보통 운영진이 먼저 '/ㅇㅈ 4번' 멘트를 보낸 뒤 이 "확인"을 받지만, 여성은 '4번' 과정 없이
         #  '문제없음' 확인 직후 바로 이 "확인"을 받아도 동일하게 진행됩니다 — 코드상 '4번' 발송 여부는 확인하지 않습니다.)
-        if current_status_for_check == "승인대기":
+                if current_status_for_check == "승인대기":
             row = get_validation_row(user_id, "nickname, birth_year, gender")
             nickname = row.get('nickname') or ""
             birth_year = row.get('birth_year') or ""
             gender = row.get('gender') or ""
-            # 여성은 닉네임 뒤에 붙는 이모지만 다르게(⚖️), 그 외(남성 등)는 기존과 동일(🧨)
             nickname_emoji = "⚖️" if gender in ("여", "여자") else "🧨"
+
+            # ✨ [수정됨] 생년을 뒤에서 2자리만 추출 (예: "1998" -> "98")
+            short_year = str(birth_year)[-2:] if birth_year else ""
 
             nickchange_template = search_keyword("닉변")
             if nickchange_template:
                 nickchange_text = (
                     nickchange_template
-                    .replace("{생년}", birth_year).replace("{birth_year}", birth_year)
+                    .replace("{생년}", short_year).replace("{birth_year}", short_year)
                     .replace("{닉네임}", nickname).replace("{nickname}", nickname)
                     .replace("{닉네임이모지}", nickname_emoji).replace("{emoji}", nickname_emoji)
                 )
             else:
                 nickchange_text = (
                     "닉네임을 아래 형식으로 복사하여 변경해 주세요.\n\n"
-                    f"{birth_year} {nickname}{nickname_emoji}\n\n"
+                    f"{short_year} {nickname}{nickname_emoji}\n\n"  # 👈 여기도 short_year 적용
                     "변경 후 프로필 사진도 도용 사진이 아닌 사진으로 설정해 주시고, '변경완료'라고 답장해 주세요."
                 )
 
