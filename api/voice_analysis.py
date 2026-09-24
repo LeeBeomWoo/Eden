@@ -34,27 +34,48 @@ analyze_new_member_voice()는 내부에서 발생하는 모든 예외(Cloud Run 
 import os
 import time
 import datetime
-
+import hashlib  # 파일 상단 import 구역에 추가
 import requests
 
-VOICE_SERVICE_URL = os.environ.get("VOICE_SERVICE_URL", "")
+# ✨ [변경됨] 단일 VOICE_SERVICE_URL → 콤마 구분 리스트로 확장 (하위호환: 리스트가 비어있으면
+# 기존 VOICE_SERVICE_URL 단일값을 그대로 사용)
+_raw_urls = os.environ.get("VOICE_SERVICE_URLS", "")
+VOICE_SERVICE_URLS = [u.strip().rstrip("/") for u in _raw_urls.split(",") if u.strip()]
+if not VOICE_SERVICE_URLS:
+    _legacy_url = os.environ.get("VOICE_SERVICE_URL", "").strip()
+    if _legacy_url:
+        VOICE_SERVICE_URLS = [_legacy_url.rstrip("/")]
 VOICE_SERVICE_API_KEY = os.environ.get("VOICE_SERVICE_API_KEY", "")
 # Cloud Run이 무료 티어 안에서 스케일-투-제로로 동작하면 콜드스타트(첫 요청 시
 # 모델 로딩)에 시간이 걸릴 수 있어서 넉넉하게 잡습니다.
 VOICE_SERVICE_TIMEOUT = 90
 
+def get_voice_service_url(room_id: str = None) -> str:
+    """room_id를 해시해서 VOICE_SERVICE_URLS 중 하나를 결정적으로 골라 돌려줍니다.
+    같은 방은 항상 같은 인스턴스로 가고(웜업 효율 유지), 방이 다르면 3대에 분산됩니다.
+    room_id가 없으면(관리자방 수동 업로드 등) 항상 첫 번째 URL을 씁니다.
+    설정된 URL이 하나도 없으면 빈 문자열을 돌려줍니다.
+    """
+    if not VOICE_SERVICE_URLS:
+        return ""
+    if len(VOICE_SERVICE_URLS) == 1 or not room_id:
+        return VOICE_SERVICE_URLS[0]
+    digest = hashlib.md5(str(room_id).encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(VOICE_SERVICE_URLS)
+    return VOICE_SERVICE_URLS[idx]
 
-def analyze_audio_via_cloud_run(raw_audio_bytes: bytes) -> dict:
+def analyze_audio_via_cloud_run(raw_audio_bytes: bytes, room_id: str = None) -> dict:
+    target_url = get_voice_service_url(room_id)
+    if not target_url:
+        raise RuntimeError("VOICE_SERVICE_URLS(또는 VOICE_SERVICE_URL) 환경변수가 설정되지 않았습니다.")
     """Cloud Run의 /analyze 엔드포인트에 원본 오디오를 보내고 결과를 받아옵니다.
 
     반환: {"embedding": [...], "estimated_gender": "남"|"여"|None, "pitch_hz": float|None}
     실패 시 예외를 던집니다 (호출부 analyze_new_member_voice가 잡아서 처리).
     """
-    if not VOICE_SERVICE_URL:
-        raise RuntimeError("VOICE_SERVICE_URL 환경변수가 설정되지 않았습니다.")
 
     resp = requests.post(
-        f"{VOICE_SERVICE_URL.rstrip('/')}/analyze",
+        f"{target_url}/analyze",
         files={"audio": ("audio", raw_audio_bytes)},
         headers={"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {},
         timeout=VOICE_SERVICE_TIMEOUT,
@@ -96,7 +117,8 @@ def mark_voice_analysis_state(supabase, user_id, state, *, result=None, error=No
         print(f"⚠️ voice_analysis_state 업데이트 실패: {e}")
 
 
-def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname=""):
+def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname="", room_id=None):
+    mark_voice_analysis_state(supabase, user_id, "처리중")
     """오디오 도착 시점(index.py의 handle_audio)에 호출됩니다. Cloud Run의 /analyze-async에
     '접수'만 시키고 결과는 기다리지 않습니다 — 실제 분석/저장/최종 상태 기록은 Cloud Run(app.py)이
     백그라운드로 전부 끝낸 뒤 Supabase에 직접 씁니다.
@@ -105,7 +127,6 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
     실패하면(다운로드 실패, URL 미설정, 네트워크 에러 등) 상태를 바로 '에러'로 남겨서
     '문제없음' 답장 시 즉시 🔴로 안내되고 운영진 수동 확인으로 넘어가게 합니다.
     """
-    mark_voice_analysis_state(supabase, user_id, "처리중")
 
     try:
         audio_bytes = download_line_audio(message_id, configuration)
@@ -113,20 +134,18 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
         mark_voice_analysis_state(supabase, user_id, "에러", error=f"LINE 오디오 다운로드 실패: {e}")
         return
 
-    if not VOICE_SERVICE_URL:
-        mark_voice_analysis_state(supabase, user_id, "에러", error="VOICE_SERVICE_URL 미설정")
+    target_url = get_voice_service_url(room_id)
+    if not target_url:
+        mark_voice_analysis_state(supabase, user_id, "에러", error="VOICE_SERVICE_URLS 미설정")
         return
 
     headers = {"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {}
     try:
         resp = requests.post(
-            f"{VOICE_SERVICE_URL.rstrip('/')}/analyze-async",
+            f"{target_url}/analyze-async",
             files={"audio": ("audio", audio_bytes)},
             data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
             headers=headers,
-            # (연결 10초, 응답대기 20초) — /analyze-async는 이제 분석을 끝낸 뒤에야 응답하므로,
-            # 이 요청은 사실상 거의 항상 ReadTimeout으로 끝나는 게 정상이다. 그건 접수 실패가
-            # 아니라 "분석이 오래 걸리고 있다"는 뜻일 뿐이므로 아래에서 별도로 무시 처리한다.
             timeout=(10, 20),
         )
         resp.raise_for_status()
@@ -296,7 +315,7 @@ def insert_blacklist_validation(supabase, *, nickname="", gender="", black_reaso
 
 def process_admin_blacklist_voice_upload(
     supabase, configuration, *, message_id, nickname, gender, black_reason="", registered_by="",
-    storage_prefix="admin_blacklist",
+    storage_prefix="admin_blacklist", room_id=None,
 ):
     """운영진이 '/음성업로드'로 직접 제출한 음성을 분석해 블랙리스트(user_validations + voice_profiles)에
     등록하는 파이프라인입니다. analyze_new_member_voice()와 거의 동일하되,
@@ -314,7 +333,7 @@ def process_admin_blacklist_voice_upload(
     }
     try:
         raw_bytes = download_line_audio(message_id, configuration)
-        analysis = analyze_audio_via_cloud_run(raw_bytes)
+        analysis = analyze_audio_via_cloud_run(raw_bytes, room_id=room_id)
         embedding = analysis.get("embedding")
         result["estimated_gender"] = analysis.get("estimated_gender")
         result["pitch_hz"] = analysis.get("pitch_hz")
