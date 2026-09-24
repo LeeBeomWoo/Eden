@@ -54,6 +54,11 @@ def warmup_voice_service():
 # 인증자방(관리자 그룹방) ID 고정 설정
 ADMIN_GROUP_CHAT_ID = "C1fdb3b771a6bd0686fa7dbf1b5145a70"
 
+# ✨ [추가됨] 같은 코드를 여러 클라우드런 인스턴스에 올려서, 인증방별로 처리를 나눠 맡기기 위한 설정.
+# 이 서비스 자신의 클라우드런 URL(예: https://xxxx-uc.a.run.app)을 배포 시 환경변수로 넣어준다.
+# (인스턴스마다 이 값만 다르게 설정하면 됨 — 나머지 코드/환경변수는 동일해도 무방)
+MY_SERVICE_URL = os.environ.get("MY_SERVICE_URL", "").strip().rstrip("/")
+
 # 환경변수 설정 및 핸들러 초기화
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
@@ -395,6 +400,47 @@ def get_room_id_by_name(room_name):
     return None
 
 
+# ✨ [추가됨] 인증방별 클라우드런 라우팅
+def get_forward_target_url(raw_body):
+    """이 웹훅 이벤트가 어느 방(그룹)에서 왔는지 확인해서, 그 방을 담당하는 클라우드런
+    URL이 '방관리' 시트(=room_management 테이블, service_url 열)에 등록돼 있고
+    그게 지금 이 서비스(MY_SERVICE_URL) 자신이 아니면 그 URL을 돌려준다.
+
+    담당 URL을 못 찾거나, 그룹 이벤트가 아니거나, 담당이 곧 나 자신이면 None을 돌려주고
+    (= 지금 이 서비스에서 그대로 처리), 조회 자체가 실패해도 None을 돌려줘서
+    최소한 이 서비스에서라도 처리를 시도하게 한다 (라우팅 실패가 인증 자체를 막으면 안 되므로).
+    """
+    if not supabase or not MY_SERVICE_URL:
+        return None
+    try:
+        payload = json.loads(raw_body)
+        events = payload.get("events") or []
+        if not events:
+            return None
+        source = events[0].get("source") or {}
+        group_id = source.get("groupId") or source.get("roomId")
+        if not group_id or group_id == ADMIN_GROUP_CHAT_ID:
+            # 1:1 대화이거나 관리자방(공통) 이벤트는 라우팅하지 않고 받은 서비스가 그대로 처리
+            return None
+    except Exception as e:
+        print(f"⚠️ 라우팅용 이벤트 파싱 실패(이 서비스에서 직접 처리): {e}")
+        return None
+
+    res = supabase_execute(
+        lambda: supabase.table('room_management').select('service_url').eq('room_id', group_id).limit(1).execute(),
+        label="방 담당 서비스 URL 조회"
+    )
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        return None
+
+    target_url = (rows[0].get('service_url') or "").strip().rstrip("/")
+    if not target_url or target_url == MY_SERVICE_URL:
+        return None
+
+    return f"{target_url}/api"
+
+
 # ==========================================
 # ✨ [추가됨] 구글시트 → DB 동기화용 안전장치
 # ==========================================
@@ -677,6 +723,24 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
 def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
+
+    # ✨ [추가됨] 같은 코드가 올라간 다른 클라우드런 인스턴스가 이 방을 담당하고 있으면
+    # 원본 요청을 그대로 그쪽으로 넘기고, 여기서는 처리하지 않는다.
+    # (서명은 채널 시크릿+바디로 계산되므로, 바디/시그니처를 그대로 전달하면
+    #  받는 쪽에서도 서명 검증이 정상적으로 통과한다)
+    try:
+        forward_url = get_forward_target_url(body)
+        if forward_url:
+            requests.post(
+                forward_url,
+                data=body.encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Line-Signature": signature},
+                timeout=10,
+            )
+            return 'OK'
+    except Exception as e:
+        print(f"⚠️ 다른 인스턴스로 전달 실패(이 서비스에서 직접 처리 시도): {e}")
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -848,7 +912,14 @@ def handle_message(event):
                             r_name = str(row[keys[0]]).replace(" ", "")
                             r_id = str(row[keys[1]]).strip()
                             if r_name and r_id:
-                                room_records.append({"room_name": r_name, "room_id": r_id})
+                                record = {"room_name": r_name, "room_id": r_id}
+                                # ✨ [추가됨] 3번째 열(담당 클라우드런 URL)이 있으면 같이 저장.
+                                # 없는 방(빈 칸)은 담당 지정 안 함 = 받은 서비스가 그대로 처리.
+                                if len(keys) >= 3:
+                                    r_service_url = str(row[keys[2]]).strip().rstrip("/")
+                                    if r_service_url:
+                                        record["service_url"] = r_service_url
+                                room_records.append(record)
                     if room_records and supabase:
                         supabase.table('room_management').delete().neq('room_name', '_DELETE_ALL_KEY_').execute()
                         process_in_chunks('room_management', room_records, is_insert=True)
