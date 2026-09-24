@@ -33,7 +33,7 @@ from linebot.v3.webhooks import (
 )
 
 # ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
-from voice_analysis import submit_voice_analysis_job
+from voice_analysis import submit_voice_analysis_job, process_admin_blacklist_voice_upload
 
 app = Flask(__name__)
 
@@ -1018,6 +1018,46 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
 
+        # ✨ [추가됨] /음성업로드 — 운영진이 임의로 음성을 제출해 블랙리스트에 수동 등록
+        elif command_body.startswith("음성업로드"):
+            rest = command_body[len("음성업로드"):].strip()
+
+            if rest in ("취소", "취소하기", "cancel"):
+                del_user_session(event.source.user_id)
+                reply_text = "🗑️ 음성 업로드 요청이 취소되었습니다."
+            elif not rest:
+                reply_text = (
+                    "사용법: /음성업로드 닉네임 성별 [사유]\n"
+                    "예) /음성업로드 홍길동 남 도촬유포\n\n"
+                    "입력 후 이어서 음성 파일을 보내주시면 자동 분석 후 블랙리스트에 등록됩니다.\n"
+                    "취소하려면 /음성업로드 취소"
+                )
+            else:
+                upload_args = rest.split(maxsplit=2)
+                if len(upload_args) < 2:
+                    reply_text = "닉네임과 성별은 필수입니다.\n사용법: /음성업로드 닉네임 성별 [사유]"
+                else:
+                    up_nickname, up_gender = upload_args[0], upload_args[1]
+                    up_reason = upload_args[2] if len(upload_args) >= 3 else ""
+
+                    set_user_session(event.source.user_id, {
+                        "pending_blacklist_voice_upload": {
+                            "nickname": up_nickname, "gender": up_gender, "reason": up_reason,
+                        }
+                    }, ttl=600)
+
+                    reply_text = (
+                        f"📤 블랙리스트 음성 업로드 준비 완료\n\n"
+                        f"- 닉네임: {up_nickname}\n- 성별: {up_gender}\n- 사유: {up_reason or '(미입력)'}\n\n"
+                        f"🎤 이제 음성 파일을 보내주세요."
+                    )
+
+            if reply_text:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+                return
+
         # 2) /O번방 확인 명령어
         elif "확인" in command_body:
             room_name_input = command_body.replace("확인", "").strip()
@@ -1905,6 +1945,62 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
 
 
 # ==========================================
+# ✨ [추가됨] 관리자방 '/음성업로드' — 운영진이 직접 제출한 음성을 블랙리스트에 수동 등록
+# ==========================================
+def handle_admin_blacklist_voice_upload(event, admin_user_id):
+    """관리자방에서 '/음성업로드' 명령 직후 도착한 음성 메시지를 처리합니다.
+    대기 중인 업로드 요청(pending_blacklist_voice_upload)이 없으면 조용히 무시합니다
+    (관리자방에는 인증과 무관한 음성이 오갈 수 있으므로)."""
+    session_data = get_user_session(admin_user_id) or {}
+    pending = session_data.get("pending_blacklist_voice_upload") if isinstance(session_data, dict) else None
+    if not pending:
+        return
+
+    del_user_session(admin_user_id)  # 1회성 소모 (중복 처리 방지)
+
+    nickname = pending.get("nickname", "")
+    gender = pending.get("gender", "")
+    reason = pending.get("reason", "")
+
+    result = process_admin_blacklist_voice_upload(
+        supabase, configuration,
+        message_id=event.message.id, nickname=nickname, gender=gender,
+        black_reason=reason, registered_by=admin_user_id,
+    )
+
+    if result.get("error"):
+        reply_text = f"❌ 음성 분석/업로드 중 오류가 발생했습니다: {result['error']}"
+    else:
+        lines = [f"✅ 블랙리스트 음성 등록 완료 — {nickname} ({gender})"]
+        if reason:
+            lines.append(f"- 사유: {reason}")
+        if result.get("blacklist_user_id"):
+            lines.append(f"- 등록 ID: {result['blacklist_user_id']}")
+        if result.get("pitch_hz"):
+            lines.append(f"- 분석 피치: {result['pitch_hz']}Hz (추정 성별: {result.get('estimated_gender') or '알수없음'})")
+
+        matches = result.get("matches") or []
+        strong = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
+        if strong:
+            lines.append("\n⚠️ 기존 블랙리스트와 매우 유사한 음성이 있습니다 (중복 인물 가능성):")
+            for m in strong:
+                similarity = (m.get("similarity") or 0) * 100
+                lines.append(f"  └ {m.get('nickname', '알 수 없음')} / 일치율: {similarity:.1f}%")
+        elif matches:
+            top = matches[0]
+            top_sim = (top.get("similarity") or 0) * 100
+            lines.append(f"\n(참고) 가장 유사한 기존 기록: {top.get('nickname','알수없음')} / 일치율 {top_sim:.1f}%")
+
+        reply_text = "\n".join(lines)
+
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+        )
+
+
+# ==========================================
 # [핸들러 4] 📌 음성 메시지 처리 핸들러 (마지막 입장 유저만 작동)
 # ==========================================
 @handler.add(MessageEvent, message=AudioMessageContent)
@@ -1914,6 +2010,12 @@ def handle_audio(event):
         return
 
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', event.source.user_id))
+
+    # ✨ [추가됨] 관리자방에서 '/음성업로드' 명령 직후 온 음성 -> 블랙리스트 수동 등록 플로우로 분기.
+    # (신입 검증용 last-joined 체크는 적용하지 않는다 — 운영진 본인이 보내는 음성이므로.)
+    if source_id == ADMIN_GROUP_CHAT_ID:
+        handle_admin_blacklist_voice_upload(event, user_id)
+        return
 
     if not is_last_joined_user(source_id, user_id):
         return
