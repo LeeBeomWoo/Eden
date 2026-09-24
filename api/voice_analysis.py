@@ -32,10 +32,24 @@ analyze_new_member_voice()는 내부에서 발생하는 모든 예외(Cloud Run 
 """
 
 import os
+import re
 import time
 import datetime
 import hashlib  # 파일 상단 import 구역에 추가
 import requests
+
+
+def safe_storage_key(text: str, fallback: str = "unknown") -> str:
+    """Supabase Storage 경로(오브젝트 키)에 안전하게 쓸 수 있도록 문자열을 정제합니다.
+
+    ✨ [추가됨] 한글 등 비-ASCII 문자가 storage_path에 그대로 들어가면 supabase-py가
+    내부적으로 이 경로를 HTTP 요청 헤더/URL에 실어 보내는 과정에서 인코딩 에러
+    (latin-1/UnicodeEncodeError 등)로 업로드가 실패하는 문제가 있었습니다.
+    한글(닉네임 등)은 영숫자/일부 기호만 남기고 전부 언더스코어로 치환합니다."""
+    if not text:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(text)).strip("_")
+    return cleaned or fallback
 
 # ✨ [변경됨] 단일 VOICE_SERVICE_URL → 콤마 구분 리스트로 확장 (하위호환: 리스트가 비어있으면
 def _parse_url_list(raw: str) -> list:
@@ -264,7 +278,10 @@ def analyze_new_member_voice(
         result["estimated_gender"] = analysis.get("estimated_gender")
         result["pitch_hz"] = analysis.get("pitch_hz")
 
-        storage_path = f"{storage_prefix}/{user_id}_{int(time.time())}.m4a"
+        # ✨ [수정됨] storage_path는 항상 ASCII로만 구성한다 (한글 닉네임 등이 섞이면
+        # Supabase Storage 업로드가 실패할 수 있음). LINE user_id는 보통 이미 ASCII지만
+        # 방어적으로 한 번 더 정제한다.
+        storage_path = f"{storage_prefix}/{safe_storage_key(user_id)}_{int(time.time())}.m4a"
         upload_voice_sample(supabase, raw_bytes, storage_path)
         result["storage_path"] = storage_path
 
@@ -357,7 +374,10 @@ def process_admin_blacklist_voice_upload(
         )
         result["blacklist_user_id"] = blacklist_user_id
 
-        storage_path = f"{storage_prefix}/{(blacklist_user_id or nickname or 'unknown')}_{int(time.time())}.m4a"
+        # ✨ [수정됨] blacklist_user_id(=BL_타임스탬프_닉네임)에 한글 닉네임이 그대로 들어있거나,
+        # 그마저 없어 nickname을 바로 쓰는 경우 모두 storage_path에 한글이 섞여 Supabase
+        # Storage 업로드가 실패했다. safe_storage_key로 한글/특수문자를 언더스코어로 치환한다.
+        storage_path = f"{storage_prefix}/{safe_storage_key(blacklist_user_id or nickname)}_{int(time.time())}.m4a"
         upload_voice_sample(supabase, raw_bytes, storage_path)
         result["storage_path"] = storage_path
 
