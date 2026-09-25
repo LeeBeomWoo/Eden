@@ -2166,13 +2166,17 @@ def format_voice_analysis_reply_text(user_id):
         supabase_execute(
             lambda: supabase.table('user_validations').update({
                 # ✨ 기존 'N번방 확인' 명령어(format_voice_check_status)가 이 두 컬럼을 그대로 읽으므로
-                # 하위 호환을 위해 함께 채워 둔다.
+                # 하위 호환을 위해 함께 채워 둔다. (상세 리포트는 DB/운영진용으로만 보관 — 신입에게는
+                # 아래에서 별도의 간결한 문구만 보낸다)
                 "voice_checked_at": datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M"),
                 "voice_check_report": report_text,
             }).eq('user_id', user_id).execute(),
             label="음성검증 확인정보 저장(비동기 파이프라인)"
         )
-        return f"🔵 자동분석 결과를 조회했습니다.\n{report_text}\n\n{FINAL_APPROVAL_WAIT_TEXT}", claimed_gender
+        # ✨ [수정됨] report_text(블랙리스트 대조 대상 닉네임/일치율 등 상세 내용)는 절대 신입 본인
+        # 채팅방에 그대로 보내지 않는다 — 운영진 참고용 알림(notify_admin_voice_analysis)과
+        # 'N번방 확인' 명령어로만 확인 가능하다. 신입에게는 완료 여부만 간결하게 안내한다.
+        return f"🔵 자동분석이 완료되었습니다.\n\n{FINAL_APPROVAL_WAIT_TEXT}", claimed_gender
 
     # state가 "에러"이거나 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두
     # 신입에게는 똑같이 '진행 중'으로만 안내한다. 에러 상세는 운영진이 N번방 확인 시에만 본다.
