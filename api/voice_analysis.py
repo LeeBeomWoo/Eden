@@ -40,6 +40,7 @@ import os
 import re
 import time
 import datetime
+import threading
 
 import requests
 
@@ -51,6 +52,30 @@ VOICE_SERVICE_API_KEY = os.environ.get("VOICE_SERVICE_API_KEY", "")
 # Cloud Run이 무료 티어 안에서 스케일-투-제로로 동작하면 콜드스타트(첫 요청 시
 # 모델 로딩)에 시간이 걸릴 수 있어서 넉넉하게 잡습니다.
 VOICE_SERVICE_TIMEOUT = 90
+
+# ✨ [추가됨] Cloud Run 인스턴스 하나당(같은 target_url끼리) 이 간격(초) 이상 벌려서
+# 요청을 보냅니다. 신입이 한꺼번에 여러 명 들어와 음성을 동시에 보내면 같은 인스턴스로
+# 분석 요청이 몰려 리소스(CPU/메모리) 부족으로 500이 나기 쉬운데, 그걸 완화합니다.
+# 0으로 설정하면 기존처럼 제한 없이 즉시 보냅니다.
+VOICE_SERVICE_MIN_INTERVAL_SEC = float(os.environ.get("VOICE_SERVICE_MIN_INTERVAL_SEC", "1.0"))
+
+_rate_lock = threading.Lock()
+_last_call_at = {}  # target_url -> 마지막 요청을 보낸 시각(time.monotonic())
+
+
+def _throttle(target_url: str):
+    """target_url로 나가는 요청 사이에 최소 VOICE_SERVICE_MIN_INTERVAL_SEC초 간격을 보장합니다.
+    이 프로세스(Flask 앱)가 계속 떠 있는 서버이기 때문에 인메모리 락만으로도 효과가 있습니다.
+    간격이 부족하면 그만큼만 짧게 sleep한 뒤 보냅니다 — 요청 자체를 취소하지는 않습니다."""
+    if VOICE_SERVICE_MIN_INTERVAL_SEC <= 0 or not target_url:
+        return
+    with _rate_lock:
+        now = time.monotonic()
+        last = _last_call_at.get(target_url, 0.0)
+        wait = VOICE_SERVICE_MIN_INTERVAL_SEC - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at[target_url] = time.monotonic()
 
 
 def safe_storage_key(text: str, fallback: str = "unknown") -> str:
@@ -136,6 +161,7 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
         return
 
     headers = {"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {}
+    _throttle(target_url)
     try:
         requests.post(
             f"{target_url}/analyze-async",
@@ -164,6 +190,7 @@ def analyze_audio_via_cloud_run(raw_audio_bytes: bytes, room_id: str = "") -> di
     if not target_url:
         raise RuntimeError("VOICE_SERVICE_URLS 환경변수가 설정되지 않았습니다.")
 
+    _throttle(target_url)
     resp = requests.post(
         f"{target_url}/analyze",
         files={"audio": ("audio", raw_audio_bytes)},
