@@ -1453,6 +1453,14 @@ def handle_message(event):
                     reply_messages.append(TextMessage(text=four_text))
                 else:
                     print(f"⚠️ user_id={user_id} '4번' 인증 멘트가 DB(auth_ments)에 등록되어 있지 않아 자동 발송을 건너뜁니다. 키워드 '4번'을 등록해 주세요.")
+            else:
+                # ✨ [수정됨] 여성은 '4번' 멘트를 보내지 않으므로, 신입 본인이 다음 단계로 넘어가려면
+                # "확인"이라고 답장해야 한다는 안내가 반드시 필요하다. FINAL_APPROVAL_WAIT_TEXT에는
+                # 이 안내가 없어서(운영진이 알려줄 것처럼만 되어 있음) 여성 신입이 "확인"을 보내지 않고
+                # '승인대기' 상태에 멈춰 있는 문제가 있었다.
+                reply_messages.append(TextMessage(
+                    text="위 내용이 맞다면 '확인'이라고 답장해 주세요."
+                ))
 
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
