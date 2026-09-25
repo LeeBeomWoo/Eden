@@ -81,8 +81,10 @@ def mark_voice_analysis_state(supabase, user_id, state, *, result=None, error=No
         print(f"⚠️ voice_analysis_state 업데이트 실패: {e}")
 
 
-def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname=""):
-    """Cloud Run에 분석을 비동기 접수하고, Vercel 과금 방어를 위해 0.1초 만에 응답 대기를 끊습니다."""
+def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, nickname="", source_id=""):
+    """
+    source_id(방 ID)를 받아서 해당 방에 매핑된 Cloud Run URL로 요청을 보냅니다.
+    """
     mark_voice_analysis_state(supabase, user_id, "처리중")
 
     try:
@@ -91,9 +93,11 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
         mark_voice_analysis_state(supabase, user_id, "에러", error=f"LINE 오디오 다운로드 실패: {e}")
         return
 
-    target_url = get_cloud_run_url(user_id)
+    # 1. 방 ID(source_id)에 해당하는 Cloud Run URL을 가져옵니다.
+    target_url = get_voice_service_url(source_id)  # 기존에 쓰시던 방 매핑 함수/변수 사용
+    
     if not target_url:
-        mark_voice_analysis_state(supabase, user_id, "에러", error="VOICE_SERVICE_URLS 미설정")
+        mark_voice_analysis_state(supabase, user_id, "에러", error="Cloud Run URL 매핑 실패")
         return
 
     headers = {"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {}
@@ -103,15 +107,13 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
             files={"audio": ("audio", audio_bytes)},
             data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
             headers=headers,
-            timeout=(3.0, 0.1),  # 연결 3초 대기, 전송 후 Read(응답 대기)는 0.1초 컷
+            timeout=(3.0, 0.1),  # 연결 3초, 대기 0.1초 컷 (Vercel 과금 방어 유지)
         )
     except requests.exceptions.ReadTimeout:
-        # Vercel 연결을 끊어서 발생하는 정상 동작이므로 예외 처리 후 정상 종료
-        pass
+        pass  # 0.1초 만에 끊어서 발생하는 정상 동작
     except Exception as e:
         mark_voice_analysis_state(supabase, user_id, "에러", error=f"클라우드런 접수 실패: {e}")
         return
-
 
 def analyze_audio_via_cloud_run(raw_audio_bytes: bytes, user_id: str = "") -> dict:
     """동기식 음성 분석 요청 (필요 시 사용)"""
