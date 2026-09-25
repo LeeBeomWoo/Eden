@@ -1726,6 +1726,35 @@ AUTOTUNE_ALERT_THRESHOLD = 50.0
 # 신청서 성별 표기("남"/"남자"/"여"/"여자")를 "남"/"여"로 정규화하기 위한 매핑
 _GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"}
 
+# ✨ [추가됨] 대조 결과로 보여줄 최대 후보 수 (너무 많으면 메시지가 길어지므로 상위 N개만)
+VOICE_MATCH_DISPLAY_LIMIT = 5
+
+
+def format_voice_match_lines(matches, limit=VOICE_MATCH_DISPLAY_LIMIT):
+    """블랙리스트 대조 결과(matches)를 유사도 내림차순으로 정렬해, 상위 `limit`건의
+    대조 대상 정보(닉네임/성별/상태)와 일치율을 사람이 읽기 좋은 줄 리스트로 만듭니다.
+
+    ✨ [추가됨] 예전에는 일치율이 VOICE_MATCH_ALERT_THRESHOLD(90%) 이상인 것만, 그마저
+    없으면 가장 유사한 1건만 보여줬습니다. 운영진이 "어떤 자료와 얼마나 일치했는지"를
+    임계치와 무관하게 항상 확인할 수 있도록, 매칭이 하나라도 있으면 상위 여러 건을
+    함께 보여주도록 변경했습니다. 임계치 이상인 건은 ⚠️로 강조 표시합니다."""
+    if not matches:
+        return []
+    sorted_matches = sorted(matches, key=lambda m: (m.get("similarity") or 0), reverse=True)
+    shown = sorted_matches[:limit]
+    lines = []
+    for m in shown:
+        similarity = (m.get("similarity") or 0) * 100
+        nickname = m.get("nickname", "알 수 없음")
+        match_gender = m.get("gender", "알 수 없음")
+        match_status = m.get("status", "상태 없음")
+        mark = "⚠️ " if similarity >= VOICE_MATCH_ALERT_THRESHOLD * 100 else "└ "
+        lines.append(f"  {mark}닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
+    remaining = len(sorted_matches) - len(shown)
+    if remaining > 0:
+        lines.append(f"  (그 외 {remaining}건 더 있음 — 유사도 낮음, 생략)")
+    return lines
+
 
 def build_voice_check_report_lines(*, claimed_gender, voice_result):
     """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
@@ -1757,15 +1786,15 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
         lines.append(f"- 오토튠/피치보정 의심도: {autotune_prob:.1f}% ({level}) — 참고용 정황 지표, 확정 판정 아님")
 
     matches = voice_result.get("matches") or []
-    strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
-    if strong_matches:
-        lines.append("- ⚠️⚠️ 블랙리스트 음성과 매우 유사 (동일인 의심):")
-        for m in strong_matches:
-            similarity = (m.get("similarity") or 0) * 100
-            nickname = m.get("nickname", "알 수 없음")
-            match_gender = m.get("gender", "알 수 없음")
-            match_status = m.get("status", "상태 없음")
-            lines.append(f"  └ 닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
+    if matches:
+        has_strong = any((m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
+        header = (
+            "- ⚠️⚠️ 블랙리스트 음성과 매우 유사한 대조 결과 (동일인 의심):"
+            if has_strong else
+            "- 블랙리스트 대조 결과 (임계치 미만 — 참고용):"
+        )
+        lines.append(header)
+        lines.extend(format_voice_match_lines(matches))
 
     # ✨ [추가됨] Cloud Run(app.py)이 80% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
     # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
@@ -1982,16 +2011,15 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
             lines.append(f"- 분석 피치: {result['pitch_hz']}Hz (추정 성별: {result.get('estimated_gender') or '알수없음'})")
 
         matches = result.get("matches") or []
-        strong = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
-        if strong:
-            lines.append("\n⚠️ 기존 블랙리스트와 매우 유사한 음성이 있습니다 (중복 인물 가능성):")
-            for m in strong:
-                similarity = (m.get("similarity") or 0) * 100
-                lines.append(f"  └ {m.get('nickname', '알 수 없음')} / 일치율: {similarity:.1f}%")
-        elif matches:
-            top = matches[0]
-            top_sim = (top.get("similarity") or 0) * 100
-            lines.append(f"\n(참고) 가장 유사한 기존 기록: {top.get('nickname','알수없음')} / 일치율 {top_sim:.1f}%")
+        if matches:
+            has_strong = any((m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
+            header = (
+                "\n⚠️ 기존 블랙리스트와 매우 유사한 음성이 있습니다 (중복 인물 가능성):"
+                if has_strong else
+                "\n(참고) 기존 블랙리스트 대조 결과:"
+            )
+            lines.append(header)
+            lines.extend(format_voice_match_lines(matches))
 
         reply_text = "\n".join(lines)
 
