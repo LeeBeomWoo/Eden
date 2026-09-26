@@ -1506,7 +1506,7 @@ def handle_message(event):
                 )
             sync_status_to_sheet(user_id, "헤르페스확인대기")
 
-            reply_text = "✅ 확인되었습니다. 위 안내 사항(질문 포함)에 답변해 주세요."
+            reply_text = "✅ 확인되었습니다. 위 헤르페스 관련 경험유무에 답변해 주세요. (없으면 없다, 경험이 있다면 있다. 혹은 현재 보균중이다)"
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
