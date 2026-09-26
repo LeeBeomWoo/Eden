@@ -1804,10 +1804,10 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
         lines.append(header)
         lines.extend(format_voice_match_lines(matches))
 
-    # ✨ [추가됨] Cloud Run(app.py)이 80% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
+    # ✨ [추가됨] Cloud Run(app.py)이 90% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
     # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
     if voice_result.get("is_strong_match"):
-        lines.append("- ℹ️ 블랙리스트 일치율 80% 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
+        lines.append("- ℹ️ 블랙리스트 일치율 90% 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
 
     # ✨ [추가됨] 분석 자체는 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우.
     # 신입에게는 노출되지 않고(🔵 완료로만 보임) 운영진만 이 리포트로 확인할 수 있다.
