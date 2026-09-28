@@ -813,6 +813,17 @@ def handle_message(event):
         parts = command.split(maxsplit=1)
         cmd_prefix = parts[0]
 
+        # ✨ 방(그룹) ID 확인: /방아이디, /방id  (어느 방에서든 동작)
+        if cmd_prefix.lower() in ("방아이디", "방id"):
+            gid = getattr(event.source, 'group_id', None) or getattr(event.source, 'room_id', None)
+            id_reply = f"이 방의 ID:\n{gid}" if gid else "그룹방이 아닙니다."
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=id_reply)])
+                )
+            return
+
         # 음성인증 멘트 수동 발송: /인증 음성인증, /ㅇㅈ 음성인증, /ㅇㅅㅇㅈ
         # (자동으로 "확인" 답장을 받아 진행되지 않았거나, 관리자가 직접 재발송해야 할 때 사용)
         voice_manual_trigger = (
@@ -1018,13 +1029,6 @@ def handle_message(event):
                     line_bot_api = MessagingApi(api_client)
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
-
-        elif command in ["방아이디", "방id"]:
-            if source_type == "group":
-                messages_to_send.append({"type": "text", "text": f"이 그룹방의 ID: {group_id}"})
-            else:
-                messages_to_send.append({"type": "text", "text": "그룹방이 아닙니다."})
-
 
         # ✨ [추가됨] /음성업로드 — 운영진이 임의로 음성을 제출해 블랙리스트에 수동 등록
         elif command_body.startswith("음성업로드"):
