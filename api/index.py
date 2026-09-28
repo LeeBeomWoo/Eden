@@ -1019,6 +1019,13 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
 
+        elif command in ["방아이디", "방id"]:
+            if source_type == "group":
+                messages_to_send.append({"type": "text", "text": f"이 그룹방의 ID: {group_id}"})
+            else:
+                messages_to_send.append({"type": "text", "text": "그룹방이 아닙니다."})
+
+
         # ✨ [추가됨] /음성업로드 — 운영진이 임의로 음성을 제출해 블랙리스트에 수동 등록
         elif command_body.startswith("음성업로드"):
             rest = command_body[len("음성업로드"):].strip()
