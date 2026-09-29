@@ -294,32 +294,122 @@ def del_user_session(user_id):
             print(f"user_session 삭제 에러: {e}")
     notified_users.pop(user_id, None)
 
+# ==========================================
+# [룸스테이트 — DB(Supabase room_states) 우선, DB 조회가 실패할 때만 구글시트 '룸스테이트' 탭 사용]
+#   시트 탭: A: room_id / B: data(JSON) / C: updated_at(KST)
+#   쓰기는 DB와 시트 양쪽에 모두 반영해 두고(시트 = 백업), /디비업데이트 시 시트 기준으로 DB를 맞춥니다.
+# ==========================================
+ROOM_STATE_SHEET_NAME = "룸스테이트"
+ROOM_STATE_SHEET_CACHE_TTL = 3  # 초. DB 장애로 시트 폴백을 쓸 때 시트 읽기 횟수(API 할당량) 절약용
+_room_state_sheet_cache = {}    # room_id -> (만료시각, data 또는 None)
+
+
+def _init_room_state_sheet():
+    try:
+        try:
+            return spreadsheet.worksheet(ROOM_STATE_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title=ROOM_STATE_SHEET_NAME, rows=200, cols=3)
+            ws.update(range_name='A1:C1', values=[["room_id", "data", "updated_at"]])
+            return ws
+    except Exception as e:
+        print(f"⚠️ 룸스테이트 시트 연결 실패: {e}")
+        return None
+
+
+room_state_sheet = _init_room_state_sheet()
+
+
+def _room_state_sheet_read(room_id):
+    """시트에서 room_id 행의 data(dict)를 반환. 없으면 None. 시트 조회 자체가 실패하면 예외를 그대로 올림."""
+    rows = room_state_sheet.get_all_values()
+    for row in rows[1:]:
+        if row and str(row[0]).strip() == room_id:
+            raw = row[1] if len(row) > 1 else ""
+            return json.loads(raw) if raw else None
+    return None
+
+
+def _room_state_sheet_write(room_id, data):
+    if not room_state_sheet:
+        return
+    try:
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        now_str = datetime.datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+        payload = [room_id, json.dumps(data, ensure_ascii=False), now_str]
+        with sheet_sync_lock():
+            ids = [str(v).strip() for v in room_state_sheet.col_values(1)]
+            if room_id in ids:
+                r = ids.index(room_id) + 1
+                room_state_sheet.update(range_name=f'A{r}:C{r}', values=[payload], value_input_option='RAW')
+            else:
+                room_state_sheet.append_row(payload, value_input_option='RAW')
+    except Exception as e:
+        print(f"room_state 시트 저장 에러: {e}")
+
+
+def _room_state_sheet_delete(room_id):
+    if not room_state_sheet:
+        return
+    try:
+        with sheet_sync_lock():
+            ids = [str(v).strip() for v in room_state_sheet.col_values(1)]
+            if room_id in ids:
+                room_state_sheet.delete_rows(ids.index(room_id) + 1)
+    except Exception as e:
+        print(f"room_state 시트 삭제 에러: {e}")
+
+
 def set_room_state(room_id, data, ttl=3600):
+    room_states_memory[room_id] = data
+    _room_state_sheet_cache.pop(room_id, None)
     if supabase:
         try:
             supabase.table('room_states').upsert({"room_id": room_id, "data": data}).execute()
-            return
         except Exception as e:
-            print(f"room_state 저장 에러: {e}")
-    room_states_memory[room_id] = data
+            print(f"room_state DB 저장 에러: {e}")
+    _room_state_sheet_write(room_id, data)
 
-def get_room_state(room_id):
+
+def get_room_state(room_id, strict=False):
+    """DB를 먼저 읽고, DB 조회가 '실패'했을 때만 시트를 읽습니다. (DB에 행이 없는 것은 실패가 아니라 '없음'입니다)
+    strict=True면 DB와 시트 모두 실패했을 때 예외를 올립니다('N번방 확인'이 '없음'과 '조회 실패'를 구분하기 위함)."""
+    db_ok = False
     if supabase:
         try:
             res = supabase.table('room_states').select('data').eq('room_id', room_id).execute()
+            db_ok = True
             if res.data:
                 return res.data[0]['data']
+            return None
         except Exception as e:
-            print(f"room_state 조회 에러: {e}")
+            print(f"room_state DB 조회 에러 -> 시트로 폴백: {e}")
+
+    if not db_ok and room_state_sheet:
+        cached = _room_state_sheet_cache.get(room_id)
+        if cached and cached[0] > time.time():
+            return cached[1]
+        try:
+            data = _room_state_sheet_read(room_id)
+            _room_state_sheet_cache[room_id] = (time.time() + ROOM_STATE_SHEET_CACHE_TTL, data)
+            return data
+        except Exception as e:
+            print(f"room_state 시트 조회 에러: {e}")
+
+    if strict and (supabase or room_state_sheet):
+        raise RuntimeError("DB와 시트 모두에서 룸스테이트 조회에 실패했습니다.")
     return room_states_memory.get(room_id)
 
+
 def del_room_state(room_id):
+    room_states_memory.pop(room_id, None)
+    _room_state_sheet_cache.pop(room_id, None)
     if supabase:
         try:
             supabase.table('room_states').delete().eq('room_id', room_id).execute()
         except Exception as e:
-            print(f"room_state 삭제 에러: {e}")
-    room_states_memory.pop(room_id, None)
+            print(f"room_state DB 삭제 에러: {e}")
+    _room_state_sheet_delete(room_id)
 
 
 def reset_verification_state(source_id, target_user_id=None):
@@ -790,9 +880,15 @@ def handle_message(event):
             return
 
     # 0. 점(.) 입력 시 해당 방의 인증 진행 상태(room_state)만 초기화 (DB status는 변경하지 않음)
+    if is_admin_room and user_message == ".":
+        return  # 인증자방에서는 '.'에 반응하지 않음
+
     if not is_admin_room and user_message == ".":
         room_state = get_room_state(source_id)
         tracked_user_id = room_state.get('user_id') if room_state else None
+        # 신입(인증 진행 중인 본인)이 입력한 '.'은 무시 — 기존 멤버가 입력했을 때만 초기화
+        if tracked_user_id and tracked_user_id == user_id:
+            return
         if tracked_user_id:
             del_user_session(tracked_user_id)
         del_room_state(source_id)
@@ -1028,6 +1124,32 @@ def handle_message(event):
                                 report_line += f" (재시도횟수/상태 정보가 없어 기존 값을 유지한 행 {skipped_short_rows}건 포함)"
                             sync_reports.append(report_line)
 
+                # E. '룸스테이트' 시트 동기화 (시트 기준으로 DB room_states를 맞춤: 시트에 있는 방은 upsert, 시트에 없는 방은 DB에서 삭제)
+                if room_state_sheet and supabase:
+                    try:
+                        rs_rows = room_state_sheet.get_all_values()[1:]
+                        rs_records = {}
+                        for row in rs_rows:
+                            rid = str(row[0]).strip() if row else ""
+                            raw = row[1] if len(row) > 1 else ""
+                            if not rid or not raw:
+                                continue
+                            try:
+                                rs_records[rid] = {"room_id": rid, "data": json.loads(raw)}
+                            except Exception:
+                                print(f"룸스테이트 시트 JSON 파싱 실패(건너뜀): {rid}")
+
+                        existing_rs = get_all_supabase_data('room_states', 'room_id')
+                        existing_rids = {str(r.get('room_id', '')).strip() for r in existing_rs if r.get('room_id')}
+                        removed_rids = list(existing_rids - set(rs_records.keys()))
+                        for i in range(0, len(removed_rids), 200):
+                            supabase.table('room_states').delete().in_('room_id', removed_rids[i:i + 200]).execute()
+                        process_in_chunks('room_states', list(rs_records.values()), is_insert=False)
+                        _room_state_sheet_cache.clear()
+                        sync_reports.append(f"• 룸스테이트: {len(rs_records)}개 방 (DB에서 삭제 {len(removed_rids)}개)")
+                    except Exception as e:
+                        sync_reports.append(f"• ⚠️ 룸스테이트: 동기화 실패 — {e}")
+
                 report_str = "\n".join(sync_reports)
                 reply_text = f"✅ 모든 구글 시트 데이터가 DB에 동기화되었습니다!\n\n{report_str}"
             except Exception as e:
@@ -1085,8 +1207,15 @@ def handle_message(event):
             room_name_input = command_body.replace("확인", "").strip()
             target_room_id = get_room_id_by_name(room_name_input)
             if target_room_id:
-                room_state = get_room_state(target_room_id)
-                if not room_state:
+                try:
+                    room_state = get_room_state(target_room_id, strict=True)
+                except Exception as rs_err:
+                    print(f"N번방 확인 - 룸스테이트 시트 조회 실패: {rs_err}")
+                    room_state = None
+                    reply_text = f"⚠️ [{room_name_input}] 룸스테이트 시트 조회에 실패했습니다. 잠시 후 다시 시도해 주세요."
+                if reply_text:
+                    pass
+                elif not room_state:
                     reply_text = f"📭 [{room_name_input}] 현재 대기 중인 신규 인증 멤버가 없습니다."
                 else:
                     status = room_state.get('status')
@@ -1619,13 +1748,14 @@ def handle_message(event):
             finalize_after_nickname_check(source_id, user_id, event.reply_token)
         return
 
-    # 3. 일반 DB 키워드 검색
-    matched_reply = search_keyword(user_message)
-    if matched_reply:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=matched_reply)]))
-        return
+    # 3. 일반 DB 키워드 검색 — 봇 명령어는 반드시 '/'로 시작해야 하므로, 슬래시 없는 채팅에는 반응하지 않음
+    if user_message.startswith("/"):
+        matched_reply = search_keyword(user_message)
+        if matched_reply:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=matched_reply)]))
+            return
 
 
 # ==========================================
