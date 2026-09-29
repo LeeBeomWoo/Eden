@@ -886,6 +886,15 @@ def handle_message(event):
     if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
         command_body = user_message[1:].strip()
 
+        # 0) /색상, /색상표, /색깔, /색표 : 중복/블랙 필터링 색상 의미표 (관리자방 전용)
+        if command_body in ("색상", "색상표", "색깔", "색표"):
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=COLOR_LEGEND_TEXT)])
+                )
+            return
+
         # 1) /디비업데이트 명령어 (1000개 이상 데이터 대응 완료)
         if "디비업데이트" in command_body:
             try:
@@ -1884,6 +1893,17 @@ def _voice_analysis_is_stale(row):
         return False
     elapsed = datetime.datetime.now(datetime.timezone.utc) - synced_dt
     return elapsed > datetime.timedelta(minutes=VOICE_ANALYSIS_STALE_MINUTES)
+
+
+COLOR_LEGEND_TEXT = (
+    "🎨 중복/블랙 필터링 색상 안내\n\n"
+    "⚫ 블랙리스트 유저 감지\n"
+    "🔴 닉네임 및 모든 정보 일치\n"
+    "🟪 재입장 유저 (동일 ID 확인)\n"
+    "🟡 닉네임 및 정보 일부 일치\n"
+    "🟦 닉네임만 일치\n"
+    "🟢 이상 없음 (중복/블랙 이력 없음)"
+)
 
 
 def format_form_basic_info(*, nickname, birth_year, age, gender, region, marriage, military,
