@@ -480,18 +480,29 @@ def get_room_target_user_id(source_id):
 # [DB 전용 조회 함수]
 # ==========================================
 def get_room_id_by_name(room_name):
+    """'#번방' 이름 -> room_id. DB(room_management)를 먼저 보고, DB 조회가 '실패'했을 때만 '방관리' 시트(A열 방이름 / B열 room_id)를 봅니다."""
+    target_name = room_name.replace(" ", "")
+    db_ok = False
     if supabase:
         try:
-            target_name = room_name.replace(" ", "")
             res = supabase.table('room_management').select('room_id').eq('room_name', target_name).execute()
+            db_ok = True
             if res.data:
                 return res.data[0]['room_id']
+            return None
         except Exception as e:
-            print(f"방 DB 조회 실패: {e}")
+            print(f"방 DB 조회 실패 -> 방관리 시트로 폴백: {e}")
+
+    if not db_ok and room_manage_sheet:
+        try:
+            for row in room_manage_sheet.get_all_values()[1:]:
+                if len(row) >= 2 and str(row[0]).replace(" ", "") == target_name and str(row[1]).strip():
+                    return str(row[1]).strip()
+        except Exception as e:
+            print(f"방관리 시트 조회 실패: {e}")
     return None
 
 
-# ✨ [추가됨] 인증방별 클라우드런 라우팅
 def get_forward_target_url(raw_body):
     """이 웹훅 이벤트가 어느 방(그룹)에서 왔는지 확인해서, 그 방을 담당하는 클라우드런
     URL이 '방관리' 시트(=room_management 테이블, service_url 열)에 등록돼 있고
@@ -1238,7 +1249,7 @@ def handle_message(event):
                     if reply_text and tracked_user_id:
                         reply_text = f"{reply_text}\n\n{format_voice_check_status(tracked_user_id)}"
             else:
-                reply_text = f"❌ '{room_name_input}' 정보를 DB/방관리 시트에서 찾을 수 없습니다."
+                reply_text = f"❌ '{room_name_input}' 정보를 방관리(DB)에서 찾을 수 없습니다. 방관리 시트에 방금 추가했다면 /디비업데이트 후 다시 시도해 주세요."
 
             if reply_text:
                 with ApiClient(configuration) as api_client:
