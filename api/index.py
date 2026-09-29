@@ -657,8 +657,9 @@ def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
 def has_blacklist_issue(user_id):
     """DB에 저장된 음성 자동분석 결과 기준으로 블랙리스트 유사 매칭(강한 의심)이 남아있는지 재확인합니다."""
     row = get_validation_row(user_id, "voice_analysis_result")
-    voice_result = row.get('voice_analysis_result') or {}
+    voice_result = drop_self_matches(row.get('voice_analysis_result') or {}, user_id) or {}
     matches = voice_result.get('matches') or []
+    # 블랙리스트 음성뿐 아니라 기존 신입 음성과 강하게 유사한 경우(다른 닉/계정 재입장 의심)도 운영진 검토 대상
     return any((m.get('similarity') or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
 
 
@@ -1190,6 +1191,16 @@ def handle_message(event):
                 # 1000개 이상 제약 해결: 페이지네이션 기반 전체 데이터 호출
                 all_val_data = get_all_supabase_data('user_validations')
 
+                # 음성DB(voice_profiles)도 함께 대조: 유저ID 일치=동일인, 닉네임 일치=동일인 의심
+                # (임베딩 등 무거운 컬럼은 가져오지 않는다)
+                voice_profile_rows = get_all_supabase_data('voice_profiles', 'user_id, nickname, source')
+                vp_by_uid = {}
+                for _vp in voice_profile_rows:
+                    _vp_uid = str(_vp.get('user_id') or '').strip()
+                    if _vp_uid and _vp_uid not in vp_by_uid:
+                        vp_by_uid[_vp_uid] = _vp
+                seen_validation_uids = set()
+
                 for row in all_val_data:
                     rec_id = str(row.get('user_id', '')).strip()
 
@@ -1217,8 +1228,8 @@ def handle_message(event):
 
                     if is_id_matched or is_name_matched:
                         match_reasons = []
-                        if is_id_matched: match_reasons.append("고유ID 일치")
-                        if is_name_matched: match_reasons.append("닉네임 일치")
+                        if is_id_matched: match_reasons.append("고유ID 일치 → 동일인")
+                        if is_name_matched: match_reasons.append("닉네임 일치 → 동일인 의심")
 
                         match_score = 0
                         if rec_year == birth_year: match_score += 1
@@ -1247,6 +1258,14 @@ def handle_message(event):
                                 detail_lines.append(f"{label}: {val}")
                         if detail_lines:
                             row_info += f"\n - 📝 기존 입력 내용: {' / '.join(detail_lines)}"
+
+                        # 같은 유저ID의 음성DB 프로필이 있으면 함께 표시
+                        linked_vp = vp_by_uid.get(rec_id) if rec_id else None
+                        if linked_vp:
+                            vp_kind = "신입 음성인증" if linked_vp.get('source') == 'new_member' else "블랙리스트 음성 등록"
+                            row_info += f"\n - 🎙️ 음성DB: 같은 유저ID의 음성 프로필 있음 ({vp_kind})"
+                        if rec_id:
+                            seen_validation_uids.add(rec_id)
                         found_duplicates.append(row_info)
 
                         current_level = 0
@@ -1266,6 +1285,41 @@ def handle_message(event):
                             elif current_level == 3: alert_status_text, color_emoji = "🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"
                             elif current_level == 2: alert_status_text, color_emoji = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치", "🟡"
                             elif current_level == 1: alert_status_text, color_emoji = "🔵 [주의] 닉네임 일치 유저", "🟦"
+
+                # 위에서 이미 user_validations 기록으로 표시된 유저ID를 제외하고, 음성DB에만 있는 기록을 추가 대조
+                for vp in voice_profile_rows:
+                    vp_uid = str(vp.get('user_id') or '').strip()
+                    vp_name = str(vp.get('nickname') or '').strip()
+                    if vp_uid and vp_uid in seen_validation_uids:
+                        continue
+                    if is_edit_resubmission and vp_uid and vp_uid == str(user_id).strip():
+                        continue
+
+                    vp_id_matched = (vp_uid != "" and vp_uid == str(user_id).strip())
+                    vp_name_matched = (vp_name != "" and vp_name == nickname)
+                    if not (vp_id_matched or vp_name_matched):
+                        continue
+
+                    # source가 new_member(신입 음성인증)가 아니면 블랙 음성 (admin_blacklist_upload, blacklist_backfill 등)
+                    vp_is_black = (vp.get('source') != 'new_member')
+                    vp_reasons = []
+                    if vp_id_matched: vp_reasons.append("고유ID 일치 → 동일인")
+                    if vp_name_matched: vp_reasons.append("닉네임 일치 → 동일인 의심")
+                    vp_kind = "블랙리스트 음성 등록" if vp_is_black else "신입 음성인증"
+                    found_duplicates.append(
+                        f"🎙️ [음성DB 기록] ({', '.join(vp_reasons)})\n - 음성DB정보: {vp_name or '(닉네임 없음)'} / {vp_kind}"
+                    )
+
+                    if vp_is_black: vp_level = 5
+                    elif vp_id_matched: vp_level = 3
+                    else: vp_level = 1
+                    if vp_level > highest_alert_level:
+                        highest_alert_level = vp_level
+                        alert_status_text, color_emoji = {
+                            5: ("💀 [위험] 블랙리스트 유저 감지", "⚫"),
+                            3: ("🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"),
+                            1: ("🔵 [주의] 닉네임 일치 유저", "🟦"),
+                        }[vp_level]
 
                 if highest_alert_level > 0:
                     dup_details_str = "\n\n".join(found_duplicates)
@@ -1767,6 +1821,24 @@ def handle_member_left(event):
 # 블랙리스트 유사도가 이 값 이상이면 "동일인 의심"으로 강조 표시한다.
 VOICE_MATCH_ALERT_THRESHOLD = 0.90
 
+
+def _match_is_member(m):
+    """대조 결과 한 건이 '기존 신입 음성'인지 (source가 new_member). source가 없는 예전 결과는 블랙으로 간주."""
+    return (m or {}).get("source") == "new_member"
+
+
+def drop_self_matches(voice_result, user_id):
+    """대조 결과에서 본인(같은 user_id)의 이전 제출 음성을 뺀 사본을 돌려준다."""
+    if not voice_result or not user_id:
+        return voice_result
+    matches = voice_result.get("matches") or []
+    filtered = [m for m in matches if str(m.get("user_id") or "") != str(user_id)]
+    if len(filtered) == len(matches):
+        return voice_result
+    new_result = dict(voice_result)
+    new_result["matches"] = filtered
+    return new_result
+
 # ✨ [추가됨] 오토튠/피치보정 의심도(%)가 이 값 이상이면 운영진방 알림 조건에 포함시킨다.
 AUTOTUNE_ALERT_THRESHOLD = 50.0
 
@@ -1777,7 +1849,7 @@ _GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"
 VOICE_MATCH_DISPLAY_LIMIT = 5
 
 
-def format_voice_match_lines(matches, limit=VOICE_MATCH_DISPLAY_LIMIT):
+def format_voice_match_lines(matches, limit=VOICE_MATCH_DISPLAY_LIMIT, claimed_nickname=None):
     """블랙리스트 대조 결과(matches)를 유사도 내림차순으로 정렬해, 상위 `limit`건의
     대조 대상 정보(닉네임/성별/상태)와 일치율을 사람이 읽기 좋은 줄 리스트로 만듭니다.
 
@@ -1793,17 +1865,29 @@ def format_voice_match_lines(matches, limit=VOICE_MATCH_DISPLAY_LIMIT):
     for m in shown:
         similarity = (m.get("similarity") or 0) * 100
         nickname = m.get("nickname", "알 수 없음")
-        match_gender = m.get("gender", "알 수 없음")
-        match_status = m.get("status", "상태 없음")
+        # RPC가 gender/status를 NULL로 돌려주는 경우가 있어 값이 있을 때만 표시한다 ("None" 방지)
+        match_gender = m.get("gender")
+        match_status = m.get("status")
         mark = "⚠️ " if similarity >= VOICE_MATCH_ALERT_THRESHOLD * 100 else "└ "
-        lines.append(f"  {mark}닉네임: {nickname} (과거 성별: {match_gender} / 상태: {match_status} / 일치율: {similarity:.1f}%)")
+        same_name_note = ""
+        if claimed_nickname and str(nickname).strip() == str(claimed_nickname).strip():
+            same_name_note = " ← 신청 닉네임과 동일 (동일인 의심)"
+        is_member = _match_is_member(m)
+        kind = "기존 신입 음성" if is_member else "블랙리스트 음성"
+        info_parts = []
+        if match_gender: info_parts.append(f"과거 성별: {match_gender}")
+        info_parts.append(f"일치율: {similarity:.1f}%")
+        if (is_member and claimed_nickname and not same_name_note
+                and similarity >= VOICE_MATCH_ALERT_THRESHOLD * 100):
+            same_name_note = " ← ⚠️ 다른 닉네임으로 재입장 의심"
+        lines.append(f"  {mark}[{kind}] 닉네임: {nickname} ({' / '.join(info_parts)}){same_name_note}")
     remaining = len(sorted_matches) - len(shown)
     if remaining > 0:
         lines.append(f"  (그 외 {remaining}건 더 있음 — 유사도 낮음, 생략)")
     return lines
 
 
-def build_voice_check_report_lines(*, claimed_gender, voice_result):
+def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nickname=None):
     """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
     (운영진방 알림, 'N번방 확인' 저장용 리포트에서 공통으로 사용)
     특이사항이 없으면 빈 리스트를 반환합니다.
@@ -1834,14 +1918,15 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
 
     matches = voice_result.get("matches") or []
     if matches:
-        has_strong = any((m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
-        header = (
-            "- ⚠️⚠️ 블랙리스트 음성과 매우 유사한 대조 결과 (동일인 의심):"
-            if has_strong else
-            "- 블랙리스트 대조 결과 (임계치 미만 — 참고용):"
-        )
+        strong = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
+        if any(not _match_is_member(m) for m in strong):
+            header = "- ⚠️⚠️ 블랙리스트 음성과 매우 유사한 대조 결과 (동일인 의심):"
+        elif strong:
+            header = "- ⚠️ 기존 신입 음성과 매우 유사 (재입장 의심 — 닉네임/계정 변경 가능성):"
+        else:
+            header = "- 기존 음성 대조 결과 (임계치 미만 — 참고용):"
         lines.append(header)
-        lines.extend(format_voice_match_lines(matches))
+        lines.extend(format_voice_match_lines(matches, claimed_nickname=claimed_nickname))
 
     # ✨ [추가됨] Cloud Run(app.py)이 90% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
     # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
@@ -1857,13 +1942,13 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result):
     return lines
 
 
-def build_voice_check_report_text(*, claimed_gender, voice_result):
+def build_voice_check_report_text(*, claimed_gender, voice_result, claimed_nickname=None):
     """'N번방 확인' 명령어 응답 및 DB(voice_check_report) 저장에 쓰는 한 덩어리 요약 텍스트."""
     if not voice_result or voice_result.get("error"):
         reason = (voice_result or {}).get("error", "결과 없음")
         return f"자동분석 실패({reason}) — 운영진이 음성을 직접 듣고 판단해 주세요."
 
-    lines = build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result)
+    lines = build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result, claimed_nickname=claimed_nickname)
     if not lines:
         return "자동분석 결과 특이사항 없음 (블랙리스트 유사 음성 없음 / 신청 성별과 일치)"
     return "\n".join(lines)
@@ -1902,7 +1987,9 @@ COLOR_LEGEND_TEXT = (
     "🟪 재입장 유저 (동일 ID 확인)\n"
     "🟡 닉네임 및 정보 일부 일치\n"
     "🟦 닉네임만 일치\n"
-    "🟢 이상 없음 (중복/블랙 이력 없음)"
+    "🟢 이상 없음 (중복/블랙 이력 없음)\n\n"
+    "※ 대조 대상: 시트/DB 블랙리스트 + 음성DB\n"
+    "※ 고유ID 일치 = 동일인 / 닉네임 일치 = 동일인 의심"
 )
 
 
@@ -1957,7 +2044,8 @@ def format_voice_check_status(user_id):
     if not report and row.get('voice_analysis_state') == "완료" and row.get('voice_analysis_result'):
         report = build_voice_check_report_text(
             claimed_gender=row.get('gender'),
-            voice_result=row.get('voice_analysis_result'),
+            voice_result=drop_self_matches(row.get('voice_analysis_result'), user_id),
+            claimed_nickname=row.get('nickname'),
         )
 
     # ✨ [추가됨] 자동분석 에러는 신입에게는 절대 보여주지 않고, 운영진이 'N번방 확인'을 했을 때만
@@ -2017,6 +2105,7 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
     if not voice_result or voice_result.get("error"):
         return
 
+    voice_result = drop_self_matches(voice_result, user_id)
     matches = voice_result.get("matches") or []
     strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
 
@@ -2033,7 +2122,7 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
         return
 
     lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
-    lines.extend(build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result))
+    lines.extend(build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result, claimed_nickname=claimed_nickname))
 
     if strong_matches:
         # ▼ 블랙리스트 유사 매칭이 있을 때만 경고 문구 추가 (줄바꿈 \n 포함) ▼
@@ -2091,12 +2180,12 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
         if matches:
             has_strong = any((m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
             header = (
-                "\n⚠️ 기존 블랙리스트와 매우 유사한 음성이 있습니다 (중복 인물 가능성):"
+                "\n⚠️ 기존 등록 음성(블랙리스트/기존 신입)과 매우 유사한 음성이 있습니다 (중복 인물 가능성):"
                 if has_strong else
-                "\n(참고) 기존 블랙리스트 대조 결과:"
+                "\n(참고) 기존 등록 음성 대조 결과:"
             )
             lines.append(header)
-            lines.extend(format_voice_match_lines(matches))
+            lines.extend(format_voice_match_lines(matches, claimed_nickname=nickname))
 
         reply_text = "\n".join(lines)
 
@@ -2232,9 +2321,10 @@ def format_voice_analysis_reply_text(user_id):
     result = row.get('voice_analysis_result') or {}
 
     if state == "완료":
+        result = drop_self_matches(result, user_id) or result
         # voice_analysis_result는 analyze_new_member_voice()가 반환하던 것과 같은 모양(estimated_gender/
         # matches/pitch_hz 등)으로 클라우드런이 채워 넣는다는 전제 → 기존 리포트/알림 함수를 그대로 재사용.
-        report_text = build_voice_check_report_text(claimed_gender=claimed_gender, voice_result=result)
+        report_text = build_voice_check_report_text(claimed_gender=claimed_gender, voice_result=result, claimed_nickname=claimed_nickname)
         notify_admin_voice_analysis(
             claimed_nickname=claimed_nickname, claimed_gender=claimed_gender,
             user_id=user_id, voice_result=result,
