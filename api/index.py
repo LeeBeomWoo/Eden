@@ -1086,10 +1086,14 @@ def handle_message(event):
                         if is_known:
                             reply_text = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
                         else:
-                            reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다."
+                            reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다.\n✅ 현재까지 특이사항(기존 방문/블랙 이력) 없음"
                     elif status == 'form_submitted':
                         alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
                         reply_text = alert_report
+                    elif status == 'pending_friend':
+                        reply_text = f"⏳ [{room_name_input}]\n신입이 친구추가 전 단계입니다. (친구추가 후 '시작' 입력 대기 중)"
+                    else:
+                        reply_text = f"ℹ️ [{room_name_input}] 현재 진행 상태: {status}"
 
                     # ✨ [추가됨] 음성검증까지 확인되었는지 여부 + 확인된 시점이라면 그 확인 내용을 함께 출력
                     if reply_text and tracked_user_id:
@@ -1336,7 +1340,18 @@ def handle_message(event):
             if alert_text:
                 state_data = {"user_id": user_id, "status": "form_submitted", "report": alert_text}
             else:
-                state_data = {"user_id": user_id, "status": "form_submitted", "report": "✅ 해당 유저는 중복/블랙 이력이 없는 깨끗한 신규 회원입니다.\n양식이 정상 접수되었습니다."}
+                color_emoji = "🟢"
+                clean_report = (
+                    f"{color_emoji} 신입 양식 작성 중복/블랙 필터링 결과\n\n"
+                    "📌 상태: 이상 없음 (중복/블랙 이력이 없는 깨끗한 신규 회원)\n"
+                    "양식이 정상 접수되었습니다.\n\n"
+                    + format_form_basic_info(
+                        nickname=nickname, birth_year=birth_year, age=age, gender=gender, region=region,
+                        marriage=marriage, military=military, inviter=inviter, yadan=yadan,
+                        leave_reason=leave_reason, kick_reason=kick_reason,
+                    )
+                )
+                state_data = {"user_id": user_id, "status": "form_submitted", "report": clean_report}
 
             set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
@@ -1350,6 +1365,10 @@ def handle_message(event):
                     reply_text = form2_text.replace("{닉네임}", nickname).replace("{nickname}", nickname)
                 else:
                     reply_text = f"[{nickname}]님, 1번 양식이 정상 접수되었습니다.\n\n안내 사항을 읽으신 후 '확인'이라고 답장해 주세요."
+            # 관리자방 리포트와 같은 기준(블랙수준별 색)의 동그라미만 신입방 응답 맨 앞에 붙인다.
+            # 일치 내역/블랙사유 같은 상세 내용은 신입에게 노출하지 않는다.
+            if color_emoji:
+                reply_text = f"{color_emoji} {reply_text}"
         else:
             reply_text = "⚠️ 서버 통신 문제로 저장에 실패했습니다. 점(.)을 입력하여 처음부터 다시 시도해 주세요!"
 
@@ -1867,6 +1886,25 @@ def _voice_analysis_is_stale(row):
     return elapsed > datetime.timedelta(minutes=VOICE_ANALYSIS_STALE_MINUTES)
 
 
+def format_form_basic_info(*, nickname, birth_year, age, gender, region, marriage, military,
+                           inviter, yadan, leave_reason, kick_reason):
+    """'N번방 확인' 리포트에 붙이는 1번 양식 기본 정보 블록 (이상 유무와 상관없이 항상 표시)."""
+    def v(x):
+        x = str(x or "").strip()
+        return x if x else "(미입력)"
+    return (
+        "👤 [기본 정보]\n"
+        f"- 닉네임: {v(nickname)}\n"
+        f"- 년생/나이: {v(birth_year)}년생 / {v(age)}\n"
+        f"- 성별/지역: {v(gender)} / {v(region)}\n"
+        f"- 결혼유무: {v(marriage)} / 군필여부: {v(military)}\n"
+        f"- 초대자: {v(inviter)}\n"
+        f"- 야단라경험: {v(yadan)}\n"
+        f"- 나온이유: {v(leave_reason)}\n"
+        f"- 킥이력: {v(kick_reason)}"
+    )
+
+
 def format_voice_check_status(user_id):
     """'N번방 확인' 명령어에서 특정 유저의 음성검증 진행 상태를 사람이 읽기 좋은 문장으로 만들어 돌려줍니다.
     - 음성검증까지 확인이 끝났는지 여부
@@ -2163,7 +2201,7 @@ def format_voice_analysis_reply_text(user_id):
 
     res = supabase_execute(
         lambda: supabase.table('user_validations')
-            .select('nickname, gender, voice_analysis_state, voice_analysis_result, voice_analysis_error')
+            .select('nickname, gender, voice_analysis_state, voice_analysis_result, voice_analysis_error, voice_analysis_synced_at')
             .eq('user_id', user_id).execute(),
         label="음성분석 결과 조회(문제없음)"
     )
@@ -2197,8 +2235,15 @@ def format_voice_analysis_reply_text(user_id):
         # 'N번방 확인' 명령어로만 확인 가능하다. 신입에게는 완료 여부만 간결하게 안내한다.
         return f"🔵 자동분석이 완료되었습니다.\n\n{FINAL_APPROVAL_WAIT_TEXT}", claimed_gender
 
-    # state가 "에러"이거나 "처리중"이거나, 아직 기록 자체가 없는 경우(레이스 컨디션 등) 모두
-    # 신입에게는 똑같이 '진행 중'으로만 안내한다. 에러 상세는 운영진이 N번방 확인 시에만 본다.
+    # 🔴 관리자방('N번방 확인')과 같은 기준: 에러이거나, '처리중'인 채로 일정 시간 이상 멈춘 경우.
+    # 동그라미 색은 관리자방과 동일하게 보여주되, 에러 사유 같은 상세 내용은 신입에게 노출하지 않는다.
+    if state == "에러" or _voice_analysis_is_stale(row):
+        return (
+            "🔴 자동분석 중 문제가 발생했습니다. 운영진이 직접 확인해 드릴 예정입니다.\n\n"
+            f"{FINAL_APPROVAL_WAIT_TEXT}"
+        ), claimed_gender
+
+    # 🟡 처리중이거나 아직 기록 자체가 없는 경우(레이스 컨디션 등)
     return PENDING_TEXT_FOR_MEMBER, claimed_gender
 
 
