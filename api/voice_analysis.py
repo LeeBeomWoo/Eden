@@ -310,6 +310,11 @@ def process_admin_blacklist_voice_upload(
         "blacklist_user_id": None,
         "estimated_gender": None,
         "pitch_hz": None,
+        # ✨ [추가됨] 성별 종합 추정 세부 신호 (피치/성도길이/임베딩) — 등록 결과 메시지에 표시용
+        "gender_uncertain": False,
+        "gender_score": None,
+        "gender_signals": {},
+        "gender_note": None,
         "matches": [],
         "storage_path": None,
         "error": None,
@@ -320,6 +325,10 @@ def process_admin_blacklist_voice_upload(
         embedding = analysis.get("embedding")
         result["estimated_gender"] = analysis.get("estimated_gender")
         result["pitch_hz"] = analysis.get("pitch_hz")
+        result["gender_uncertain"] = bool(analysis.get("gender_uncertain"))
+        result["gender_score"] = analysis.get("gender_score")
+        result["gender_signals"] = analysis.get("gender_signals") or {}
+        result["gender_note"] = analysis.get("gender_note")
 
         # 등록 전에 기존 블랙리스트와 먼저 대조 (같은 인물 중복 등록 여부 확인용)
         if embedding:

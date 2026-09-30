@@ -2600,6 +2600,15 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
             lines.append(f"- 등록 ID: {result['blacklist_user_id']}")
         if result.get("pitch_hz"):
             lines.append(f"- 분석 피치: {result['pitch_hz']}Hz (추정 성별: {result.get('estimated_gender') or ('경계/불확실' if result.get('gender_uncertain') else '알수없음')})")
+            # ✨ [추가됨] 성도길이/임베딩 신호, 톤 조작 의심 메모, 입력 성별과 추정 성별 불일치 표시
+            _sig = _format_gender_signals(result)
+            if result.get("gender_signals") and _sig:
+                lines.append(f"- 성별 판정 신호:{_sig}")
+            if result.get("gender_note"):
+                lines.append(f"- ⚠️ {result['gender_note']} (참고용 정황, 확정 판정 아님)")
+            _est = result.get("estimated_gender")
+            if gender in ("남", "여") and _est in ("남", "여") and gender != _est:
+                lines.append(f"- ⚠️ 입력한 성별({gender})과 음성 추정 성별({_est})이 다릅니다 — 톤 조작 가능성")
 
         matches = result.get("matches") or []
         if matches:
