@@ -1372,6 +1372,14 @@ def handle_message(event):
             and current_room_state.get('status') == 'form_submitted'
         )
 
+        # ✨ [추가됨] 동일 유저ID 이력은 수정 재제출을 해도 사라지지 않게 room_state로 이어받는다.
+        # (재제출 때는 '방금 전 내가 저장한 기록'을 검증에서 제외하는데, user_id가 PK라 과거 기록이
+        #  이미 그 행으로 덮어써져 있어서, 그대로 두면 재입장/중복 이력이 통째로 사라져 '신규'로 판정됨)
+        id_match_lines = []   # 이번 검사에서 '유저ID 일치'로 잡힌 기록 상세
+        id_match_level = 0    # 그중 가장 높은 경고 수준
+        prior_id_lines = list(current_room_state.get('prior_id_lines') or []) if is_edit_resubmission else []
+        prior_id_level = int(current_room_state.get('prior_id_level') or 0) if is_edit_resubmission else 0
+
         if supabase:
             try:
                 # 1000개 이상 제약 해결: 페이지네이션 기반 전체 데이터 호출
@@ -1464,6 +1472,10 @@ def handle_message(event):
                         if rec_black:
                             current_level = 5
 
+                        if is_id_matched:
+                            id_match_lines.append(row_info)
+                            id_match_level = max(id_match_level, current_level)
+
                         if current_level > highest_alert_level:
                             highest_alert_level = current_level
                             if current_level == 5: alert_status_text, color_emoji = "💀 [위험] 블랙리스트 유저 감지", "⚫"
@@ -1492,13 +1504,15 @@ def handle_message(event):
                     if vp_id_matched: vp_reasons.append("고유ID 일치 → 동일인")
                     if vp_name_matched: vp_reasons.append("닉네임 일치 → 동일인 의심")
                     vp_kind = "블랙리스트 음성 등록" if vp_is_black else "신입 음성인증"
-                    found_duplicates.append(
-                        f"🎙️ [음성DB 기록] ({', '.join(vp_reasons)})\n - 음성DB정보: {vp_name or '(닉네임 없음)'} / {vp_kind}"
-                    )
+                    vp_line = f"🎙️ [음성DB 기록] ({', '.join(vp_reasons)})\n - 음성DB정보: {vp_name or '(닉네임 없음)'} / {vp_kind}"
+                    found_duplicates.append(vp_line)
 
                     if vp_is_black: vp_level = 5
                     elif vp_id_matched: vp_level = 3
                     else: vp_level = 1
+                    if vp_id_matched:
+                        id_match_lines.append(vp_line)
+                        id_match_level = max(id_match_level, vp_level)
                     if vp_level > highest_alert_level:
                         highest_alert_level = vp_level
                         alert_status_text, color_emoji = {
@@ -1506,6 +1520,17 @@ def handle_message(event):
                             3: ("🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"),
                             1: ("🔵 [주의] 닉네임 일치 유저", "🟦"),
                         }[vp_level]
+
+                if is_edit_resubmission and (prior_id_lines or prior_id_level > 0):
+                    carried_level = max(prior_id_level, 3)
+                    found_duplicates = prior_id_lines + found_duplicates
+                    if carried_level > highest_alert_level:
+                        highest_alert_level = carried_level
+                        alert_status_text, color_emoji = {
+                            5: ("💀 [위험] 블랙리스트 유저 감지", "⚫"),
+                            4: ("🚨 [적색 경고] 닉네임 및 모든 정보 일치", "🔴"),
+                            3: ("🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"),
+                        }[min(carried_level, 5) if carried_level in (3, 4, 5) else 3]
 
                 if highest_alert_level > 0:
                     dup_details_str = "\n\n".join(found_duplicates)
@@ -1604,6 +1629,9 @@ def handle_message(event):
                     )
                 )
                 state_data = {"user_id": user_id, "status": "form_submitted", "report": clean_report}
+
+            state_data["prior_id_lines"] = (prior_id_lines + id_match_lines)[:5]
+            state_data["prior_id_level"] = max(prior_id_level, id_match_level)
 
             set_room_state(source_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname, "gender": gender})
