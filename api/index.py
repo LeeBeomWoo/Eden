@@ -2167,6 +2167,20 @@ def format_voice_match_lines(matches, limit=VOICE_MATCH_DISPLAY_LIMIT, claimed_n
     return lines
 
 
+def _format_gender_signals(voice_result):
+    """성별 추정에 쓰인 신호(피치/성도 길이/임베딩)를 ' (피치 120Hz / 성도길이 17.5cm / 임베딩 여성확률 3%)' 형태로."""
+    sig = voice_result.get("gender_signals") or {}
+    parts = []
+    pitch = sig.get("pitch_hz") or voice_result.get("pitch_hz")
+    if pitch:
+        parts.append(f"피치 {pitch}Hz")
+    if sig.get("vtl_cm") is not None:
+        parts.append(f"성도길이 {sig['vtl_cm']}cm")
+    if sig.get("embedding_female_pct") is not None:
+        parts.append(f"임베딩 여성확률 {sig['embedding_female_pct']}%")
+    return f" ({' / '.join(parts)})" if parts else ""
+
+
 def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nickname=None):
     """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
     (운영진방 알림, 'N번방 확인' 저장용 리포트에서 공통으로 사용)
@@ -2180,10 +2194,14 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nick
     claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
     gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
 
+    signal_note = _format_gender_signals(voice_result)
     if est_gender:
-        pitch_note = f" (추정 피치 {voice_result.get('pitch_hz')}Hz)" if voice_result.get("pitch_hz") else ""
         mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
-        lines.append(f"- 음성 기반 추정 성별: {est_gender}{pitch_note}{mismatch_note}")
+        lines.append(f"- 음성 기반 추정 성별: {est_gender}{signal_note}{mismatch_note}")
+    elif voice_result.get("gender_uncertain"):
+        lines.append(f"- 음성 기반 추정 성별: 경계/판단 불확실{signal_note} — 참고만 해주세요")
+    if voice_result.get("gender_note"):
+        lines.append(f"- ⚠️ {voice_result['gender_note']} (참고용 정황, 확정 판정 아님)")
 
     # ✨ [추가됨] 오토튠/피치보정 의심도. 확정 판정이 아니라 정황 지표이므로 항상 그 취지를 함께 남긴다.
     autotune_prob = voice_result.get("autotune_probability")
@@ -2523,7 +2541,9 @@ def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, vo
     autotune_prob = voice_result.get("autotune_probability")
     autotune_suspected = bool(autotune_prob is not None and autotune_prob >= AUTOTUNE_ALERT_THRESHOLD)
 
-    if not strong_matches and not gender_mismatch and not save_error and not autotune_suspected:
+    gender_suspect = bool(voice_result.get("gender_note"))  # 피치와 성도길이/음색이 강하게 충돌 (톤 조작 의심)
+
+    if not strong_matches and not gender_mismatch and not save_error and not autotune_suspected and not gender_suspect:
         return
 
     lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
@@ -2579,7 +2599,7 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
         if result.get("blacklist_user_id"):
             lines.append(f"- 등록 ID: {result['blacklist_user_id']}")
         if result.get("pitch_hz"):
-            lines.append(f"- 분석 피치: {result['pitch_hz']}Hz (추정 성별: {result.get('estimated_gender') or '알수없음'})")
+            lines.append(f"- 분석 피치: {result['pitch_hz']}Hz (추정 성별: {result.get('estimated_gender') or ('경계/불확실' if result.get('gender_uncertain') else '알수없음')})")
 
         matches = result.get("matches") or []
         if matches:
