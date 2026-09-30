@@ -1805,6 +1805,48 @@ def handle_message(event):
 # ==========================================
 # [핸들러 2] 방 입장 이벤트 처리 핸들러
 # ==========================================
+def send_friend_add_guide(source_id, user_id, reply_token=None):
+    """친구추가 안내(/ㅇㅈ 1ㅂㅊㄱ, /ㅇㅈ 2ㅂㅊㄱ 멘트)를 보내고, 신입이 '시작'을 입력하면 처음부터 다시
+    진행되도록 room_state를 pending_friend로 세팅합니다.
+    - 먼저 reply로 시도하고, 실패하면 그룹으로 push(마지막 수단)로 보냅니다.
+    반환값: 안내 발송 성공 여부"""
+    set_room_state(source_id, {
+        "user_id": user_id,
+        "status": "pending_friend"
+    }, ttl=3600)
+
+    ment1 = search_keyword("1ㅂㅊㄱ")
+    ment2 = search_keyword("2ㅂㅊㄱ")
+    guide_messages = [TextMessage(text=t) for t in (ment1, ment2) if t]
+    if not guide_messages:
+        guide_messages = [TextMessage(text=(
+            "저를 추가해주셔야 인증진행이 가능해요.\n"
+            "친구추가 해주시고 채팅창에 '시작'이라고 입력해 주세요."
+        ))]
+
+    if reply_token:
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=reply_token, messages=guide_messages)
+                )
+            return True
+        except Exception as e:
+            print(f"친구추가 안내 reply 실패(push로 재시도): {e}")
+
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message_with_http_info(
+                PushMessageRequest(to=source_id, messages=guide_messages)
+            )
+        return True
+    except Exception as e:
+        print(f"친구추가 안내 push도 실패: {e}")
+        return False
+
+
 def send_join_welcome(source_id, user_id, reply_token):
     """신입 입장 시 최초 안내(1번 멘트 전송 + room_state 세팅) 로직.
     - MemberJoinedEvent 정상 처리 시 그리고
@@ -1871,7 +1913,10 @@ def send_join_welcome(source_id, user_id, reply_token):
                 )
             )
     except Exception as e:
-        print(f"신입 안내 메시지 전송 실패: {e}")
+        print(f"신입 안내 메시지 전송 실패 -> 친구추가 안내로 전환: {e}")
+        # ✨ [추가됨] 입장 이벤트는 발생했는데 1번 멘트가 나가지 못한 경우:
+        # 친구추가 안내(/ㅇㅈ 1ㅂㅊㄱ, 2ㅂㅊㄱ)를 보내고, '시작' 입력 시 처음부터 다시 진행되게 한다.
+        send_friend_add_guide(source_id, user_id, reply_token)
 
 
 def fetch_member_profile(line_bot_api, source, user_id):
@@ -1912,33 +1957,7 @@ def handle_member_joined(event):
         except Exception as e:
             print(f"신입 프로필 조회 실패(친구추가 필요 추정): {e}")
 
-            set_room_state(source_id, {
-                "user_id": user_id,
-                "status": "pending_friend"
-            }, ttl=3600)
-
-            # /ㅇㅈ 1ㅂㅊㄱ, /ㅇㅈ 2ㅂㅊㄱ 두 키워드 멘트를 순서대로 전송
-            ment1 = search_keyword("1ㅂㅊㄱ")
-            ment2 = search_keyword("2ㅂㅊㄱ")
-            guide_messages = [TextMessage(text=t) for t in (ment1, ment2) if t]
-
-            if not guide_messages:
-                guide_messages = [TextMessage(text=(
-                    "저를 추가해주셔야 인증진행이 가능해요.\n"
-                    "친구추가 해주시고 채팅창에 '시작'이라고 입력해 주세요."
-                ))]
-
-            try:
-                with ApiClient(configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=guide_messages
-                        )
-                    )
-            except Exception as e2:
-                print(f"친구추가 안내 메시지 전송 실패: {e2}")
+            send_friend_add_guide(source_id, user_id, event.reply_token)
             continue
 
         send_join_welcome(source_id, user_id, event.reply_token)
