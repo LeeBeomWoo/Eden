@@ -764,6 +764,46 @@ def has_blacklist_issue(user_id):
     return any((m.get('similarity') or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
 
 
+def is_clean_new_user(user_id):
+    """1번 양식 제출 시점의 중복/블랙 필터링 결과가 '이상 없음(깨끗한 신규)'이었는지 확인합니다.
+    기록이 없거나(이전 버전에서 진행 중이던 유저 등) 판단 불가하면 안전하게 False(운영진 확인)로 처리합니다."""
+    details = get_validation_row(user_id, "details").get('details') or {}
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except Exception:
+            details = {}
+    return isinstance(details, dict) and details.get('dup_clean') is True
+
+
+def build_nickchange_text(user_id):
+    """'/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임/이모지로 채워 돌려줍니다."""
+    row = get_validation_row(user_id, "nickname, birth_year, gender")
+    nickname = row.get('nickname') or ""
+    birth_year = row.get('birth_year') or ""
+    gender = row.get('gender') or ""
+    nickname_emoji = "⚖️" if gender in ("여", "여자") else "🧨"
+
+    # ✨ [수정됨] 생년을 뒤에서 2자리만 추출 (예: "1998" -> "98")
+    short_year = str(birth_year)[-2:] if birth_year else ""
+
+    nickchange_template = search_keyword("닉변")
+    if nickchange_template:
+        nickchange_text = (
+            nickchange_template
+            .replace("{생년}", short_year).replace("{birth_year}", short_year)
+            .replace("{닉네임}", nickname).replace("{nickname}", nickname)
+            .replace("{닉네임이모지}", nickname_emoji).replace("{emoji}", nickname_emoji)
+        )
+    else:
+        nickchange_text = (
+            "닉네임을 아래 형식으로 복사하여 변경해 주세요.\n\n"
+            f"{short_year} {nickname}{nickname_emoji}\n\n"  # 👈 여기도 short_year 적용
+            "변경 후 프로필 사진도 도용 사진이 아닌 사진으로 설정해 주시고, '변경완료'라고 답장해 주세요."
+        )
+    return nickchange_text
+
+
 def finalize_after_nickname_check(source_id, user_id, reply_token):
     """'헤르페스확인대기' 상태에서 (헤르페스 무증상 답변, 또는 닉네임 재수정 후 '확인')이 왔을 때
     실제 LINE 닉네임 변경 여부와 블랙리스트 재조회 결과를 확인해 최종 분기 처리합니다.
@@ -786,7 +826,9 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
             )
         return
 
-    if has_blacklist_issue(user_id):
+    # ✨ [변경됨] 깨끗한 신규 유저(양식 중복/블랙 이력 없음 + 음성 유사매칭 없음)일 때만 '/ㅇㅈ 퇴장' 멘트를 내보낸다.
+    # 그 외에는 퇴장 멘트 대신 운영진 멘션 + 추가 확인 안내만 보낸다.
+    if has_blacklist_issue(user_id) or not is_clean_new_user(user_id):
         if supabase:
             supabase_execute(
                 lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
@@ -794,11 +836,14 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
             )
         sync_status_to_sheet(user_id, "관리자검토대기")
 
-        reply_text = "인증자의 확인 후 인증과정이 마무리 될 예정이니 잠시대기하여주세요."
+        # 멘션 없이 일반 텍스트로 안내 (초대자 userId는 알 수 없고, 운영진 @전체 멘션도 쓰지 않기로 함)
+        review_message = TextMessage(
+            text="기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다."
+        )
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_text)])
+                ReplyMessageRequest(reply_token=reply_token, messages=[review_message])
             )
         return
 
@@ -1310,6 +1355,7 @@ def handle_message(event):
 
         save_success = False
         alert_text = None
+        dup_check_ok = False  # ✨ 중복/블랙 조회가 실제로 끝까지 성공했는지 (실패 시 '깨끗함'으로 간주하지 않음)
 
         # A. DB 중복/블랙리스트 조회 (1000명 이상 안전 조회 처리 적용)
         found_duplicates = []
@@ -1470,13 +1516,16 @@ def handle_message(event):
                         f"📑 [중복/기존 내역 상세]\n{dup_details_str}\n\n"
                         f"💡 관리자분들께서는 위 상세 내역을 기반으로 승인 여부를 검토하시기 바랍니다."
                     )
+                dup_check_ok = True
             except Exception as db_err:
                 print(f"DB 검증 에러: {db_err}")
 
         # B. DB 업서트(Upsert) 저장
         update_data_details = {
             "age": age, "marriage": marriage, "military": military,
-            "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason
+            "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason,
+            # ✨ 마지막 '퇴장' 멘트 직전에 확인하는 값: 중복/블랙 이력이 없는 깨끗한 신규 유저인지
+            "dup_clean": bool(dup_check_ok and not alert_text),
         }
         
         target_status = "입장대기"
@@ -1592,29 +1641,7 @@ def handle_message(event):
         # (남성은 보통 운영진이 먼저 '/ㅇㅈ 4번' 멘트를 보낸 뒤 이 "확인"을 받지만, 여성은 '4번' 과정 없이
         #  '문제없음' 확인 직후 바로 이 "확인"을 받아도 동일하게 진행됩니다 — 코드상 '4번' 발송 여부는 확인하지 않습니다.)
         if current_status_for_check == "승인대기":
-            row = get_validation_row(user_id, "nickname, birth_year, gender")
-            nickname = row.get('nickname') or ""
-            birth_year = row.get('birth_year') or ""
-            gender = row.get('gender') or ""
-            nickname_emoji = "⚖️" if gender in ("여", "여자") else "🧨"
-
-            # ✨ [수정됨] 생년을 뒤에서 2자리만 추출 (예: "1998" -> "98")
-            short_year = str(birth_year)[-2:] if birth_year else ""
-
-            nickchange_template = search_keyword("닉변")
-            if nickchange_template:
-                nickchange_text = (
-                    nickchange_template
-                    .replace("{생년}", short_year).replace("{birth_year}", short_year)
-                    .replace("{닉네임}", nickname).replace("{nickname}", nickname)
-                    .replace("{닉네임이모지}", nickname_emoji).replace("{emoji}", nickname_emoji)
-                )
-            else:
-                nickchange_text = (
-                    "닉네임을 아래 형식으로 복사하여 변경해 주세요.\n\n"
-                    f"{short_year} {nickname}{nickname_emoji}\n\n"  # 👈 여기도 short_year 적용
-                    "변경 후 프로필 사진도 도용 사진이 아닌 사진으로 설정해 주시고, '변경완료'라고 답장해 주세요."
-                )
+            nickchange_text = build_nickchange_text(user_id)
 
             if supabase:
                 supabase_execute(
@@ -1668,18 +1695,25 @@ def handle_message(event):
         if not cas_update_status(user_id, "음성확인중", "분석중", label="문제없음 확인(결과 조회 시작)"):
             return
 
+        next_status = None
         try:
             reply_text, claimed_gender = format_voice_analysis_reply_text(user_id)
-            cas_update_status(user_id, "분석중", "승인대기", label="문제없음 확인(결과 조회 완료)")
-            sync_status_to_sheet(user_id, "승인대기")
+            claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
+            # ✨ [변경됨] 여성은 '4번'도 '확인' 답장도 없이 바로 닉변 멘트로 넘어가므로 '닉변대기'로 직행.
+            # 남성/성별 미상은 4번 멘트 후 신입의 '확인'을 기다리는 '승인대기'.
+            next_status = "닉변대기" if claimed_gender_norm == "여" else "승인대기"
+            cas_update_status(user_id, "분석중", next_status, label="문제없음 확인(결과 조회 완료)")
+            sync_status_to_sheet(user_id, next_status)
 
-            reply_messages = [TextMessage(text=reply_text)]
+            # ✨ [변경됨] '자동분석 진행중/완료 + 운영진 확인 후 안내' 문구는 신입에게 보내지 않는다.
+            # (reply_text는 더 이상 발송하지 않지만, format_voice_analysis_reply_text 호출 자체는
+            #  DB 저장/운영진 알림 부수효과가 있으므로 그대로 유지)
+            reply_messages = []
 
             # ✨ [추가됨] 운영진이 문제 없을 때도 매번 수동으로 보내던 '/ㅇㅈ 4번' 멘트를 자동화.
             # 여성은 원래 '4번' 과정 없이 바로 "확인"을 받아도 동일하게 진행되므로,
             # 남성/성별 미상('여'가 아닌 모든 경우)에만 이어서 자동 발송한다.
             # (운영진 개입은 문제가 있을 때만 하도록 하기 위함 — 정상 케이스는 완전 자동 진행)
-            claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
             if claimed_gender_norm != "여":
                 four_text = search_keyword("4번") or search_keyword("4")
                 if four_text:
@@ -1687,22 +1721,21 @@ def handle_message(event):
                 else:
                     print(f"⚠️ user_id={user_id} '4번' 인증 멘트가 DB(auth_ments)에 등록되어 있지 않아 자동 발송을 건너뜁니다. 키워드 '4번'을 등록해 주세요.")
             else:
-                # ✨ [수정됨] 여성은 '4번' 멘트를 보내지 않으므로, 신입 본인이 다음 단계로 넘어가려면
-                # "확인"이라고 답장해야 한다는 안내가 반드시 필요하다. FINAL_APPROVAL_WAIT_TEXT에는
-                # 이 안내가 없어서(운영진이 알려줄 것처럼만 되어 있음) 여성 신입이 "확인"을 보내지 않고
-                # '승인대기' 상태에 멈춰 있는 문제가 있었다.
-                reply_messages.append(TextMessage(
-                    text="위 내용이 맞다면 '확인'이라고 답장해 주세요."
-                ))
+                # 여성: '4번'/'확인' 없이 바로 닉변 멘트 발송 (상태는 위에서 이미 '닉변대기'로 전환됨)
+                reply_messages.append(TextMessage(text=build_nickchange_text(user_id)))
 
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=reply_messages)
-                )
+            if reply_messages:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(reply_token=event.reply_token, messages=reply_messages)
+                    )
         except Exception as e:
             print(f"⚠️ 문제없음 처리(결과 조회) 중 예외 — 재시도 가능하도록 상태 되돌림: {e}")
             cas_update_status(user_id, "분석중", "음성확인중", label="문제없음 처리 실패 롤백")
+            if next_status:
+                # 상태 전환(승인대기/닉변대기) 이후에 답장 발송이 실패한 경우도 재시도 가능하도록 되돌림
+                cas_update_status(user_id, next_status, "음성확인중", label="문제없음 처리 실패 롤백(전환 후)")
             sync_status_to_sheet(user_id, "음성확인중")
             try:
                 with ApiClient(configuration) as api_client:
