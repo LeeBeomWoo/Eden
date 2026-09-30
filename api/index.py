@@ -776,8 +776,23 @@ def is_clean_new_user(user_id):
     return isinstance(details, dict) and details.get('dup_clean') is True
 
 
+def build_nickchange_messages(user_id):
+    """닉변 안내를 2개 메시지로 돌려줍니다: [1] 변경할 닉네임만 단독(복사하기 쉽게), [2] 기존 안내 문구."""
+    nick_only, guide_text = build_nickchange_parts(user_id)
+    messages = []
+    if nick_only:
+        messages.append(TextMessage(text=nick_only))
+    messages.append(TextMessage(text=guide_text))
+    return messages
+
+
 def build_nickchange_text(user_id):
-    """'/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임/이모지로 채워 돌려줍니다."""
+    """(호환용) 기존 안내 문구만 돌려줍니다."""
+    return build_nickchange_parts(user_id)[1]
+
+
+def build_nickchange_parts(user_id):
+    """'/ㅇㅈ 닉변' 멘트를 신입이 입력한 생년/닉네임/이모지로 채워서 (닉네임 단독 문자열, 안내 문구)로 돌려줍니다."""
     row = get_validation_row(user_id, "nickname, birth_year, gender")
     nickname = row.get('nickname') or ""
     birth_year = row.get('birth_year') or ""
@@ -801,7 +816,30 @@ def build_nickchange_text(user_id):
             f"{short_year} {nickname}{nickname_emoji}\n\n"  # 👈 여기도 short_year 적용
             "변경 후 프로필 사진도 도용 사진이 아닌 사진으로 설정해 주시고, '변경완료'라고 답장해 주세요."
         )
-    return nickchange_text
+    # 변경할 닉네임만 단독으로 (생년 2자리 + 닉네임 + 이모지). 닉네임 정보가 없으면 단독 메시지는 만들지 않음.
+    nick_only = f"{short_year} {nickname}{nickname_emoji}".strip() if nickname else ""
+    return nick_only, nickchange_text
+
+
+def send_reply_or_push(reply_token, source_id, messages):
+    """reply로 먼저 보내고, 실패하면 그룹으로 push로 재시도합니다. 성공 여부 반환(실패 사유는 로그)."""
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=reply_token, messages=messages)
+            )
+        return True
+    except Exception as e:
+        print(f"⚠️ reply 발송 실패(push로 재시도): {e}")
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message_with_http_info(
+                PushMessageRequest(to=source_id, messages=messages)
+            )
+        return True
+    except Exception as e:
+        print(f"⚠️ push 발송도 실패: {e}")
+        return False
 
 
 def finalize_after_nickname_check(source_id, user_id, reply_token):
@@ -828,7 +866,10 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
 
     # ✨ [변경됨] 깨끗한 신규 유저(양식 중복/블랙 이력 없음 + 음성 유사매칭 없음)일 때만 '/ㅇㅈ 퇴장' 멘트를 내보낸다.
     # 그 외에는 퇴장 멘트 대신 운영진 멘션 + 추가 확인 안내만 보낸다.
-    if has_blacklist_issue(user_id) or not is_clean_new_user(user_id):
+    _blacklist_issue = has_blacklist_issue(user_id)
+    _clean_new = is_clean_new_user(user_id)
+    print(f"[퇴장 멘트 판정] user_id={user_id} 음성블랙이슈={_blacklist_issue} 깨끗한신규(dup_clean)={_clean_new}")
+    if _blacklist_issue or not _clean_new:
         if supabase:
             supabase_execute(
                 lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
@@ -864,11 +905,16 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
     #  미리 함께 보낸다. 즉, "실제로 나갔는지" 확정 확인 후 발송이 아니라 안내와 동시 발송임.)
     completion_message = build_all_mention_message(f"[{nickname or '신입'}]님 인증이 완료되었습니다.")
 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=exit_text), completion_message])
-        )
+    sent_ok = send_reply_or_push(reply_token, source_id, [TextMessage(text=exit_text), completion_message])
+    if not sent_ok:
+        # 퇴장 멘트가 실제로 못 나갔다면 '퇴장대기'로 두면 다음 "없다"가 무시되므로, 재시도 가능하게 되돌림
+        print(f"⚠️ user_id={user_id} 퇴장 멘트 발송 실패 -> 헤르페스확인대기로 되돌림")
+        if supabase:
+            supabase_execute(
+                lambda: supabase.table('user_validations').update({"status": "헤르페스확인대기"}).eq('user_id', user_id).execute(),
+                label="퇴장 멘트 발송 실패 롤백"
+            )
+        sync_status_to_sheet(user_id, "헤르페스확인대기")
 
 
 @app.route("/api", methods=['POST'])
@@ -1294,12 +1340,23 @@ def handle_message(event):
                     if reply_text and tracked_user_id:
                         reply_text = f"{reply_text}\n\n{format_voice_check_status(tracked_user_id)}"
             else:
-                reply_text = f"❌ '{room_name_input}' 정보를 방관리(DB)에서 찾을 수 없습니다. 방관리 시트에 방금 추가했다면 /디비업데이트 후 다시 시도해 주세요."
+                # ✨ [추가됨] 방 이름이 아니면 '닉네임'으로 보고 과거 검증 기록 + 음성DB 기록을 조회 (/닉네임 확인)
+                nick_text = format_nickname_history(room_name_input) if room_name_input else None
+                if nick_text:
+                    reply_text = nick_text
+                else:
+                    reply_text = (
+                        f"❌ '{room_name_input}' 정보를 방관리(DB)에서도, 닉네임 기록(검증/음성DB)에서도 찾을 수 없습니다. "
+                        "방관리 시트에 방금 추가했다면 /디비업데이트 후 다시 시도해 주세요."
+                    )
 
             if reply_text:
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=t) for t in split_for_line(reply_text)]
+                    ))
             return
 
     # 📌 [핵심 검증 1] 1번 양식 제출 처리 (마지막 입장 유저만 작동)
@@ -1669,7 +1726,7 @@ def handle_message(event):
         # (남성은 보통 운영진이 먼저 '/ㅇㅈ 4번' 멘트를 보낸 뒤 이 "확인"을 받지만, 여성은 '4번' 과정 없이
         #  '문제없음' 확인 직후 바로 이 "확인"을 받아도 동일하게 진행됩니다 — 코드상 '4번' 발송 여부는 확인하지 않습니다.)
         if current_status_for_check == "승인대기":
-            nickchange_text = build_nickchange_text(user_id)
+            nickchange_messages = build_nickchange_messages(user_id)
 
             if supabase:
                 supabase_execute(
@@ -1681,7 +1738,7 @@ def handle_message(event):
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=nickchange_text)])
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=nickchange_messages)
                 )
             return
 
@@ -1750,7 +1807,7 @@ def handle_message(event):
                     print(f"⚠️ user_id={user_id} '4번' 인증 멘트가 DB(auth_ments)에 등록되어 있지 않아 자동 발송을 건너뜁니다. 키워드 '4번'을 등록해 주세요.")
             else:
                 # 여성: '4번'/'확인' 없이 바로 닉변 멘트 발송 (상태는 위에서 이미 '닉변대기'로 전환됨)
-                reply_messages.append(TextMessage(text=build_nickchange_text(user_id)))
+                reply_messages.extend(build_nickchange_messages(user_id))
 
             if reply_messages:
                 with ApiClient(configuration) as api_client:
@@ -1813,9 +1870,11 @@ def handle_message(event):
         word in user_message for word in ["없습니다", "없어요", "없다", "없음", "아니요", "아니오"]
     ):
         if not is_last_joined_user(source_id, user_id):
+            print(f"[없다 처리] 무시됨: 마지막 입장 유저가 아님 user_id={user_id}")
             return
 
         current_row = get_validation_row(user_id, "status")
+        print(f"[없다 처리] user_id={user_id} 현재 status={current_row.get('status')}")
         if current_row.get('status') == "헤르페스확인대기":
             finalize_after_nickname_check(source_id, user_id, event.reply_token)
         return
@@ -2233,6 +2292,124 @@ def format_form_basic_info(*, nickname, birth_year, age, gender, region, marriag
     )
 
 
+def split_for_line(text, limit=4800, max_parts=5):
+    """LINE 텍스트 메시지(최대 5000자) 제한에 맞춰 줄 단위로 나눕니다. (한 번의 reply에 최대 5개)"""
+    parts, cur = [], ""
+    for line in str(text).split("\n"):
+        while len(line) > limit:  # 한 줄이 너무 길면 강제로 자름
+            if cur:
+                parts.append(cur); cur = ""
+            parts.append(line[:limit]); line = line[limit:]
+        if len(cur) + len(line) + 1 > limit and cur:
+            parts.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    if len(parts) > max_parts:
+        parts = parts[:max_parts]
+        parts[-1] = parts[-1][:limit - 20] + "\n…(이하 생략)"
+    return parts
+
+
+def format_nickname_history(nickname):
+    """관리자방 '/닉네임 확인'용: 해당 닉네임의 과거 검증 기록 + 음성DB 기록을 모아 문자열로 돌려줍니다.
+    기록이 전혀 없으면 None. (닉네임 완전일치를 우선 보고, 없으면 부분일치로 한 번 더 찾습니다.)"""
+    name = str(nickname or "").strip()
+    if not supabase or not name:
+        return None
+
+    val_cols = ('user_id, nickname, gender, region, birth_year, status, entry_date, retry_count, '
+                'black_reason, details, voice_check_report')
+    rows, partial = [], False
+    try:
+        res = supabase.table('user_validations').select(val_cols).eq('nickname', name).execute()
+        rows = res.data or []
+        if not rows and "%" not in name and "_" not in name:
+            res = supabase.table('user_validations').select(val_cols).ilike('nickname', f"%{name}%").limit(10).execute()
+            rows = res.data or []
+            partial = bool(rows)
+    except Exception as e:
+        print(f"닉네임 확인 - user_validations 조회 실패: {e}")
+        return "⚠️ 닉네임 기록 조회에 실패했습니다. 잠시 후 다시 시도해 주세요."
+
+    # 음성DB: 닉네임 일치 + 위에서 찾은 유저ID 일치 (임베딩 등 무거운 컬럼은 가져오지 않음)
+    uids = [str(r.get('user_id')).strip() for r in rows if r.get('user_id')]
+    vp_rows = {}
+    def _fetch_vp(cols):
+        found = []
+        q = supabase.table('voice_profiles').select(cols).eq('nickname', name).execute()
+        found += q.data or []
+        if uids:
+            q2 = supabase.table('voice_profiles').select(cols).in_('user_id', uids).execute()
+            found += q2.data or []
+        return found
+    try:
+        try:
+            vp_list = _fetch_vp('user_id, nickname, source, black_reason')
+        except Exception:
+            vp_list = _fetch_vp('user_id, nickname, source')
+        for vp in vp_list:
+            key = (str(vp.get('user_id') or ''), str(vp.get('nickname') or ''), str(vp.get('source') or ''))
+            vp_rows[key] = vp
+    except Exception as e:
+        print(f"닉네임 확인 - voice_profiles 조회 실패: {e}")
+
+    if not rows and not vp_rows:
+        return None
+
+    def _vp_kind(vp):
+        return "신입 음성인증" if vp.get('source') == 'new_member' else "블랙리스트 음성 등록"
+
+    vp_by_uid = {}
+    for vp in vp_rows.values():
+        vp_by_uid.setdefault(str(vp.get('user_id') or ''), []).append(vp)
+
+    out = [f"🔎 [{name}] 과거 기록" + (" (닉네임 부분일치)" if partial else "")]
+    shown_vp_keys = set()
+
+    if rows:
+        out.append(f"\n📚 검증 기록 {len(rows)}건")
+    for i, r in enumerate(rows, 1):
+        uid = str(r.get('user_id') or '').strip()
+        details = r.get('details') or {}
+        if isinstance(details, str):
+            try: details = json.loads(details)
+            except Exception: details = {}
+        lines = [
+            f"\n[{i}] {r.get('nickname') or '-'} / {r.get('birth_year') or '-'}년생 / {r.get('gender') or '-'} / {r.get('region') or '-'}",
+            f" - 유저ID: {uid or '-'}",
+            f" - 상태: {r.get('status') or '-'} / 재시도 {r.get('retry_count') or 1}회 / 입장일: {r.get('entry_date') or '-'}",
+        ]
+        if str(r.get('black_reason') or '').strip():
+            lines.append(f" - 💀 블랙사유: {str(r.get('black_reason')).strip()}")
+        detail_lines = []
+        for key, label in [("leave_reason", "나온이유"), ("kick_reason", "킥이력"), ("yadan", "야단라경험"),
+                           ("inviter", "초대자"), ("marriage", "결혼유무"), ("military", "군필여부")]:
+            val = str(details.get(key, "")).strip() if isinstance(details, dict) else ""
+            if val:
+                detail_lines.append(f"{label}: {val}")
+        if detail_lines:
+            lines.append(f" - 📝 입력내용: {' / '.join(detail_lines)}")
+        for vp in vp_by_uid.get(uid, []):
+            shown_vp_keys.add((str(vp.get('user_id') or ''), str(vp.get('nickname') or ''), str(vp.get('source') or '')))
+            extra = f" / 사유: {vp.get('black_reason')}" if vp.get('black_reason') else ""
+            lines.append(f" - 🎙️ 음성DB: {_vp_kind(vp)}{extra}")
+        vr = str(r.get('voice_check_report') or '').strip()
+        if vr:
+            lines.append(f" - 🎙️ 음성확인 요약:\n{vr[:700]}{'…' if len(vr) > 700 else ''}")
+        out.append("\n".join(lines))
+
+    extra_vps = [vp for k, vp in vp_rows.items() if k not in shown_vp_keys]
+    if extra_vps:
+        out.append(f"\n🎙️ 음성DB 기록 {len(extra_vps)}건 (검증 기록과 연결되지 않은 것)")
+        for vp in extra_vps:
+            extra = f" / 사유: {vp.get('black_reason')}" if vp.get('black_reason') else ""
+            out.append(f" - {vp.get('nickname') or '(닉네임 없음)'} / {_vp_kind(vp)} / 유저ID: {vp.get('user_id') or '-'}{extra}")
+
+    return "\n".join(out)
+
+
 def format_voice_check_status(user_id):
     """'N번방 확인' 명령어에서 특정 유저의 음성검증 진행 상태를 사람이 읽기 좋은 문장으로 만들어 돌려줍니다.
     - 음성검증까지 확인이 끝났는지 여부
@@ -2291,11 +2468,18 @@ def format_voice_check_status(user_id):
         # 분석은 '문제없음' 답장 시점에 실행되므로, 이 상태에서는 아직 자동분석 결과가 없는 게 정상.
         note = "자동분석 진행 중" if status == "분석중" else "'문제없음' 답장 대기 중"
         return f"🎙️ 음성검증: ⏳ 음성 파일 제출 완료, {note}{analysis_error_note}"
-    if status in ("승인대기", "완료"):
-        if status == "승인대기":
-            header = "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)"
-        else:
-            header = "🎙️ 음성검증: ✅ 음성 파일 제출 + 운영진 최종 승인까지 완료"
+    # ✨ [추가됨] '문제없음' 확인 이후 단계들(닉변/헤르페스/퇴장/운영진 추가확인)도 음성 확인은 이미 끝난 상태이므로
+    # '상태 확인 불가'로 떨어지지 않게 같은 방식으로 자동분석 요약을 보여준다.
+    _after_voice_headers = {
+        "승인대기": "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)",
+        "완료": "🎙️ 음성검증: ✅ 음성 파일 제출 + 운영진 최종 승인까지 완료",
+        "닉변대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (신입 닉네임 변경 대기 중)",
+        "헤르페스확인대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (헤르페스 질문 답변 대기 중)",
+        "퇴장대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (퇴장 안내 발송됨, 신입 퇴장 대기 중)",
+        "관리자검토대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (운영진 추가 확인 대기 중)",
+    }
+    if status in _after_voice_headers:
+        header = _after_voice_headers[status]
         lines = [header]
         if checked_at:
             lines.append(f"- 확인 시점: {checked_at}")
