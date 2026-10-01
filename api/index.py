@@ -1619,6 +1619,13 @@ def handle_message(event):
                 if user_res.data:
                     retry_cnt = user_res.data[0].get('retry_count', 1) + 1
                     existing_entry_date = user_res.data[0].get('entry_date')
+                    # ✨ [추가됨] 인증 진행 중 1번 양식을 '수정 재제출'한 경우, 이미 진행된 단계(음성대기/음성확인중/
+                    # 닉변대기/헤르페스확인대기 등)를 '입장대기'로 되돌리지 않고 유지한다.
+                    # (되돌리면 이후 '확인' 입력 시 음성인증을 처음부터 다시 요청하게 됨)
+                    _existing_status = user_res.data[0].get('status')
+                    if is_edit_resubmission and _existing_status and _existing_status not in ("입장대기", "완료"):
+                        target_status = _existing_status
+                        retry_cnt = user_res.data[0].get('retry_count', 1)  # 수정 재제출은 재시도 횟수에 포함하지 않음
 
                 # 기존 입장일 기록에 이번 날짜를 콤마로 이어붙임 (덮어쓰지 않고 누적)
                 entry_date_to_save = f"{existing_entry_date},{current_date}" if existing_entry_date else current_date
