@@ -705,9 +705,10 @@ def build_all_mention_message(text_body):
     if _MENTION_SUPPORTED:
         try:
             return TextMessageV2(
-                text="{전체} " + text_body,
+                text="{everyone} " + text_body,
                 substitution={
-                    "전체": MentionSubstitutionObject(
+                    # LINE 규칙: substitution 키는 영문/숫자/_ (1~20자)만 허용 → 한글 키("전체")는 400 에러
+                    "everyone": MentionSubstitutionObject(
                         type="mention",
                         mentionee=AllMentionTarget(type="all")
                     )
