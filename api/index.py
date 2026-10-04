@@ -1,5 +1,6 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import re
 import time
 import random
 import json
@@ -763,6 +764,17 @@ def has_blacklist_issue(user_id):
     matches = voice_result.get('matches') or []
     # 블랙리스트 음성뿐 아니라 기존 신입 음성과 강하게 유사한 경우(다른 닉/계정 재입장 의심)도 운영진 검토 대상
     return any((m.get('similarity') or 0) >= VOICE_MATCH_ALERT_THRESHOLD for m in matches)
+
+
+def is_yadan_none(yadan_text):
+    """1번 양식의 '야단라경험유무' 답변이 '무/없음' 계열인지 판별합니다.
+    (예: 무, 없음, 없어요, 없습니다, x, no, 해당없음, -)  비어 있어도 '없음'으로 봅니다."""
+    t = re.sub(r"[\s\.\,\!\~\-\_\(\)\[\]]", "", str(yadan_text or "")).lower()
+    if t == "":
+        return True
+    if t in ("무", "x", "no", "none", "없", "해당없음", "해당사항없음", "ㅇㅇ없음", "ㄴㄴ"):
+        return True
+    return t.startswith("없") and len(t) <= 8
 
 
 def is_clean_new_user(user_id):
@@ -1608,7 +1620,7 @@ def handle_message(event):
             "age": age, "marriage": marriage, "military": military,
             "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason,
             # ✨ 마지막 '퇴장' 멘트 직전에 확인하는 값: 중복/블랙 이력이 없는 깨끗한 신규 유저인지
-            "dup_clean": bool(dup_check_ok and not alert_text),
+            "dup_clean": bool(dup_check_ok and not alert_text and not is_yadan_none(yadan)),
         }
         
         target_status = "입장대기"
