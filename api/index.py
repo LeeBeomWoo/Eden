@@ -834,6 +834,192 @@ def build_nickchange_parts(user_id):
     return nick_only, nickchange_text
 
 
+# ==========================================
+# ✨ [추가됨] 닉네임 수동 변경('/새닉 변경') + 재제출 이력/비교
+#   - 신입이 다른 닉네임으로 바꾸기로 하면, 운영진이 그 방에서 '/바뀐닉 변경'을 입력해 DB 닉네임을 직접 수정합니다.
+#   - user_validations.details(JSON)에 아래 값들을 쌓습니다. (컬럼/테이블 추가 불필요)
+#       form_nickname : 양식에 적었던 닉네임 (중복검사/비교용, 운영진이 바꿔도 보존)
+#       nick_changes  : 운영진이 닉네임을 바꾼 기록 [{at, from, to, by}]
+#       history       : 재제출 때마다 이전 양식 스냅샷 (최근 5개)
+# ==========================================
+DIFF_DETAIL_FIELDS = [
+    ("marriage", "결혼유무"), ("military", "군필여부"), ("leave_reason", "나온이유"),
+    ("kick_reason", "킥이력"), ("yadan", "야단라경험"), ("inviter", "초대자"),
+]
+
+
+def _load_details(raw):
+    """details가 문자열(JSON)이어도 dict로 안전하게 변환"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _norm_year(y):
+    """1991 / 91 / '91년생' 모두 '91'로 맞춰 비교"""
+    return re.sub(r"\D", "", str(y or ""))[-2:]
+
+
+def _kst_now_str(fmt="%Y-%m-%d %H:%M"):
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(kst).strftime(fmt)
+
+
+def diff_with_previous(old_row, new):
+    """이전 제출(old_row: user_validations 행)과 이번 제출(new: dict)을 비교합니다.
+    반환: (달라진 항목 줄 리스트, 성별/년생 불일치 여부)"""
+    od = _load_details(old_row.get('details'))
+    lines, critical = [], False
+
+    og = _GENDER_NORM_MAP.get(str(old_row.get('gender') or '').strip())
+    ng = _GENDER_NORM_MAP.get(str(new.get('gender') or '').strip())
+    if og and ng and og != ng:
+        lines.append(f"성별: {og} → {ng} ⚠️")
+        critical = True
+
+    oy, ny = _norm_year(old_row.get('birth_year')), _norm_year(new.get('birth_year'))
+    if oy and oy != ny:
+        lines.append(f"년생: {old_row.get('birth_year')} → {new.get('birth_year')} ⚠️")
+        critical = True
+
+    # 닉네임은 '양식에 적었던 값'끼리 비교 (운영진이 닉변해 둔 값과 섞이지 않게)
+    old_form_nick = str(od.get('form_nickname') or old_row.get('nickname') or '').strip()
+    new_nick = str(new.get('nickname') or '').strip()
+    if old_form_nick and old_form_nick != new_nick:
+        lines.append(f"닉네임: {old_form_nick} → {new_nick}")
+
+    o_reg = re.sub(r"\s", "", str(old_row.get('region') or ''))
+    n_reg = re.sub(r"\s", "", str(new.get('region') or ''))
+    if o_reg and o_reg != n_reg:
+        lines.append(f"지역: {old_row.get('region')} → {new.get('region')}")
+
+    for key, label in DIFF_DETAIL_FIELDS:
+        a, b = str(od.get(key, '')).strip(), str(new.get(key, '')).strip()
+        if a and a != b:
+            # 과거엔 있었다고 했는데 이번엔 '없음'으로 바꾼 경우는 강조
+            warn = " ⚠️ (이전에는 있음 → 이번엔 없음)" if key in ("yadan", "kick_reason") and is_yadan_none(b) and not is_yadan_none(a) else ""
+            lines.append(f"{label}: {a} → {b}{warn}")
+
+    changes = od.get('nick_changes') or []
+    if changes:
+        lines.append("(이전 운영진 닉변 이력: " + " / ".join(f"{c.get('from')}→{c.get('to')}" for c in changes[-3:]) + ")")
+    return lines, critical
+
+
+def sync_nickname_to_sheet(user_id, nickname):
+    """검증 시트 A열(닉네임)만 동기화합니다. 실패해도 무시합니다."""
+    try:
+        with sheet_sync_lock():
+            if validation_sheet:
+                ids = [str(v).strip() for v in validation_sheet.col_values(5)]
+                if user_id in ids:
+                    validation_sheet.update(range_name=f'A{ids.index(user_id) + 1}', values=[[nickname]])
+    except Exception as e:
+        print(f"닉네임 시트 동기화 에러: {e}")
+
+
+def find_nickname_conflicts(nick, exclude_uid):
+    """새 닉네임과 같은 '다른 유저'의 검증기록/음성DB 기록을 줄 리스트로 돌려줍니다.
+    (user_id가 NULL인 행도 놓치지 않도록 파이썬에서 필터링)"""
+    out = []
+    if not supabase or not nick:
+        return out
+    r1 = supabase_execute(
+        lambda: supabase.table('user_validations').select('user_id, nickname, birth_year, gender, black_reason').eq('nickname', nick).execute(),
+        label="새 닉네임 중복조회(검증)"
+    )
+    for r in (r1.data if r1 and r1.data else []):
+        if str(r.get('user_id') or '') == str(exclude_uid):
+            continue
+        black = f" / 💀 블랙사유: {str(r['black_reason']).strip()}" if str(r.get('black_reason') or '').strip() else ""
+        out.append(f" - 검증기록: {r.get('nickname')} / {r.get('birth_year') or '-'}년생 / {r.get('gender') or '-'}{black}")
+    r2 = supabase_execute(
+        lambda: supabase.table('voice_profiles').select('user_id, nickname, source').eq('nickname', nick).execute(),
+        label="새 닉네임 중복조회(음성DB)"
+    )
+    for r in (r2.data if r2 and r2.data else []):
+        if str(r.get('user_id') or '') == str(exclude_uid):
+            continue
+        kind = "신입 음성인증" if r.get('source') == 'new_member' else "블랙리스트 음성 등록"
+        out.append(f" - 🎙️ 음성DB: {kind} ({r.get('nickname')})")
+    return out
+
+
+def apply_nickname_change(source_id, sender_user_id, new_nick):
+    """'/새닉 변경' 처리. 이 방에서 인증 진행 중인 신입의 DB 닉네임을 new_nick으로 바꾸고 이력을 남깁니다.
+    반환: 방에 reply할 TextMessage 리스트 (신입 본인이 입력했으면 빈 리스트 = 무시)"""
+    target = get_room_target_user_id(source_id)
+    if not target:
+        return [TextMessage(text="❌ 현재 이 방에서 인증 진행 중인 신입 유저를 찾을 수 없습니다.")]
+    if target == sender_user_id:
+        return []  # 신입이 스스로 못 바꾸게 무시
+
+    row = get_validation_row(target, "nickname, birth_year, gender, status, details")
+    if not row:
+        return [TextMessage(text="❌ 해당 유저의 인증 정보를 DB에서 찾을 수 없습니다.")]
+
+    short_year = _norm_year(row.get('birth_year'))
+    emoji = "⚖️" if (row.get('gender') or '') in ("여", "여자") else "🧨"
+
+    # 표시명 전체('91 오브🧨')를 붙여 넣어도 닉네임만 남기기
+    new_nick = re.sub(r"[⚖🧨\uFE0F]+$", "", new_nick).strip()
+    if short_year and new_nick.startswith(short_year + " "):
+        new_nick = new_nick[len(short_year):].strip()
+    if not new_nick:
+        return [TextMessage(text="사용법: /바뀐닉네임 변경")]
+
+    old_nick = row.get('nickname') or ""
+    if new_nick == old_nick:
+        return [TextMessage(text=f"ℹ️ 이미 '{new_nick}'(으)로 저장되어 있습니다.")]
+
+    details = _load_details(row.get('details'))
+    details.setdefault('form_nickname', old_nick)              # 양식에 적었던 닉네임 보존
+    changes = list(details.get('nick_changes') or [])
+    changes.append({"at": _kst_now_str(), "from": old_nick, "to": new_nick, "by": sender_user_id})
+    details['nick_changes'] = changes[-5:]
+
+    conflicts = find_nickname_conflicts(new_nick, target)
+    if conflicts:
+        # 새 닉네임이 기존 기록과 겹치면 마지막에 자동 '퇴장' 멘트 대신 운영진 추가확인으로 보낸다
+        details['dup_clean'] = False
+
+    res = supabase_execute(
+        lambda: supabase.table('user_validations').update({"nickname": new_nick, "details": details}).eq('user_id', target).execute(),
+        label="닉네임 수동 변경"
+    )
+    if res is None:
+        return [TextMessage(text="⚠️ 닉네임 변경 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")]
+
+    sess = get_user_session(target)
+    if isinstance(sess, dict):
+        sess["nickname"] = new_nick
+        set_user_session(target, sess)
+    sync_nickname_to_sheet(target, new_nick)
+
+    # 충돌 상세는 신입이 있는 방에 노출하지 않고 운영진방으로만 알린다
+    if conflicts:
+        alert = (f"🔁 닉네임 수동 변경 알림\n- {old_nick} → {new_nick}\n- 유저ID: {target}\n\n"
+                 f"⚠️ 새 닉네임과 같은 기존 기록이 있습니다:\n" + "\n".join(conflicts) +
+                 "\n\n※ 자동 퇴장 멘트 대신 '운영진 추가 확인' 안내로 진행되니 직접 확인해 주세요.")
+        try:
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).push_message_with_http_info(
+                    PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=alert[:4900])])
+                )
+        except Exception as e:
+            print(f"⚠️ 닉네임 변경 충돌 알림 전송 실패: {e}")
+
+    status = row.get('status')
+    hint = {"닉변대기": "변경 후 '변경완료'", "헤르페스확인대기": "변경 후 '확인'"}.get(status, "변경 후 안내에 따라 답장")
+    return [
+        TextMessage(text=f"✅ 닉네임을 '{new_nick}'(으)로 변경 처리했습니다.\n아래 닉네임으로 바꾸시고 프사도 설정한 뒤 {hint}을(를) 입력해 주세요."),
+        TextMessage(text=f"{short_year} {new_nick}{emoji}".strip()),
+    ]
+
+
 def send_reply_or_push(reply_token, source_id, messages):
     """reply로 먼저 보내고, 실패하면 그룹으로 push로 재시도합니다. 성공 여부 반환(실패 사유는 로그)."""
     try:
@@ -869,7 +1055,13 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
     birth_year = row.get('birth_year') or ""
 
     if not is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
-        reply_text = "닉네임을 변경하여 주시고 프사를 설정하여 주세요. 그리고 다시 확인이라고 입력하여 주세요."
+        # ✨ [수정됨] 어떤 형식으로 바꿔야 하는지 알려준다. (다른 닉으로 하고 싶으면 운영진이 '/새닉 변경'으로 DB 값을 바꿔줌)
+        short_year = str(birth_year)[-2:]
+        reply_text = (
+            f"닉네임이 아직 '{short_year} {nickname}' 형식과 맞지 않아요.\n"
+            "닉네임을 변경하고 프사를 설정한 뒤 다시 '확인'이라고 입력해 주세요.\n"
+            "다른 닉네임으로 하고 싶으시면 운영진에게 말씀해 주세요."
+        )
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
@@ -1035,6 +1227,20 @@ def handle_message(event):
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=id_reply)])
                 )
             return
+
+        # ✨ [추가됨] /바뀐닉 변경 : 신입이 다른 닉네임으로 바꾸기로 했을 때, 운영진이 그 방에서
+        # 이 명령을 입력하면 DB의 닉네임 값을 직접 수정한다. (예: "/오브할게요 변경")
+        # 인증자방에서는 동작하지 않고, 신입 본인이 입력한 건 무시한다.
+        if (not is_admin_room) and command.endswith("변경") and cmd_prefix not in ("인증", "ㅇㅈ", "ㅇㅅㅇㅈ"):
+            changed_nick = command[:-2].strip()
+            if changed_nick:
+                nick_messages = apply_nickname_change(source_id, user_id, changed_nick)
+                if nick_messages:
+                    with ApiClient(configuration) as api_client:
+                        MessagingApi(api_client).reply_message_with_http_info(
+                            ReplyMessageRequest(reply_token=event.reply_token, messages=nick_messages)
+                        )
+                return
 
         # 음성인증 멘트 수동 발송: /인증 음성인증, /ㅇㅈ 음성인증, /ㅇㅅㅇㅈ
         # (자동으로 "확인" 답장을 받아 진행되지 않았거나, 관리자가 직접 재발송해야 할 때 사용)
@@ -1448,7 +1654,8 @@ def handle_message(event):
         id_match_lines = []   # 이번 검사에서 '유저ID 일치'로 잡힌 기록 상세
         id_match_level = 0    # 그중 가장 높은 경고 수준
         prior_id_lines = list(current_room_state.get('prior_id_lines') or []) if is_edit_resubmission else []
-        prior_id_level = int(current_room_state.get('prior_id_level') or 0) if is_edit_resubmission else 0
+        # ✨ [변경됨] 3.5(🟠) 같은 소수 단계를 쓰므로 int → float
+        prior_id_level = float(current_room_state.get('prior_id_level') or 0) if is_edit_resubmission else 0
 
         if supabase:
             try:
@@ -1487,8 +1694,14 @@ def handle_message(event):
                         except Exception:
                             rec_details = {}
 
+                    # ✨ [변경됨] 운영진이 닉네임을 수동 변경('/새닉 변경')한 유저도,
+                    # 처음 양식에 적었던 닉네임(form_nickname)으로 닉네임 일치를 잡을 수 있게 함께 비교한다.
+                    rec_form_nick = str(rec_details.get('form_nickname', '')).strip() if isinstance(rec_details, dict) else ""
                     is_id_matched = (rec_id == str(user_id).strip() and rec_id != "")
-                    is_name_matched = (rec_name == nickname and rec_name != "")
+                    is_name_matched = (
+                        (rec_name == nickname and rec_name != "")
+                        or (rec_form_nick == nickname and rec_form_nick != "")
+                    )
 
                     if is_id_matched or is_name_matched:
                         match_reasons = []
@@ -1523,6 +1736,18 @@ def handle_message(event):
                         if detail_lines:
                             row_info += f"\n - 📝 기존 입력 내용: {' / '.join(detail_lines)}"
 
+                        # ✨ [추가됨] 동일 유저ID라면, 이전에 제출한 양식과 이번 양식에서 달라진 항목을 비교해서 보여준다.
+                        # 성별/년생이 이전과 다르면 diff_critical=True → 아래에서 🟠 경고 단계로 올린다.
+                        diff_critical = False
+                        if is_id_matched:
+                            diff_lines, diff_critical = diff_with_previous(row, {
+                                "nickname": nickname, "birth_year": birth_year, "gender": gender, "region": region,
+                                "marriage": marriage, "military": military, "yadan": yadan,
+                                "leave_reason": leave_reason, "kick_reason": kick_reason, "inviter": inviter,
+                            })
+                            if diff_lines:
+                                row_info += "\n - 🔀 이전 제출과 달라진 내용:\n   " + "\n   ".join(diff_lines)
+
                         # 같은 유저ID의 음성DB 프로필이 있으면 함께 표시
                         linked_vp = vp_by_uid.get(rec_id) if rec_id else None
                         if linked_vp:
@@ -1539,6 +1764,9 @@ def handle_message(event):
                             else: current_level = 1
                         if is_id_matched:
                             if current_level < 3: current_level = 3
+                        # ✨ [추가됨] 동일 ID인데 성별/년생이 이전 제출과 다르면 🟠 경고(3.5). 블랙(5)은 아래에서 그대로 우선한다.
+                        if is_id_matched and diff_critical and current_level < 3.5:
+                            current_level = 3.5
                         if rec_black:
                             current_level = 5
 
@@ -1550,6 +1778,7 @@ def handle_message(event):
                             highest_alert_level = current_level
                             if current_level == 5: alert_status_text, color_emoji = "💀 [위험] 블랙리스트 유저 감지", "⚫"
                             elif current_level == 4: alert_status_text, color_emoji = "🚨 [적색 경고] 닉네임 및 모든 정보 일치", "🔴"
+                            elif current_level == 3.5: alert_status_text, color_emoji = "🟠 [경고] 동일 ID인데 성별/년생이 이전과 다름", "🟠"
                             elif current_level == 3: alert_status_text, color_emoji = "🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"
                             elif current_level == 2: alert_status_text, color_emoji = "⚠️ [황색 경고] 닉네임 및 정보 일부 일치", "🟡"
                             elif current_level == 1: alert_status_text, color_emoji = "🔵 [주의] 닉네임 일치 유저", "🟦"
@@ -1596,11 +1825,14 @@ def handle_message(event):
                     found_duplicates = prior_id_lines + found_duplicates
                     if carried_level > highest_alert_level:
                         highest_alert_level = carried_level
-                        alert_status_text, color_emoji = {
+                        # ✨ [변경됨] 🟠(3.5) 단계도 수정 재제출 때 사라지지 않도록 이어받는다.
+                        carried_map = {
                             5: ("💀 [위험] 블랙리스트 유저 감지", "⚫"),
                             4: ("🚨 [적색 경고] 닉네임 및 모든 정보 일치", "🔴"),
+                            3.5: ("🟠 [경고] 동일 ID인데 성별/년생이 이전과 다름", "🟠"),
                             3: ("🔄 [주의] 재입장 유저 (동일 ID 확인)", "🟪"),
-                        }[min(carried_level, 5) if carried_level in (3, 4, 5) else 3]
+                        }
+                        alert_status_text, color_emoji = carried_map.get(carried_level, carried_map[3])
 
                 if highest_alert_level > 0:
                     dup_details_str = "\n\n".join(found_duplicates)
@@ -1621,12 +1853,18 @@ def handle_message(event):
             "inviter": inviter, "yadan": yadan, "leave_reason": leave_reason, "kick_reason": kick_reason,
             # ✨ 마지막 '퇴장' 멘트 직전에 확인하는 값: 중복/블랙 이력이 없는 깨끗한 신규 유저인지
             "dup_clean": bool(dup_check_ok and not alert_text and not is_yadan_none(yadan)),
+            # ✨ [추가됨] 양식에 적은 닉네임 (운영진이 '/새닉 변경'으로 DB 닉네임을 바꿔도 이 값은 보존됨)
+            "form_nickname": nickname,
         }
         
         target_status = "입장대기"
+        nickname_to_save = nickname   # ✨ [추가됨] 수정 재제출 시 운영진이 바꿔둔 닉네임을 덮어쓰지 않기 위한 저장용 값
         if supabase:
             try:
-                user_res = supabase.table('user_validations').select('retry_count, status, entry_date').eq('user_id', user_id).execute()
+                # ✨ [변경됨] 이력 비교/보존을 위해 기존 닉네임/성별/지역/년생/details도 함께 조회
+                user_res = supabase.table('user_validations').select(
+                    'retry_count, status, entry_date, nickname, gender, region, birth_year, details'
+                ).eq('user_id', user_id).execute()
                 retry_cnt = 1
                 existing_entry_date = None
                 if user_res.data:
@@ -1640,12 +1878,35 @@ def handle_message(event):
                         target_status = _existing_status
                         retry_cnt = user_res.data[0].get('retry_count', 1)  # 수정 재제출은 재시도 횟수에 포함하지 않음
 
+                    # ✨ [추가됨] 이력 누적: details를 통째로 덮어쓰는 구조라, 이전 history/nick_changes를 반드시 이어받는다.
+                    prev = user_res.data[0]
+                    prev_d = _load_details(prev.get('details'))
+                    history = list(prev_d.get('history') or [])
+                    if not is_edit_resubmission:   # 같은 세션의 '수정 재제출'은 이력에 넣지 않음
+                        history.append({
+                            "at": current_date,
+                            "nickname": prev.get('nickname'),
+                            "form_nickname": prev_d.get('form_nickname') or prev.get('nickname'),
+                            "birth_year": prev.get('birth_year'), "gender": prev.get('gender'), "region": prev.get('region'),
+                            "age": prev_d.get('age'),
+                            **{k: prev_d.get(k) for k, _ in DIFF_DETAIL_FIELDS},
+                        })
+                    update_data_details["history"] = history[-5:]
+                    if prev_d.get('nick_changes'):
+                        update_data_details["nick_changes"] = prev_d['nick_changes']
+                        # 같은 세션에서 양식 내용만 고쳐 재제출했고 닉네임 양식 값이 그대로라면,
+                        # 운영진이 바꿔둔 닉네임/중복 플래그를 그대로 유지한다.
+                        if is_edit_resubmission and str(prev_d.get('form_nickname') or '').strip() == nickname:
+                            nickname_to_save = prev.get('nickname') or nickname
+                            if prev_d.get('dup_clean') is False:
+                                update_data_details["dup_clean"] = False
+
                 # 기존 입장일 기록에 이번 날짜를 콤마로 이어붙임 (덮어쓰지 않고 누적)
                 entry_date_to_save = f"{existing_entry_date},{current_date}" if existing_entry_date else current_date
 
                 supabase.table('user_validations').upsert({
                     "user_id": user_id,
-                    "nickname": nickname,
+                    "nickname": nickname_to_save,
                     "gender": gender,
                     "region": region,
                     "birth_year": birth_year,
@@ -1676,13 +1937,13 @@ def handle_message(event):
                         existing_entry_date_sheet = row_data[5].strip() if len(row_data) > 5 and row_data[5].strip() else ""
                         entry_date_to_save_sheet = f"{existing_entry_date_sheet},{current_date}" if existing_entry_date_sheet else current_date
 
-                        update_data_basic = [nickname, gender, region, birth_year, user_id, entry_date_to_save_sheet, "", current_retry_count + 1]
+                        update_data_basic = [nickname_to_save, gender, region, birth_year, user_id, entry_date_to_save_sheet, "", current_retry_count + 1]
                         validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[update_data_basic])
                         validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
                         validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
                     else:
                         found_row_index = len(all_data) + 1
-                        row_to_insert_basic = [nickname, gender, region, birth_year, user_id, current_date, "", 1]
+                        row_to_insert_basic = [nickname_to_save, gender, region, birth_year, user_id, current_date, "", 1]
                         validation_sheet.update(range_name=f'A{found_row_index}:H{found_row_index}', values=[row_to_insert_basic])
                         validation_sheet.update(range_name=f'K{found_row_index}:L{found_row_index}', values=[[user_id, target_status]])
                         validation_sheet.update(range_name=f'M{found_row_index}:S{found_row_index}', values=[details_list])
@@ -1711,7 +1972,7 @@ def handle_message(event):
             state_data["prior_id_level"] = max(prior_id_level, id_match_level)
 
             set_room_state(source_id, state_data, ttl=7200)
-            set_user_session(user_id, {"nickname": nickname, "gender": gender})
+            set_user_session(user_id, {"nickname": nickname_to_save, "gender": gender})
 
             if is_edit_resubmission:
                 # 이미 1번 양식을 제출한 상태에서 내용만 고쳐서 재제출한 경우: DB만 갱신하고 2번 멘트는 다시 보내지 않음
@@ -2302,6 +2563,7 @@ COLOR_LEGEND_TEXT = (
     "🎨 중복/블랙 필터링 색상 안내\n\n"
     "⚫ 블랙리스트 유저 감지\n"
     "🔴 닉네임 및 모든 정보 일치\n"
+    "🟠 동일 ID인데 성별/년생이 이전과 다름\n"
     "🟪 재입장 유저 (동일 ID 확인)\n"
     "🟡 닉네임 및 정보 일부 일치\n"
     "🟦 닉네임만 일치\n"
@@ -2371,6 +2633,15 @@ def format_nickname_history(nickname):
         print(f"닉네임 확인 - user_validations 조회 실패: {e}")
         return "⚠️ 닉네임 기록 조회에 실패했습니다. 잠시 후 다시 시도해 주세요."
 
+    # ✨ [추가됨] 운영진이 닉네임을 바꿔둔('/새닉 변경') 유저도, 처음 양식에 적었던 닉네임(details.form_nickname)으로 찾을 수 있게 함.
+    # (details가 jsonb 컬럼이 아니면 이 조회만 실패하고, 위의 기본 조회 결과는 그대로 사용됨)
+    try:
+        res2 = supabase.table('user_validations').select(val_cols).eq('details->>form_nickname', name).execute()
+        have = {str(r.get('user_id')) for r in rows}
+        rows += [r for r in (res2.data or []) if str(r.get('user_id')) not in have]
+    except Exception as e:
+        print(f"닉네임 확인 - form_nickname 조회 실패(무시): {e}")
+
     # 음성DB: 닉네임 일치 + 위에서 찾은 유저ID 일치 (임베딩 등 무거운 컬럼은 가져오지 않음)
     uids = [str(r.get('user_id')).strip() for r in rows if r.get('user_id')]
     vp_rows = {}
@@ -2429,6 +2700,17 @@ def format_nickname_history(nickname):
                 detail_lines.append(f"{label}: {val}")
         if detail_lines:
             lines.append(f" - 📝 입력내용: {' / '.join(detail_lines)}")
+
+        # ✨ [추가됨] 운영진 닉변 기록 + 이전 제출 이력(최근 3건)
+        _d = _load_details(details)
+        for c in (_d.get('nick_changes') or [])[-3:]:
+            lines.append(f" - 🔁 닉변: {c.get('from')} → {c.get('to')} ({c.get('at')})")
+        _hist = _d.get('history') or []
+        if _hist:
+            lines.append(f" - 🕘 이전 제출 {len(_hist)}건:")
+            for h in _hist[-3:]:
+                lines.append(f"   · {h.get('at')} {h.get('form_nickname') or h.get('nickname')} / {h.get('birth_year')}년생 / {h.get('gender')} / {h.get('region')}")
+
         for vp in vp_by_uid.get(uid, []):
             shown_vp_keys.add((str(vp.get('user_id') or ''), str(vp.get('nickname') or ''), str(vp.get('source') or '')))
             extra = f" / 사유: {vp.get('black_reason')}" if vp.get('black_reason') else ""
