@@ -34,23 +34,9 @@ from linebot.v3.webhooks import (
 )
 
 # ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
-from voice_analysis import submit_voice_analysis_job, process_admin_blacklist_voice_upload, VOICE_SERVICE_URLS
+from voice_analysis import submit_voice_analysis_job, process_admin_blacklist_voice_upload
 
 app = Flask(__name__)
-
-
-def warmup_voice_service():
-    """신입 입장 시 Cloud Run 음성분석 서비스를 미리 깨워둔다 (콜드스타트 완화용).
-    응답을 기다리지 않고 짧은 타임아웃으로 요청만 보내고, 실패/타임아웃 나도 무시한다.
-    (요청이 타임아웃 나더라도 Cloud Run 쪽 컨테이너 기동은 이미 시작됨)"""
-    """신입 입장 시 Cloud Run 음성분석 서비스들을 미리 깨워둔다 (콜드스타트 완화용).
-    어느 방이 어느 인스턴스로 갈지는 room_id 해시로 결정되므로, 웜업 시점엔 특정하기 어려워
-    등록된 URL 전부를 깨운다."""
-    for url in VOICE_SERVICE_URLS:
-        try:
-            requests.get(f"{url}/healthz", timeout=3)
-        except Exception:
-            pass
 
 
 # 인증자방(관리자 그룹방) ID 고정 설정
@@ -643,11 +629,6 @@ def start_voice_auth(user_id, require_status='입장대기'):
     u_data = u_res.data[0]
     if require_status is not None and u_data.get('status') != require_status:
         return False, None
-
-    # ✨ [추가됨] 콜드스타트 완화용 웜업 호출 시점을 "입장" 시점에서 "음성인증 시작(확인 답장)"
-    # 시점으로 옮김 — 신입이 실제로 녹음해서 보내기까지 걸리는 시간이 자연스러운 버퍼가 되어,
-    # '문제없음' 답장 때 크라우드런을 호출할 즈음엔 이미 웜업이 끝나 있을 확률이 높다.
-    threading.Thread(target=warmup_voice_service, daemon=True).start()
 
     user_nickname = u_data.get('nickname', '신입')
     user_gender = u_data.get('gender', '')
@@ -2307,10 +2288,6 @@ def handle_member_joined(event):
     if source_id == ADMIN_GROUP_CHAT_ID:
         return
 
-    # ✨ [변경됨] Cloud Run 웜업은 더 이상 입장 시점이 아니라 start_voice_auth()(=신입이
-    # "확인"이라고 답장해서 음성인증이 실제로 시작되는 시점)에서 호출한다. 입장~확인 사이에는
-    # 시간차가 커서 웜업이 식어버릴 수 있어, 실제 녹음 직전에 깨우는 게 더 효과적이다.
-
     joined_members = event.joined.members
     for member in joined_members:
         user_id = member.user_id
@@ -2992,12 +2969,10 @@ def handle_audio(event):
         session_data.setdefault("gender", claimed_gender)
         set_user_session(user_id, session_data)
 
-        # ✨ [변경됨] 여기서 클라우드런에 분석을 "접수"만 시키고 끝난다(결과를 기다리지 않음).
-        # 실제 무거운 분석(임베딩 추출 등)은 클라우드런이 백그라운드로 계속 진행하다가
+        # ✨ [변경됨] 여기서 음성분석 서버(Oracle VM)에 분석을 "접수"만 시키고 끝난다(결과를 기다리지 않음).
+        # 실제 무거운 분석(임베딩 추출 등)은 분석 서버가 백그라운드로 계속 진행하다가
         # 끝나면 Supabase에 직접 결과를 기록한다. '문제없음' 답장이 왔을 땐 그 결과를
         # 조회만 하면 되므로 그 요청이 무거워질 일이 없다.
-        # (submit_voice_analysis_job은 '접수 확인(202)'까지만 기다리도록 설계되어 있어
-        #  아래 reply가 크게 지연되지는 않지만, 콜드스타트 시엔 지연될 수 있다 — warmup으로 완화)
         submit_voice_analysis_job(
             supabase, configuration,
             message_id=event.message.id, user_id=user_id, nickname=claimed_nickname,
