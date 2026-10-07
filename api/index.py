@@ -636,13 +636,15 @@ def start_voice_auth(user_id, require_status='입장대기'):
     inviter = details.get('inviter', '없음')
 
     col_male, col_female = get_recording_ments()
+    g_norm = normalize_gender(user_gender)
     rec_ment = ""
-    if user_gender in ["남", "남자"] and col_male:
+    if g_norm == "남" and col_male:
         rec_ment = random.choice(col_male)
-    elif user_gender in ["여", "여자"] and col_female:
+    elif g_norm == "여" and col_female:
         rec_ment = random.choice(col_female)
 
     if not rec_ment:
+        print(f"⚠️ 녹음멘트 폴백: gender={user_gender!r}, 남={len(col_male)}개, 여={len(col_female)}개")
         rec_ment = "잘 부탁드립니다."
 
     # 한국 시간(KST) 기준 오늘 날짜 계산
@@ -1068,7 +1070,7 @@ def register_existing_member(admin_user_id, extracted, force_new=False):
     필수 항목이 비면 등록하지 않고 안내만 한다(대기 상태는 유지되어 다시 제출하면 됨)."""
     nickname = extracted.get("닉네임", "").strip()
     birth_year = _norm_year(extracted.get("년생", ""))
-    gender = extracted.get("성별", "").strip()
+    gender = normalize_gender(extracted.get("성별", ""))
     region = extracted.get("지역", "").strip()
 
     missing = []
@@ -1160,7 +1162,7 @@ def _form_to_compare(form):
     return {
         "nickname": form.get("닉네임", "").strip(),
         "birth_year": _norm_year(form.get("년생", "")),
-        "gender": form.get("성별", "").strip(),
+        "gender": normalize_gender(form.get("성별", "")),
         "region": form.get("지역", "").strip(),
         "marriage": form.get("결혼유무", "").strip(),
         "military": form.get("군필여부", "").strip(),
@@ -2000,7 +2002,7 @@ def handle_message(event):
         # ✨ [변경됨] 1994 / 94 / 94년생 어떻게 써도 숫자 두 자리('94')만 저장
         birth_year = _norm_year(extracted_data.get("년생", ""))
         age = extracted_data.get("나이", "").strip()
-        gender = extracted_data.get("성별", "").strip()
+        gender = normalize_gender(extracted_data.get("성별", ""))
         region = extracted_data.get("지역", "").strip()
         marriage = extracted_data.get("결혼유무", "").strip()
         military = extracted_data.get("군필여부", "").strip()
@@ -2787,8 +2789,14 @@ def drop_self_matches(voice_result, user_id):
 AUTOTUNE_ALERT_THRESHOLD = 50.0
 
 # 신청서 성별 표기("남"/"남자"/"여"/"여자")를 "남"/"여"로 정규화하기 위한 매핑
-_GENDER_NORM_MAP = {"남": "남", "남자": "남", "여": "여", "여자": "여"}
+_GENDER_NORM_MAP = {
+    "남": "남", "남자": "남", "남성": "남", "male": "남", "m": "남",
+    "여": "여", "여자": "여", "여성": "여", "female": "여", "f": "여",
+}
 
+def normalize_gender(g):
+    s = str(g or "").strip()
+    return _GENDER_NORM_MAP.get(s.lower(), s)
 # ✨ [추가됨] 대조 결과로 보여줄 최대 후보 수 (너무 많으면 메시지가 길어지므로 상위 N개만)
 VOICE_MATCH_DISPLAY_LIMIT = 5
 
