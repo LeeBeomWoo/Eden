@@ -1009,6 +1009,376 @@ def apply_nickname_change(source_id, sender_user_id, new_nick):
     ]
 
 
+# ==========================================
+# ✨ [추가됨] 기존 멤버 수동 등록 ('/기존멤버등록')
+#   1) 인증자방에서 '/기존멤버등록' 입력 → 봇이 양식 제출 요청
+#   2) 양식 제출 → user_validations에 등록(가짜 user_id 'EM_...', status '기존멤버')
+#   3) 봇이 음성 파일 요청 → 음성 제출 → 신입과 똑같은 분석/저장 루틴(submit_voice_analysis_job)
+#      (voice_profiles.source는 신입과 같은 'new_member'로 저장되어, 이후 신입 대조 시 '기존 신입 음성'으로 잡힘)
+#   결과 확인은 '/닉네임 확인'
+# ==========================================
+MEMBER_REGISTER_TTL_SEC = 1800   # 양식/음성 대기 제한(30분). 지나면 대기 상태를 버린다.
+MEMBER_FORM_TEMPLATE = (
+    "닉네임:\n"
+    "년생:\n"
+    "나이:\n"
+    "성별:\n"
+    "지역:\n"
+    "결혼유무:\n"
+    "군필여부:\n"
+    "초대자:\n"
+    "야단라경험유무:\n"
+    "기존 다른방에서 나온이유:\n"
+    "다른 방에서 킥을 당한적 있는지:"
+)
+
+
+def parse_signup_form(text):
+    """'키: 값' 줄 형태의 양식 텍스트를 dict로 파싱 (1번 양식 제출 처리와 같은 규칙)."""
+    data = {}
+    for line in str(text or "").split("\n"):
+        delimiter = ":" if ":" in line else ("：" if "：" in line else None)
+        if not delimiter:
+            continue
+        k, v = line.split(delimiter, 1)
+        k = k.replace("-", "").strip()
+        if "(" in k:
+            k = k.split("(", 1)[0].strip()
+        if "/" in k:
+            k = k.split("/", 1)[0].strip()
+        data[k] = v.strip()
+    return data
+
+
+def _sheet_append_validation_row(nickname, gender, region, birth_year, user_id, entry_date, status, details_list):
+    """검증 시트에 한 줄 백업(실패해도 무시). 열 배치는 1번 양식 제출 때와 같다."""
+    try:
+        with sheet_sync_lock():
+            if validation_sheet:
+                idx = len(validation_sheet.get_all_values()) + 1
+                validation_sheet.update(range_name=f'A{idx}:H{idx}', values=[[nickname, gender, region, birth_year, user_id, entry_date, "", 1]])
+                validation_sheet.update(range_name=f'K{idx}:L{idx}', values=[[user_id, status]])
+                validation_sheet.update(range_name=f'M{idx}:S{idx}', values=[details_list])
+    except Exception as e:
+        print(f"기존멤버 등록 - 시트 백업 에러(무시): {e}")
+
+
+def register_existing_member(admin_user_id, extracted, force_new=False):
+    """양식(dict)을 user_validations에 등록하고, 음성 대기 상태로 전환한다. 반환: reply TextMessage 리스트.
+    필수 항목이 비면 등록하지 않고 안내만 한다(대기 상태는 유지되어 다시 제출하면 됨)."""
+    nickname = extracted.get("닉네임", "").strip()
+    birth_year = _norm_year(extracted.get("년생", ""))
+    gender = extracted.get("성별", "").strip()
+    region = extracted.get("지역", "").strip()
+
+    missing = []
+    if not nickname: missing.append("닉네임")
+    if not birth_year: missing.append("년생(숫자로 작성, 예: 94)")
+    if not gender: missing.append("성별")
+    if not region: missing.append("지역")
+    if missing:
+        return [TextMessage(text=f"⚠️ 다음 항목이 비어 있습니다: {', '.join(missing)}\n\n채워서 양식을 다시 제출해 주세요. (취소: /기존멤버등록 취소)")]
+    if not supabase:
+        return [TextMessage(text="⚠️ DB 연결이 없어 등록할 수 없습니다.")]
+
+    # ✨ 같은 닉네임의 기존 기록이 있으면 바로 등록하지 않고, 관련 기록을 보여준 뒤 '같은 사람인지' 먼저 확인한다.
+    # (운영진이 번호로 연결하거나 '새로'로 새 기록을 만든다. force_new=True면 이 확인을 건너뜀)
+    if not force_new:
+        cands = find_member_candidates(nickname)
+        if cands:
+            set_user_session(admin_user_id, {"pending_member_register": {
+                "stage": "confirm", "form": extracted,
+                "candidate_ids": [str(c.get("user_id")) for c in cands], "at": time.time(),
+            }})
+            return [TextMessage(text=t) for t in split_for_line(format_member_candidates_message(nickname, cands, extracted))]
+
+    details = {
+        "age": extracted.get("나이", "").strip(),
+        "marriage": extracted.get("결혼유무", "").strip(),
+        "military": extracted.get("군필여부", "").strip(),
+        "inviter": extracted.get("초대자", "").strip(),
+        "yadan": extracted.get("야단라경험유무", "").strip(),
+        "leave_reason": extracted.get("기존 다른방에서 나온이유", "").strip(),
+        "kick_reason": extracted.get("다른 방에서 킥을 당한적 있는지", "").strip(),
+        "form_nickname": nickname,
+        "registered_by": admin_user_id,
+        "source": "existing_member_register",
+    }
+    new_uid = f"EM_{int(time.time())}_{random.randint(1000, 9999)}"
+    entry_date = _kst_now_str("%Y-%m-%d")
+    conflicts = [] if force_new else find_nickname_conflicts(nickname, None)
+
+    res = supabase_execute(
+        lambda: supabase.table('user_validations').insert({
+            "user_id": new_uid, "nickname": nickname, "gender": gender, "region": region,
+            "birth_year": birth_year, "entry_date": entry_date, "retry_count": 1,
+            "status": "기존멤버", "details": details,
+        }).execute(),
+        label="기존멤버 등록"
+    )
+    if res is None:
+        return [TextMessage(text="⚠️ DB 등록에 실패했습니다. 잠시 후 양식을 다시 제출해 주세요.")]
+
+    _sheet_append_validation_row(
+        nickname, gender, region, birth_year, new_uid, entry_date, "기존멤버",
+        [details["age"], details["marriage"], details["military"], details["inviter"],
+         details["yadan"], details["leave_reason"], details["kick_reason"]],
+    )
+
+    set_user_session(admin_user_id, {"pending_member_register": {
+        "stage": "voice", "user_id": new_uid, "nickname": nickname, "gender": gender, "at": time.time(),
+    }})
+
+    lines = [
+        "✅ 기존 멤버를 DB에 등록했습니다.",
+        f"- {nickname} / {birth_year}년생 / {gender} / {region}",
+        f"- 등록 ID: {new_uid}",
+    ]
+    if conflicts:
+        lines.append("\n⚠️ 같은 닉네임의 기존 기록이 있습니다 (중복 등록 여부 확인):")
+        lines.extend(conflicts[:5])
+    lines.append("\n🎤 이제 분석할 음성 파일을 보내주세요. (30분 안에 · 취소: /기존멤버등록 취소)")
+    return [TextMessage(text="\n".join(lines))]
+
+
+def find_member_candidates(nickname, limit=5):
+    """같은 닉네임(또는 양식에 적었던 닉네임)의 기존 검증 기록을 찾는다."""
+    cols = 'user_id, nickname, gender, region, birth_year, status, entry_date, black_reason, details'
+    found = {}
+    for col in ('nickname', 'details->>form_nickname'):
+        res = supabase_execute(
+            lambda c=col: supabase.table('user_validations').select(cols).eq(c, nickname).execute(),
+            label=f"기존멤버 후보 조회({col})"
+        )
+        for r in (res.data if res and res.data else []):
+            found.setdefault(str(r.get('user_id')), r)
+    return list(found.values())[:limit]
+
+
+def _form_to_compare(form):
+    """양식 dict(한글 키)를 diff_with_previous가 받는 형태로 바꾼다."""
+    return {
+        "nickname": form.get("닉네임", "").strip(),
+        "birth_year": _norm_year(form.get("년생", "")),
+        "gender": form.get("성별", "").strip(),
+        "region": form.get("지역", "").strip(),
+        "marriage": form.get("결혼유무", "").strip(),
+        "military": form.get("군필여부", "").strip(),
+        "inviter": form.get("초대자", "").strip(),
+        "yadan": form.get("야단라경험유무", "").strip(),
+        "leave_reason": form.get("기존 다른방에서 나온이유", "").strip(),
+        "kick_reason": form.get("다른 방에서 킥을 당한적 있는지", "").strip(),
+        "age": form.get("나이", "").strip(),
+    }
+
+
+def format_member_candidates_message(nickname, cands, form):
+    """후보 기록들을 번호와 함께 보여주고, 이번 양식과 달라진 점을 같이 표시한다."""
+    new_form = _form_to_compare(form)
+    lines = [f"🔎 '{nickname}'와(과) 같은 기록이 {len(cands)}건 있습니다. 같은 사람인지 확인해 주세요.\n"]
+    for i, c in enumerate(cands, 1):
+        d = _load_details(c.get('details'))
+        lines.append(f"[{i}] {c.get('nickname') or '-'} / {_year_label(c.get('birth_year'))}년생 / {c.get('gender') or '-'} / {c.get('region') or '-'}")
+        lines.append(f" - 상태: {c.get('status') or '-'} / 입장일: {c.get('entry_date') or '-'}")
+        if str(c.get('black_reason') or '').strip():
+            lines.append(f" - 💀 블랙사유: {str(c.get('black_reason')).strip()}")
+        info = []
+        for key, label in [("leave_reason", "나온이유"), ("kick_reason", "킥이력"), ("yadan", "야단라경험"), ("inviter", "초대자")]:
+            val = str(d.get(key, "")).strip()
+            if val:
+                info.append(f"{label}: {val}")
+        if info:
+            lines.append(f" - 📝 {' / '.join(info)}")
+        diff_lines, _ = diff_with_previous(c, new_form)
+        if diff_lines:
+            lines.append(" - 🔀 이번 양식과 다른 점:\n   " + "\n   ".join(diff_lines))
+        else:
+            lines.append(" - ✅ 이번 양식과 주요 항목이 같음")
+        lines.append("")
+    n = len(cands)
+    lines.append(f"▶ 같은 사람이면 /1 ~ /{n} (번호) 입력 → 그 기록과 연결\n▶ 다른 사람이면 /새로 → 새 기록으로 등록\n▶ 취소: /취소")
+    return "\n".join(lines)
+
+
+def link_existing_member(admin_user_id, target_uid, form):
+    """선택한 기존 기록에 이번 양식을 연결한다: 이전 값은 details.history에 남기고, 새 양식 값으로 갱신.
+    status/black_reason/entry_date/닉네임은 그대로 둔다. 이후 음성 대기 상태로 전환."""
+    row = get_validation_row(target_uid, "user_id, nickname, gender, region, birth_year, status, entry_date, black_reason, details")
+    if not row:
+        return [TextMessage(text="⚠️ 선택한 기록을 DB에서 찾지 못했습니다. '/기존멤버등록'부터 다시 진행해 주세요.")]
+
+    new_form = _form_to_compare(form)
+    diff_lines, critical = diff_with_previous(row, new_form)
+
+    d = _load_details(row.get('details'))
+    history = list(d.get('history') or [])
+    history.append({
+        "at": _kst_now_str("%Y-%m-%d"),
+        "nickname": row.get('nickname'),
+        "form_nickname": d.get('form_nickname') or row.get('nickname'),
+        "birth_year": row.get('birth_year'), "gender": row.get('gender'), "region": row.get('region'),
+        "age": d.get('age'),
+        **{k: d.get(k) for k, _ in DIFF_DETAIL_FIELDS},
+    })
+    d['history'] = history[-5:]
+    for k in ("age", "marriage", "military", "inviter", "yadan", "leave_reason", "kick_reason"):
+        if new_form.get(k):
+            d[k] = new_form[k]
+    d.setdefault('form_nickname', row.get('nickname'))
+    links = list(d.get('member_links') or [])
+    links.append({"at": _kst_now_str(), "by": admin_user_id})
+    d['member_links'] = links[-5:]
+
+    res = supabase_execute(
+        lambda: supabase.table('user_validations').update({
+            "gender": new_form["gender"], "region": new_form["region"],
+            "birth_year": new_form["birth_year"], "details": d,
+        }).eq('user_id', target_uid).execute(),
+        label="기존멤버 기록 연결"
+    )
+    if res is None:
+        return [TextMessage(text="⚠️ 기록 연결(갱신)에 실패했습니다. 잠시 후 번호를 다시 입력해 주세요.")]
+
+    nickname = row.get('nickname') or ""
+    set_user_session(admin_user_id, {"pending_member_register": {
+        "stage": "voice", "user_id": target_uid, "nickname": nickname, "gender": new_form["gender"], "at": time.time(),
+    }})
+
+    lines = [
+        "🔗 기존 기록과 연결했습니다.",
+        f"- {nickname} / {new_form['birth_year']}년생 / {new_form['gender']} / {new_form['region']}",
+        f"- 연결된 ID: {target_uid}",
+        f"- 상태: {row.get('status') or '-'} (그대로 유지)",
+    ]
+    if str(row.get('black_reason') or '').strip():
+        lines.append("- 💀 블랙리스트 기록과 연결되었습니다 (사유/상태는 그대로 유지)")
+    if diff_lines:
+        lines.append("- 🔀 이전 값과 달라서 갱신한 내용 (이전 값은 이력에 보관):\n   " + "\n   ".join(diff_lines))
+    if critical:
+        lines.append("⚠️ 성별/년생이 이전 기록과 다릅니다. 같은 사람이 맞는지 한 번 더 확인해 주세요.")
+    lines.append("\n🎤 이제 분석할 음성 파일을 보내주세요. (30분 안에 · 취소: /기존멤버등록 취소)")
+    return [TextMessage(text=t) for t in split_for_line("\n".join(lines))]
+
+
+def start_member_register(admin_user_id, rest):
+    """'/기존멤버등록 [취소 | 양식]' 처리. 반환: reply TextMessage 리스트."""
+    rest = (rest or "").strip()
+    if rest in ("취소", "취소하기", "cancel"):
+        del_user_session(admin_user_id)
+        return [TextMessage(text="🗑️ 기존 멤버 등록을 취소했습니다.")]
+
+    # 같은 메시지에 양식을 같이 붙여 보냈으면 바로 등록
+    if all(k in rest for k in ("닉네임", "년생", "성별", "지역")):
+        return register_existing_member(admin_user_id, parse_signup_form(rest))
+
+    set_user_session(admin_user_id, {"pending_member_register": {"stage": "form", "at": time.time()}})
+    return [
+        TextMessage(text="📝 기존 멤버의 양식을 제출해 주세요.\n아래 양식을 복사해 채워서 보내면 됩니다. (닉네임/년생/성별/지역은 필수)\n취소: /기존멤버등록 취소"),
+        TextMessage(text=MEMBER_FORM_TEMPLATE),
+    ]
+
+
+def _get_pending_member_register(admin_user_id, stage):
+    """대기 중인 등록 상태를 돌려준다. 단계가 다르거나 시간이 지났으면 None(지났으면 상태도 삭제)."""
+    sess = get_user_session(admin_user_id)
+    pending = sess.get("pending_member_register") if isinstance(sess, dict) else None
+    if not pending or pending.get("stage") != stage:
+        return None
+    if time.time() - float(pending.get("at") or 0) > MEMBER_REGISTER_TTL_SEC:
+        del_user_session(admin_user_id)
+        return None
+    return pending
+
+
+def handle_member_register_form(event, admin_user_id, text):
+    """인증자방에서 '/기존멤버등록' 후 제출된 양식 처리. 처리했으면 True."""
+    if not _get_pending_member_register(admin_user_id, "form"):
+        return False
+    if not all(k in text for k in ("닉네임", "년생", "성별", "지역")):
+        return False   # 양식이 아닌 일반 대화는 무시
+    messages = register_existing_member(admin_user_id, parse_signup_form(text))
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=messages)
+        )
+    return True
+
+
+def handle_member_register_confirm(event, admin_user_id, text):
+    """동일 기록 확인 질문에 대한 답. '/'로 시작하는 메시지만 인식한다: /번호(연결) · /새로(새 기록) · /취소.
+    인식해서 처리했으면 True. 인식하지 못하면 False (다른 명령어가 그대로 동작하도록 하고, 마지막까지
+    아무 명령에도 걸리지 않았을 때만 send_member_confirm_guide가 안내한다)."""
+    pending = _get_pending_member_register(admin_user_id, "confirm")
+    if not pending:
+        return False
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return False
+    t = re.sub(r"\s", "", raw[1:])
+    cand_ids = pending.get("candidate_ids") or []
+    form = pending.get("form") or {}
+
+    if t.isdigit() and 1 <= int(t) <= len(cand_ids):
+        messages = link_existing_member(admin_user_id, cand_ids[int(t) - 1], form)
+    elif t in ("새로", "신규", "새로작성", "새기록", "새로등록", "아니", "아니오", "아니요", "다른사람"):
+        messages = register_existing_member(admin_user_id, form, force_new=True)
+    elif t in ("취소", "취소하기"):
+        del_user_session(admin_user_id)
+        messages = [TextMessage(text="🗑️ 기존 멤버 등록을 취소했습니다.")]
+    else:
+        return False
+
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=messages)
+        )
+    return True
+
+
+def send_member_confirm_guide(event, admin_user_id):
+    """확인 대기 중에 '/'로 입력했지만 어떤 답변·명령에도 해당하지 않을 때, 가능한 답변을 안내한다."""
+    pending = _get_pending_member_register(admin_user_id, "confirm")
+    if not pending:
+        return False
+    n = len(pending.get("candidate_ids") or [])
+    guide = (
+        "⚠️ 답변을 인식하지 못했습니다. 아래 중 하나로 입력해 주세요.\n\n"
+        f"▶ /1 ~ /{n} : 그 번호의 기록과 연결\n"
+        "▶ /새로 : 새 기록으로 등록\n"
+        "▶ /취소 : 기존 멤버 등록 취소"
+    )
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=guide)])
+        )
+    return True
+
+
+def handle_member_register_voice(event, admin_user_id):
+    """인증자방에서 양식 등록 직후 제출된 음성 처리: 신입과 같은 분석/저장 루틴에 접수. 처리했으면 True."""
+    pending = _get_pending_member_register(admin_user_id, "voice")
+    if not pending:
+        return False
+    del_user_session(admin_user_id)   # 1회성 (중복 처리 방지)
+
+    target_uid = pending.get("user_id")
+    nickname = pending.get("nickname") or ""
+    submit_voice_analysis_job(
+        supabase, configuration,
+        message_id=event.message.id, user_id=target_uid, nickname=nickname,
+        room_id=ADMIN_GROUP_CHAT_ID,
+    )
+    reply_text = (
+        f"🎤 [{nickname}] 음성이 접수되었습니다. 분석과 저장은 신입과 같은 방식으로 진행됩니다.\n"
+        f"잠시 후 '/{nickname} 확인'으로 분석 결과(성별 추정/기존 음성 대조)를 확인할 수 있습니다."
+    )
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+        )
+    return True
+
+
 def send_reply_or_push(reply_token, source_id, messages):
     """reply로 먼저 보내고, 실패하면 그룹으로 push로 재시도합니다. 성공 여부 반환(실패 사유는 로그)."""
     try:
@@ -1199,6 +1569,11 @@ def handle_message(event):
                 )
             )
         return
+
+    # ✨ 기존멤버등록 '동일 기록 확인' 답변은 '/'로 시작하는 메시지만 인식 (/1, /새로, /취소)
+    if is_admin_room and user_message.startswith("/"):
+        if handle_member_register_confirm(event, user_id, user_message):
+            return
 
     # 슬래시(/) 명령어 로직
     if user_message.startswith("/"):
@@ -1512,6 +1887,15 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
                 return
 
+        # ✨ [추가됨] /기존멤버등록 — 기존 멤버를 양식 + 음성으로 DB에 등록
+        elif command_body.startswith("기존멤버등록"):
+            member_msgs = start_member_register(user_id, command_body[len("기존멤버등록"):])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=member_msgs)
+                )
+            return
+
         # 2) /O번방 확인 명령어
         elif "확인" in command_body:
             room_name_input = command_body.replace("확인", "").strip()
@@ -1565,6 +1949,11 @@ def handle_message(event):
                         reply_token=event.reply_token,
                         messages=[TextMessage(text=t) for t in split_for_line(reply_text)]
                     ))
+            return
+
+    # ✨ [추가됨] 인증자방: '/기존멤버등록' 이후 제출된 양식 처리 (그 외 일반 대화는 건드리지 않음)
+    if is_admin_room and not user_message.startswith("/"):
+        if handle_member_register_form(event, user_id, user_message):
             return
 
     # 📌 [핵심 검증 1] 1번 양식 제출 처리 (마지막 입장 유저만 작동)
@@ -2163,6 +2552,9 @@ def handle_message(event):
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=matched_reply)]))
             return
+        # ✨ 기존멤버등록 확인 대기 중인데 답변/명령어 어디에도 해당하지 않는 '/' 메시지 → 가능한 답변 안내
+        if is_admin_room and send_member_confirm_guide(event, user_id):
+            return
 
 
 # ==========================================
@@ -2613,7 +3005,8 @@ def format_nickname_history(nickname):
         return None
 
     val_cols = ('user_id, nickname, gender, region, birth_year, status, entry_date, retry_count, '
-                'black_reason, details, voice_check_report')
+                'black_reason, details, voice_check_report, '
+                'voice_analysis_state, voice_analysis_result, voice_analysis_error')
     rows, partial = [], False
     try:
         res = supabase.table('user_validations').select(val_cols).eq('nickname', name).execute()
@@ -2709,6 +3102,19 @@ def format_nickname_history(nickname):
             extra = f" / 사유: {vp.get('black_reason')}" if vp.get('black_reason') else ""
             lines.append(f" - 🎙️ 음성DB: {_vp_kind(vp)}{extra}")
         vr = str(r.get('voice_check_report') or '').strip()
+        # ✨ [추가됨] '문제없음' 단계를 거치지 않은 기록(기존 멤버 등록 등)은 voice_check_report가 비어 있으므로,
+        # 저장된 자동분석 결과로 요약을 만들어 보여준다.
+        _vstate = r.get('voice_analysis_state')
+        if not vr and _vstate == "완료" and r.get('voice_analysis_result'):
+            vr = build_voice_check_report_text(
+                claimed_gender=r.get('gender'),
+                voice_result=drop_self_matches(r.get('voice_analysis_result'), uid),
+                claimed_nickname=r.get('nickname'),
+            )
+        elif not vr and _vstate == "에러":
+            vr = f"🔴 자동분석 오류: {r.get('voice_analysis_error') or '(사유 미상)'}"
+        elif not vr and _vstate == "처리중":
+            vr = "⏳ 자동분석 진행 중 (잠시 후 다시 확인해 주세요)"
         if vr:
             lines.append(f" - 🎙️ 음성확인 요약:\n{vr[:700]}{'…' if len(vr) > 700 else ''}")
         out.append("\n".join(lines))
@@ -2939,6 +3345,9 @@ def handle_audio(event):
     # ✨ [추가됨] 관리자방에서 '/음성업로드' 명령 직후 온 음성 -> 블랙리스트 수동 등록 플로우로 분기.
     # (신입 검증용 last-joined 체크는 적용하지 않는다 — 운영진 본인이 보내는 음성이므로.)
     if source_id == ADMIN_GROUP_CHAT_ID:
+        # ✨ '/기존멤버등록' 양식 제출 직후의 음성이면 기존 멤버 음성 등록, 아니면 기존 블랙리스트 업로드 플로우
+        if handle_member_register_voice(event, user_id):
+            return
         handle_admin_blacklist_voice_upload(event, user_id)
         return
 
