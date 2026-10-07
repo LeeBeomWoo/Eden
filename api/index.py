@@ -733,8 +733,10 @@ def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
     current_clean = current_name.replace(" ", "")
     
     # ✨ [수정됨] 넘어온 생년(4자리)을 무조건 2자리로 자른 뒤 검사
-    short_year = str(birth_year)[-2:].strip()
-    
+    short_year = _norm_year(birth_year)
+    if not short_year:
+        return False
+
     return (short_year in current_clean) and (str(nickname).strip() in current_clean)
 
 
@@ -794,7 +796,7 @@ def build_nickchange_parts(user_id):
     nickname_emoji = "⚖️" if gender in ("여", "여자") else "🧨"
 
     # ✨ [수정됨] 생년을 뒤에서 2자리만 추출 (예: "1998" -> "98")
-    short_year = str(birth_year)[-2:] if birth_year else ""
+    short_year = _norm_year(birth_year)
 
     nickchange_template = search_keyword("닉변")
     if nickchange_template:
@@ -840,8 +842,14 @@ def _load_details(raw):
 
 
 def _norm_year(y):
-    """1991 / 91 / '91년생' 모두 '91'로 맞춰 비교"""
+    """1994 / 94 / '94년생' / '94 년생' 모두 숫자만 뽑아 뒤 2자리('94')로 맞춤. 숫자가 없으면 빈 문자열."""
     return re.sub(r"\D", "", str(y or ""))[-2:]
+
+
+def _year_label(y):
+    """화면 표시용: 2자리로 정규화된 값을 돌려주고, 숫자가 없으면 원문(없으면 '-')을 그대로 보여줌.
+    (예전에 '94년생'으로 저장된 기록도 '94년생년생'으로 겹쳐 보이지 않게 함)"""
+    return _norm_year(y) or (str(y).strip() if y else "-")
 
 
 def _kst_now_str(fmt="%Y-%m-%d %H:%M"):
@@ -863,7 +871,7 @@ def diff_with_previous(old_row, new):
 
     oy, ny = _norm_year(old_row.get('birth_year')), _norm_year(new.get('birth_year'))
     if oy and oy != ny:
-        lines.append(f"년생: {old_row.get('birth_year')} → {new.get('birth_year')} ⚠️")
+        lines.append(f"년생: {_year_label(old_row.get('birth_year'))} → {_year_label(new.get('birth_year'))} ⚠️")
         critical = True
 
     # 닉네임은 '양식에 적었던 값'끼리 비교 (운영진이 닉변해 둔 값과 섞이지 않게)
@@ -916,7 +924,7 @@ def find_nickname_conflicts(nick, exclude_uid):
         if str(r.get('user_id') or '') == str(exclude_uid):
             continue
         black = f" / 💀 블랙사유: {str(r['black_reason']).strip()}" if str(r.get('black_reason') or '').strip() else ""
-        out.append(f" - 검증기록: {r.get('nickname')} / {r.get('birth_year') or '-'}년생 / {r.get('gender') or '-'}{black}")
+        out.append(f" - 검증기록: {r.get('nickname')} / {_year_label(r.get('birth_year'))}년생 / {r.get('gender') or '-'}{black}")
     r2 = supabase_execute(
         lambda: supabase.table('voice_profiles').select('user_id, nickname, source').eq('nickname', nick).execute(),
         label="새 닉네임 중복조회(음성DB)"
@@ -1037,7 +1045,7 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
 
     if not is_nickname_changed_correctly(source_id, user_id, birth_year, nickname):
         # ✨ [수정됨] 어떤 형식으로 바꿔야 하는지 알려준다. (다른 닉으로 하고 싶으면 운영진이 '/새닉 변경'으로 DB 값을 바꿔줌)
-        short_year = str(birth_year)[-2:]
+        short_year = _norm_year(birth_year)
         reply_text = (
             f"닉네임이 아직 '{short_year} {nickname}' 형식과 맞지 않아요.\n"
             "닉네임을 변경하고 프사를 설정한 뒤 다시 '확인'이라고 입력해 주세요.\n"
@@ -1587,6 +1595,11 @@ def handle_message(event):
                     continue
                 missing_fields.append(req_field)
 
+        # ✨ [추가됨] 년생에 숫자가 하나도 없으면(예: '년생', '비밀') 누락으로 처리
+        _raw_year = extracted_data.get("년생", "").strip()
+        if _raw_year and not _norm_year(_raw_year):
+            missing_fields.append("년생(숫자로 작성, 예: 94)")
+
         if missing_fields:
             reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었습니다:\n- {', '.join(missing_fields)}\n\n해당 항목을 빠짐없이 작성 후 다시 제출해 주세요!"
             with ApiClient(configuration) as api_client:
@@ -1595,7 +1608,8 @@ def handle_message(event):
             return
 
         nickname = extracted_data.get("닉네임", "").strip()
-        birth_year = extracted_data.get("년생", "").strip()
+        # ✨ [변경됨] 1994 / 94 / 94년생 어떻게 써도 숫자 두 자리('94')만 저장
+        birth_year = _norm_year(extracted_data.get("년생", ""))
         age = extracted_data.get("나이", "").strip()
         gender = extracted_data.get("성별", "").strip()
         region = extracted_data.get("지역", "").strip()
@@ -1662,7 +1676,7 @@ def handle_message(event):
                         continue
 
                     rec_name = str(row.get('nickname', '')).strip()
-                    rec_year = str(row.get('birth_year', '')).strip()
+                    rec_year = _year_label(row.get('birth_year', ''))
                     rec_gender = str(row.get('gender', '')).strip()
                     rec_region = str(row.get('region', '')).strip()
                     rec_black = str(row.get('black_reason', '')).strip()
@@ -2487,7 +2501,9 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nick
     # ✨ [추가됨] Cloud Run(app.py)이 90% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
     # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
     if voice_result.get("is_strong_match"):
-        lines.append("- ℹ️ 블랙리스트 일치율 90% 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
+        _thr = voice_result.get("save_threshold")
+        _thr_txt = f"{_thr * 100:.0f}%" if isinstance(_thr, (int, float)) else "저장 제외 기준"
+        lines.append(f"- ℹ️ 블랙리스트 일치율이 {_thr_txt} 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
 
     # ✨ [추가됨] 분석 자체는 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우.
     # 신입에게는 노출되지 않고(🔵 완료로만 보임) 운영진만 이 리포트로 확인할 수 있다.
@@ -2663,7 +2679,7 @@ def format_nickname_history(nickname):
             try: details = json.loads(details)
             except Exception: details = {}
         lines = [
-            f"\n[{i}] {r.get('nickname') or '-'} / {r.get('birth_year') or '-'}년생 / {r.get('gender') or '-'} / {r.get('region') or '-'}",
+            f"\n[{i}] {r.get('nickname') or '-'} / {_year_label(r.get('birth_year'))}년생 / {r.get('gender') or '-'} / {r.get('region') or '-'}",
             f" - 유저ID: {uid or '-'}",
             f" - 상태: {r.get('status') or '-'} / 재시도 {r.get('retry_count') or 1}회 / 입장일: {r.get('entry_date') or '-'}",
         ]
@@ -2686,7 +2702,7 @@ def format_nickname_history(nickname):
         if _hist:
             lines.append(f" - 🕘 이전 제출 {len(_hist)}건:")
             for h in _hist[-3:]:
-                lines.append(f"   · {h.get('at')} {h.get('form_nickname') or h.get('nickname')} / {h.get('birth_year')}년생 / {h.get('gender')} / {h.get('region')}")
+                lines.append(f"   · {h.get('at')} {h.get('form_nickname') or h.get('nickname')} / {_year_label(h.get('birth_year'))}년생 / {h.get('gender')} / {h.get('region')}")
 
         for vp in vp_by_uid.get(uid, []):
             shown_vp_keys.add((str(vp.get('user_id') or ''), str(vp.get('nickname') or ''), str(vp.get('source') or '')))
