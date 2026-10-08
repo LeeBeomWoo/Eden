@@ -1737,7 +1737,7 @@ def handle_message(event):
                 # C. '녹음' 시트 동기화
                 try:
                     if client:
-                        rec_sheet = client.open("인증멘트").worksheet("녹음")
+                        rec_sheet = client.open("인증봇").worksheet("녹음")
                         males = [c.strip() for c in rec_sheet.col_values(1)[1:] if c and c.strip()]
                         females = [c.strip() for c in rec_sheet.col_values(2)[1:] if c and c.strip()]
                         rec_records = [{"gender": "male", "ment": m} for m in males] + [{"gender": "female", "ment": f} for f in females]
