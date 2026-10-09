@@ -119,10 +119,11 @@ def get_all_supabase_data(table_name, select_query="*"):
             
     return all_data
 
-def process_in_chunks(table_name, data_list, chunk_size=500, is_insert=False):
-    """1000개 이상 데이터 삽입/업데이트 시 발생하는 에러를 방지하는 청크(분할) 처리 헬퍼 함수"""
+def process_in_chunks(table_name, data_list, chunk_size=500, is_insert=False, errors=None):
+    """청크 단위 삽입/업서트. 반영된 건수를 반환하고, errors 리스트를 주면 실패 사유를 담아줍니다."""
     if not supabase or not data_list:
-        return
+        return 0
+    ok = 0
     for i in range(0, len(data_list), chunk_size):
         chunk = data_list[i:i + chunk_size]
         try:
@@ -130,10 +131,14 @@ def process_in_chunks(table_name, data_list, chunk_size=500, is_insert=False):
                 supabase.table(table_name).insert(chunk).execute()
             else:
                 supabase.table(table_name).upsert(chunk).execute()
+            ok += len(chunk)
         except Exception as e:
-            print(f"{table_name} 테이블 데이터 분할 처리 에러 ({i}~{i+chunk_size}): {e}")
-
-
+            msg = f"{table_name} ({i}~{i+chunk_size}): {str(e)[:200]}"
+            print(f"테이블 분할 처리 에러 {msg}")
+            if errors is not None:
+                errors.append(msg)
+    return ok
+    
 def supabase_execute(query_fn, retries=2, delay=0.4, default=None, label=""):
     """Supabase 쿼리 실행 시 504 Gateway Timeout 등 일시적 에러에 대해 짧게 재시도하는 헬퍼.
 
