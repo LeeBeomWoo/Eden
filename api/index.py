@@ -40,7 +40,7 @@ app = Flask(__name__)
 
 
 # 인증자방(관리자 그룹방) ID 고정 설정
-ADMIN_GROUP_CHAT_ID = "C30afa7c17e86324321d930bc35f1621f"
+ADMIN_GROUP_CHAT_ID = "Cc39d1325f15564e1549ee105ca7fdec1"
 
 # ✨ [추가됨] 같은 코드를 여러 클라우드런 인스턴스에 올려서, 인증방별로 처리를 나눠 맡기기 위한 설정.
 # 이 서비스 자신의 클라우드런 URL(예: https://xxxx-uc.a.run.app)을 배포 시 환경변수로 넣어준다.
@@ -970,6 +970,12 @@ def find_nickname_conflicts(nick, exclude_uid):
         out.append(f" - 🎙️ 음성DB: {kind} ({r.get('nickname')})")
     return out
 
+def format_nick_conflict_note(user_id):
+    d = _load_details(get_validation_row(user_id, "details").get('details'))
+    c = d.get('nick_conflicts') or []
+    if not c:
+        return ""
+    return "⚠️ 운영진 닉변 후 기존 기록과 겹침:\n" + "\n".join(c)
 
 def apply_nickname_change(source_id, sender_user_id, new_nick):
     """'/새닉 변경' 처리. 이 방에서 인증 진행 중인 신입의 DB 닉네임을 new_nick으로 바꾸고 이력을 남깁니다.
@@ -1001,8 +1007,10 @@ def apply_nickname_change(source_id, sender_user_id, new_nick):
 
     conflicts = find_nickname_conflicts(new_nick, target)
     if conflicts:
-        # 새 닉네임이 기존 기록과 겹치면 마지막에 자동 '퇴장' 멘트 대신 운영진 추가확인으로 보낸다
         details['dup_clean'] = False
+        details['nick_conflicts'] = conflicts[:5]   # 푸시 대신 DB에 저장 → 확인 명령어로 조회
+    else:
+        details.pop('nick_conflicts', None)
 
     res = supabase_execute(
         lambda: supabase.table('user_validations').update({"nickname": new_nick, "details": details}).eq('user_id', target).execute(),
@@ -1017,18 +1025,7 @@ def apply_nickname_change(source_id, sender_user_id, new_nick):
         set_user_session(target, sess)
     sync_nickname_to_sheet(target, new_nick)
 
-    # 충돌 상세는 신입이 있는 방에 노출하지 않고 운영진방으로만 알린다
-    if conflicts:
-        alert = (f"🔁 닉네임 수동 변경 알림\n- {old_nick} → {new_nick}\n- 유저ID: {target}\n\n"
-                 f"⚠️ 새 닉네임과 같은 기존 기록이 있습니다:\n" + "\n".join(conflicts) +
-                 "\n\n※ 자동 퇴장 멘트 대신 '운영진 추가 확인' 안내로 진행되니 직접 확인해 주세요.")
-        try:
-            with ApiClient(configuration) as api_client:
-                MessagingApi(api_client).push_message_with_http_info(
-                    PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=alert[:4900])])
-                )
-        except Exception as e:
-            print(f"⚠️ 닉네임 변경 충돌 알림 전송 실패: {e}")
+   
 
     hint = {"닉변대기": "변경 후 '완료'"}.get(row.get('status'), "변경 후 안내에 따라 답장")
     return [
@@ -2050,6 +2047,9 @@ def handle_message(event):
                     # ✨ [추가됨] 음성검증까지 확인되었는지 여부 + 확인된 시점이라면 그 확인 내용을 함께 출력
                     if reply_text and tracked_user_id:
                         reply_text = f"{reply_text}\n\n{format_voice_check_status(tracked_user_id)}"
+                        _cn = format_nick_conflict_note(tracked_user_id)
+                        if _cn:
+                            reply_text += f"\n\n{_cn}"
             else:
                 # ✨ [추가됨] 방 이름이 아니면 '닉네임'으로 보고 과거 검증 기록 + 음성DB 기록을 조회 (/닉네임 확인)
                 nick_text = format_nickname_history(room_name_input) if room_name_input else None
@@ -3124,6 +3124,8 @@ def format_nickname_history(nickname):
         for c in (_d.get('nick_changes') or [])[-3:]:
             lines.append(f" - 🔁 닉변: {c.get('from')} → {c.get('to')} ({c.get('at')})")
         _hist = _d.get('history') or []
+        for cl in (_d.get('nick_conflicts') or []):
+            lines.append(f" - ⚠️ 닉변 후 겹친 기록: {cl.strip()}")
         if _hist:
             lines.append(f" - 🕘 이전 제출 {len(_hist)}건:")
             for h in _hist[-3:]:
@@ -3239,60 +3241,11 @@ def format_voice_check_status(user_id):
     return f"🎙️ 음성검증: 상태 확인 불가 (status={status}){analysis_error_note}"
 
 
-def notify_admin_voice_analysis(*, claimed_nickname, claimed_gender, user_id, voice_result):
-    """음성 자동분석 결과 중 운영진이 참고할 만한 내용이 있을 때만 운영진방에 push한다.
-
-    알림 조건:
-    - 블랙리스트 유사도가 VOICE_MATCH_ALERT_THRESHOLD(기본 90%) 이상인 경우
-    - 신청서에 적은 성별과 음성 기반 추정 성별이 다른 경우
-    - ✨ [추가됨] 음성 원본/프로필 저장 자체가 실패한 경우 (분석은 성공했지만 DB에는 안 남음 — 방치하면
-      나중에 'N번방 확인'을 할 때까지 아무도 모를 수 있으므로 발생 즉시 알린다)
-    - ✨ [추가됨] 오토튠/피치보정 의심도가 AUTOTUNE_ALERT_THRESHOLD(기본 50%) 이상인 경우
-      (확정 판정 아님 — 운영진이 직접 들어보고 최종 판단해야 함)
-    넷 다 아니면 조용히 넘어간다 (매번 알림이 오면 운영진이 피로해지므로).
-
-    ⚠️ 어디까지나 참고 정보다. 자동 판정/자동 승인·차단이 아니며,
-    최종 판단은 반드시 운영진이 음성을 직접 듣고 내려야 한다.
-    """
-    if not voice_result or voice_result.get("error"):
-        return
-
-    voice_result = drop_self_matches(voice_result, user_id)
-    matches = voice_result.get("matches") or []
-    strong_matches = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
-
-    est_gender = voice_result.get("estimated_gender")
-    claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
-    gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
-
-    save_error = voice_result.get("save_error")
-
-    autotune_prob = voice_result.get("autotune_probability")
-    autotune_suspected = bool(autotune_prob is not None and autotune_prob >= AUTOTUNE_ALERT_THRESHOLD)
-
-    gender_suspect = bool(voice_result.get("gender_note"))  # 피치와 성도길이/음색이 강하게 충돌 (톤 조작 의심)
-
-    if not strong_matches and not gender_mismatch and not save_error and not autotune_suspected and not gender_suspect:
-        return
-
-    lines = [f"🎙️ 음성 자동분석 참고 알림 — {claimed_nickname or '(닉네임 미상)'}님 (신청 성별: {claimed_gender or '미상'})"]
-    lines.extend(build_voice_check_report_lines(claimed_gender=claimed_gender, voice_result=voice_result, claimed_nickname=claimed_nickname))
-
-    if strong_matches:
-        # ▼ 블랙리스트 유사 매칭이 있을 때만 경고 문구 추가 (줄바꿈 \n 포함) ▼
-        lines.append("\n※ 자동 판정이 아니니 반드시 직접 음성 대조 후 최종 판단해 주세요.")
-
-    alert_text = "\n".join(lines)
-
-    try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.push_message_with_http_info(
-                PushMessageRequest(to=ADMIN_GROUP_CHAT_ID, messages=[TextMessage(text=alert_text)])
-            )
-    except Exception as e:
-        print(f"⚠️ 운영진방 음성분석 알림 전송 실패: {e}")
-
+def notify_admin_voice_analysis(**kwargs):
+    """(푸시 알림 제거) 운영진방으로 자동 푸시하지 않습니다.
+    분석 결과는 format_voice_analysis_reply_text에서 voice_check_report로 저장되며,
+    운영진이 '/N번방 확인' 또는 '/닉네임 확인'으로 직접 조회합니다."""
+    return
 
 # ==========================================
 # ✨ [추가됨] 관리자방 '/음성업로드' — 운영진이 직접 제출한 음성을 블랙리스트에 수동 등록
