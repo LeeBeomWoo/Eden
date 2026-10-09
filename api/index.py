@@ -1780,7 +1780,7 @@ def handle_message(event):
         if "디비업데이트" in command_body:
             try:
                 sync_reports = []
-
+                sync_errors = []
                 # A. '멘트' 시트 동기화
                 if not sheet:
                     sync_reports.append("• ⚠️ 멘트: 건너뜀 — '멘트' 시트에 연결되지 않았습니다 (서버 시작 로그의 '시트 연결 중 일부 실패' 확인)")
@@ -1820,9 +1820,10 @@ def handle_message(event):
                             ok_n = process_in_chunks('auth_ments', ments_records, errors=sync_errors)
                             has_one = '1' in new_keywords
                             sync_reports.append(f"• 멘트: {ok_n}/{len(ments_records)}개 반영 (삭제 {len(removed_keywords)}개, 키워드 '1' {'있음' if has_one else '없음'})")
-                            
+                            if sync_errors:
+                                sync_reports.append("• ⚠️ 멘트 일부 실패:\n   " + "\n   ".join(sync_errors[:3]))
                 # B. '방관리' 시트 동기화
-                if room_manage_sheet:
+                if room_manage_sheet:    
                     room_data = room_manage_sheet.get_all_records()
                     room_records = []
                     for row in room_data:
