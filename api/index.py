@@ -40,7 +40,7 @@ app = Flask(__name__)
 
 
 # 인증자방(관리자 그룹방) ID 고정 설정
-ADMIN_GROUP_CHAT_ID = "C9e75b12edf47b8ce967edbcefe8a027d"
+ADMIN_GROUP_CHAT_ID = "C30afa7c17e86324321d930bc35f1621f"
 
 # ✨ [추가됨] 같은 코드를 여러 클라우드런 인스턴스에 올려서, 인증방별로 처리를 나눠 맡기기 위한 설정.
 # 이 서비스 자신의 클라우드런 URL(예: https://xxxx-uc.a.run.app)을 배포 시 환경변수로 넣어준다.
