@@ -1446,13 +1446,91 @@ def check_voice_gate(user_id):
         return "review"
     return "wait"
     
+# def finalize_after_nickname_check(source_id, user_id, reply_token):
+#     """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 판정.
+
+#     1) 닉네임(+생년 윗첨자, 여자는 ✿) 변경 확인 — 미변경이면 재안내
+#     2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내 / 에러·멈춤이면 운영진 검토
+#     3) 이상 없음(깨끗한 신규) → '/ㅇㅈ 퇴장' 멘트 + @전체 완료멘션 (퇴장대기)
+#        이상 있음 → 운영진 확인 대기 안내 (관리자검토대기)
+#     """
+#     row = get_validation_row(user_id, "nickname, birth_year, gender")
+#     nickname = row.get('nickname') or ""
+#     birth_year = row.get('birth_year') or ""
+#     gender = row.get('gender') or ""
+
+#     def _reply(text):
+#         with ApiClient(configuration) as api_client:
+#             MessagingApi(api_client).reply_message_with_http_info(
+#                 ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
+#             )
+
+#     # 1) 닉네임 변경 확인
+#     if not is_nickname_changed_correctly(source_id, user_id, birth_year, nickname, gender):
+#         expected = build_display_name(nickname, birth_year, gender)
+#         _reply(
+#             f"닉네임이 아직 '{expected}' 형식과 맞지 않아요.\n"
+#             "닉네임을 변경하고 프로필도 설정한 뒤 다시 \"완료\"라고 입력해 주세요.\n"
+#             "다른 닉네임으로 하고 싶으시면 운영진에게 말씀해 주세요."
+#         )
+#         return
+
+#     # 2) 음성 자동분석 상태 확인
+#     gate = check_voice_gate(user_id)
+#     if gate == "wait":
+#         _reply("음성 분석을 마무리하는 중이에요. 잠시 후 다시 \"완료\"라고 입력해 주세요.")
+#         return
+#     if gate == "ok":
+#         try:
+#             # 부수효과 목적: 운영진방 참고 알림 + voice_check_report 저장 (반환 문구는 사용 안 함)
+#             format_voice_analysis_reply_text(user_id)
+#         except Exception as e:
+#             print(f"음성분석 결과 알림/저장 중 예외(무시): {e}")
+
+#     # 3) 이상 여부 판정 (분석 에러/멈춤이면 무조건 운영진 검토)
+#     _blacklist_issue = has_blacklist_issue(user_id) if gate == "ok" else False
+#     _clean_new = is_clean_new_user(user_id)
+#     print(f"[퇴장 멘트 판정] user_id={user_id} gate={gate} 음성블랙이슈={_blacklist_issue} 깨끗한신규={_clean_new}")
+
+#     if gate == "review" or _blacklist_issue or not _clean_new:
+#         if supabase:
+#             supabase_execute(
+#                 lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
+#                 label="관리자검토대기 상태 전환"
+#             )
+#         sync_status_to_sheet(user_id, "관리자검토대기")
+#         _reply("기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다.")
+#         return
+
+#     # 4) 깨끗한 신규 → 퇴장 안내 + @전체 완료멘션을 같이 reply
+#     #    (memberLeft 웹훅에는 replyToken이 없어, 실제 퇴장 후에는 reply가 불가능하므로 안내와 동시에 발송)
+#     if supabase:
+#         supabase_execute(
+#             lambda: supabase.table('user_validations').update({"status": "퇴장대기"}).eq('user_id', user_id).execute(),
+#             label="퇴장대기 상태 전환"
+#         )
+#     sync_status_to_sheet(user_id, "퇴장대기")
+
+#     exit_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증이 모두 완료되었습니다. 안내에 따라 방을 나가주세요."
+#     completion_message = build_all_mention_message(f"[{nickname or '신입'}]님 인증이 완료되었습니다.")
+
+#     sent_ok = send_reply_or_push(reply_token, source_id, [TextMessage(text=exit_text), completion_message])
+#     if not sent_ok:
+#         print(f"⚠️ user_id={user_id} 퇴장 멘트 발송 실패 -> 닉변대기로 되돌림")
+#         if supabase:
+#             supabase_execute(
+#                 lambda: supabase.table('user_validations').update({"status": "닉변대기"}).eq('user_id', user_id).execute(),
+#                 label="퇴장 멘트 발송 실패 롤백"
+#             )
+#         sync_status_to_sheet(user_id, "닉변대기")
+
 def finalize_after_nickname_check(source_id, user_id, reply_token):
-    """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 판정.
+    """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 처리.
 
     1) 닉네임(+생년 윗첨자, 여자는 ✿) 변경 확인 — 미변경이면 재안내
-    2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내 / 에러·멈춤이면 운영진 검토
-    3) 이상 없음(깨끗한 신규) → '/ㅇㅈ 퇴장' 멘트 + @전체 완료멘션 (퇴장대기)
-       이상 있음 → 운영진 확인 대기 안내 (관리자검토대기)
+    2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내
+    3) 이상 유무와 상관없이 항상 '기본 인증 완료, 인증자 확인 후 진행' 안내 (관리자검토대기)
+       (퇴장 멘트/@전체 완료멘션은 더 이상 자동으로 보내지 않음)
     """
     row = get_validation_row(user_id, "nickname, birth_year, gender")
     nickname = row.get('nickname') or ""
@@ -1487,43 +1565,15 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
         except Exception as e:
             print(f"음성분석 결과 알림/저장 중 예외(무시): {e}")
 
-    # 3) 이상 여부 판정 (분석 에러/멈춤이면 무조건 운영진 검토)
-    _blacklist_issue = has_blacklist_issue(user_id) if gate == "ok" else False
-    _clean_new = is_clean_new_user(user_id)
-    print(f"[퇴장 멘트 판정] user_id={user_id} gate={gate} 음성블랙이슈={_blacklist_issue} 깨끗한신규={_clean_new}")
-
-    if gate == "review" or _blacklist_issue or not _clean_new:
-        if supabase:
-            supabase_execute(
-                lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
-                label="관리자검토대기 상태 전환"
-            )
-        sync_status_to_sheet(user_id, "관리자검토대기")
-        _reply("기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다.")
-        return
-
-    # 4) 깨끗한 신규 → 퇴장 안내 + @전체 완료멘션을 같이 reply
-    #    (memberLeft 웹훅에는 replyToken이 없어, 실제 퇴장 후에는 reply가 불가능하므로 안내와 동시에 발송)
+    # 3) 문제 유무와 상관없이 항상 운영진 확인 대기로 전환
+    print(f"[완료 처리] user_id={user_id} gate={gate} -> 관리자검토대기")
     if supabase:
         supabase_execute(
-            lambda: supabase.table('user_validations').update({"status": "퇴장대기"}).eq('user_id', user_id).execute(),
-            label="퇴장대기 상태 전환"
+            lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
+            label="관리자검토대기 상태 전환"
         )
-    sync_status_to_sheet(user_id, "퇴장대기")
-
-    exit_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증이 모두 완료되었습니다. 안내에 따라 방을 나가주세요."
-    completion_message = build_all_mention_message(f"[{nickname or '신입'}]님 인증이 완료되었습니다.")
-
-    sent_ok = send_reply_or_push(reply_token, source_id, [TextMessage(text=exit_text), completion_message])
-    if not sent_ok:
-        print(f"⚠️ user_id={user_id} 퇴장 멘트 발송 실패 -> 닉변대기로 되돌림")
-        if supabase:
-            supabase_execute(
-                lambda: supabase.table('user_validations').update({"status": "닉변대기"}).eq('user_id', user_id).execute(),
-                label="퇴장 멘트 발송 실패 롤백"
-            )
-        sync_status_to_sheet(user_id, "닉변대기")
-
+    sync_status_to_sheet(user_id, "관리자검토대기")
+    _reply("기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다.")
 
 @app.route("/api", methods=['POST'])
 def callback():
