@@ -1423,17 +1423,29 @@ def send_reply_or_push(reply_token, source_id, messages):
         return False
 
 
+# def check_voice_gate(user_id):
+#     """'완료' 시점에 음성 자동분석 상태를 본다: ok(완료) / wait(진행 중) / review(에러·멈춤)"""
+#     row = get_validation_row(user_id, "voice_analysis_state, voice_analysis_synced_at")
+#     state = row.get('voice_analysis_state')
+#     if state == "완료":
+#         return "ok"
+#     if state == "에러" or _voice_analysis_is_stale(row):
+#         return "review"
+#     return "wait"
+
 def check_voice_gate(user_id):
-    """'완료' 시점에 음성 자동분석 상태를 본다: ok(완료) / wait(진행 중) / review(에러·멈춤)"""
-    row = get_validation_row(user_id, "voice_analysis_state, voice_analysis_synced_at")
+    """'완료' 시점에 음성 자동분석 상태를 본다: ok(완료) / wait(진행 중) / review(에러·멈춤·대조 실패)"""
+    row = get_validation_row(user_id, "voice_analysis_state, voice_analysis_synced_at, voice_analysis_result")
     state = row.get('voice_analysis_state')
     if state == "완료":
+        result = row.get('voice_analysis_result') or {}
+        if isinstance(result, dict) and result.get('match_error'):
+            return "review"   # 블랙리스트 대조가 실패했으니 '이상 없음'으로 볼 수 없다 → 운영진 확인
         return "ok"
     if state == "에러" or _voice_analysis_is_stale(row):
         return "review"
     return "wait"
-
-
+    
 def finalize_after_nickname_check(source_id, user_id, reply_token):
     """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 판정.
 
@@ -2727,6 +2739,66 @@ def _format_gender_signals(voice_result):
     return f" ({' / '.join(parts)})" if parts else ""
 
 
+# def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nickname=None):
+#     """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
+#     (운영진방 알림, 'N번방 확인' 저장용 리포트에서 공통으로 사용)
+#     특이사항이 없으면 빈 리스트를 반환합니다.
+#     """
+#     lines = []
+#     if not voice_result or voice_result.get("error"):
+#         return lines
+
+#     est_gender = voice_result.get("estimated_gender")
+#     claimed_gender_norm = _GENDER_NORM_MAP.get((claimed_gender or "").strip())
+#     gender_mismatch = bool(est_gender and claimed_gender_norm and est_gender != claimed_gender_norm)
+
+#     signal_note = _format_gender_signals(voice_result)
+#     if est_gender:
+#         mismatch_note = " ⚠️ 신청서 성별과 다름" if gender_mismatch else ""
+#         lines.append(f"- 음성 기반 추정 성별: {est_gender}{signal_note}{mismatch_note}")
+#     elif voice_result.get("gender_uncertain"):
+#         lines.append(f"- 음성 기반 추정 성별: 경계/판단 불확실{signal_note} — 참고만 해주세요")
+#     if voice_result.get("gender_note"):
+#         lines.append(f"- ⚠️ {voice_result['gender_note']} (참고용 정황, 확정 판정 아님)")
+
+#     # ✨ [추가됨] 오토튠/피치보정 의심도. 확정 판정이 아니라 정황 지표이므로 항상 그 취지를 함께 남긴다.
+#     autotune_prob = voice_result.get("autotune_probability")
+#     if autotune_prob is not None:
+#         if autotune_prob >= AUTOTUNE_ALERT_THRESHOLD:
+#             level = "⚠️ 높음(의심)"
+#         elif autotune_prob >= 20:
+#             level = "중간"
+#         else:
+#             level = "낮음"
+#         lines.append(f"- 오토튠/피치보정 의심도: {autotune_prob:.1f}% ({level}) — 참고용 정황 지표, 확정 판정 아님")
+
+#     matches = voice_result.get("matches") or []
+#     if matches:
+#         strong = [m for m in matches if (m.get("similarity") or 0) >= VOICE_MATCH_ALERT_THRESHOLD]
+#         if any(not _match_is_member(m) for m in strong):
+#             header = "- ⚠️⚠️ 블랙리스트 음성과 매우 유사한 대조 결과 (동일인 의심):"
+#         elif strong:
+#             header = "- ⚠️ 기존 신입 음성과 매우 유사 (재입장 의심 — 닉네임/계정 변경 가능성):"
+#         else:
+#             header = "- 기존 음성 대조 결과 (임계치 미만 — 참고용):"
+#         lines.append(header)
+#         lines.extend(format_voice_match_lines(matches, claimed_nickname=claimed_nickname))
+
+#     # ✨ [추가됨] Cloud Run(app.py)이 90% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
+#     # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
+#     if voice_result.get("is_strong_match"):
+#         _thr = voice_result.get("save_threshold")
+#         _thr_txt = f"{_thr * 100:.0f}%" if isinstance(_thr, (int, float)) else "저장 제외 기준"
+#         lines.append(f"- ℹ️ 블랙리스트 일치율이 {_thr_txt} 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
+
+#     # ✨ [추가됨] 분석 자체는 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우.
+#     # 신입에게는 노출되지 않고(🔵 완료로만 보임) 운영진만 이 리포트로 확인할 수 있다.
+#     save_error = voice_result.get("save_error")
+#     if save_error:
+#         lines.append(f"- ⚠️ 음성 원본/프로필 저장 실패: {save_error} (voice_profiles 미등록 — 재확인 필요)")
+
+#     return lines
+
 def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nickname=None):
     """음성 자동분석 결과에서 '참고할 만한 내용'만 사람이 읽기 좋은 줄 리스트로 뽑아냅니다.
     (운영진방 알림, 'N번방 확인' 저장용 리포트에서 공통으로 사용)
@@ -2749,7 +2821,7 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nick
     if voice_result.get("gender_note"):
         lines.append(f"- ⚠️ {voice_result['gender_note']} (참고용 정황, 확정 판정 아님)")
 
-    # ✨ [추가됨] 오토튠/피치보정 의심도. 확정 판정이 아니라 정황 지표이므로 항상 그 취지를 함께 남긴다.
+    # 오토튠/피치보정 의심도. 확정 판정이 아니라 정황 지표이므로 항상 그 취지를 함께 남긴다.
     autotune_prob = voice_result.get("autotune_probability")
     if autotune_prob is not None:
         if autotune_prob >= AUTOTUNE_ALERT_THRESHOLD:
@@ -2759,6 +2831,10 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nick
         else:
             level = "낮음"
         lines.append(f"- 오토튠/피치보정 의심도: {autotune_prob:.1f}% ({level}) — 참고용 정황 지표, 확정 판정 아님")
+
+    # ✨ 블랙리스트 대조 자체가 실패한 경우 (매칭이 없는 것과 다름)
+    if voice_result.get("match_error"):
+        lines.append(f"- ⚠️⚠️ 블랙리스트 대조 실패: {voice_result['match_error']} (대조가 안 된 상태 — 직접 확인 필요)")
 
     matches = voice_result.get("matches") or []
     if matches:
@@ -2772,21 +2848,18 @@ def build_voice_check_report_lines(*, claimed_gender, voice_result, claimed_nick
         lines.append(header)
         lines.extend(format_voice_match_lines(matches, claimed_nickname=claimed_nickname))
 
-    # ✨ [추가됨] Cloud Run(app.py)이 90% 이상 일치로 판단해 신규 저장을 생략한 경우 — 에러는 아니지만
-    # voice_profiles에 새 레코드가 없다는 뜻이므로 운영진이 참고할 수 있게 남긴다.
+    # 90% 이상 일치로 판단해 신규 저장을 생략한 경우
     if voice_result.get("is_strong_match"):
         _thr = voice_result.get("save_threshold")
         _thr_txt = f"{_thr * 100:.0f}%" if isinstance(_thr, (int, float)) else "저장 제외 기준"
         lines.append(f"- ℹ️ 블랙리스트 일치율이 {_thr_txt} 이상으로 판단되어 신규 음성 프로필 저장은 생략됨")
 
-    # ✨ [추가됨] 분석 자체는 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우.
-    # 신입에게는 노출되지 않고(🔵 완료로만 보임) 운영진만 이 리포트로 확인할 수 있다.
+    # 분석은 성공했지만 Storage 업로드/voice_profiles insert가 실패한 경우
     save_error = voice_result.get("save_error")
     if save_error:
         lines.append(f"- ⚠️ 음성 원본/프로필 저장 실패: {save_error} (voice_profiles 미등록 — 재확인 필요)")
 
     return lines
-
 
 def build_voice_check_report_text(*, claimed_gender, voice_result, claimed_nickname=None):
     """'N번방 확인' 명령어 응답 및 DB(voice_check_report) 저장에 쓰는 한 덩어리 요약 텍스트."""
