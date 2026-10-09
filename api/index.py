@@ -1776,33 +1776,46 @@ def handle_message(event):
             try:
                 sync_reports = []
 
-                # A. '멘트' 시트 동기화 (전체삭제 대신 차이만 반영 - 타임아웃 방지)
-                if sheet:
+                # A. '멘트' 시트 동기화
+                if not sheet:
+                    sync_reports.append("• ⚠️ 멘트: 건너뜀 — '멘트' 시트에 연결되지 않았습니다 (서버 시작 로그의 '시트 연결 중 일부 실패' 확인)")
+                else:
                     ments_data = sheet.get_all_records()
-                    ments_records = []
-                    for row in ments_data:
-                        k_raw = str(row.get('인증', '')).strip()
-                        v_text = str(row.get('출력', '')).strip()
-                        if k_raw and v_text:
-                            for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
-                                ments_records.append({"keyword": k, "reply_text": v_text})
+                    headers = list(ments_data[0].keys()) if ments_data else []
+                    # 헤더 공백 제거 후 '인증'/'출력' 열을 찾는다
+                    key_col = next((h for h in headers if str(h).replace(" ", "") == "인증"), None)
+                    val_col = next((h for h in headers if str(h).replace(" ", "") == "출력"), None)
 
-                    if ments_records and supabase:
-                        new_keywords = {r["keyword"] for r in ments_records}
-                        existing_rows = get_all_supabase_data('auth_ments', 'keyword')
-                        existing_keywords = {str(r.get('keyword', '')).strip() for r in existing_rows if r.get('keyword')}
-                        removed_keywords = list(existing_keywords - new_keywords)
+                    if not ments_data:
+                        sync_reports.append("• ⚠️ 멘트: 건너뜀 — 시트에 데이터 행이 없습니다")
+                    elif key_col is None or val_col is None:
+                        sync_reports.append(f"• ⚠️ 멘트: 건너뜀 — '인증'/'출력' 열을 못 찾았습니다. 현재 헤더: {headers}")
+                    else:
+                        _dedup = {}
+                        for row in ments_data:
+                            k_raw = str(row.get(key_col, '')).strip()
+                            v_text = str(row.get(val_col, '')).strip()
+                            if k_raw and v_text:
+                                for k in [x.strip() for x in k_raw.split(',') if x.strip()]:
+                                    _dedup[k] = {"keyword": k, "reply_text": v_text}
+                        ments_records = list(_dedup.values())
 
-                        # 시트에서 사라진 키워드만 삭제 (전체삭제 아님)
-                        if removed_keywords:
-                            for i in range(0, len(removed_keywords), 200):
-                                chunk = removed_keywords[i:i + 200]
-                                supabase.table('auth_ments').delete().in_('keyword', chunk).execute()
+                        if not ments_records:
+                            sync_reports.append("• ⚠️ 멘트: 건너뜀 — 인증/출력 값이 모두 빈 칸입니다")
+                        elif supabase:
+                            new_keywords = {r["keyword"] for r in ments_records}
+                            existing_rows = get_all_supabase_data('auth_ments', 'keyword')
+                            existing_keywords = {str(r.get('keyword', '')).strip() for r in existing_rows if r.get('keyword')}
+                            removed_keywords = list(existing_keywords - new_keywords)
 
-                        # 나머지는 upsert (있으면 갱신, 없으면 추가)
-                        process_in_chunks('auth_ments', ments_records, is_insert=False)
-                        sync_reports.append(f"• 멘트: {len(ments_records)}개 키워드 (삭제 {len(removed_keywords)}개)")
+                            if removed_keywords:
+                                for i in range(0, len(removed_keywords), 200):
+                                    supabase.table('auth_ments').delete().in_('keyword', removed_keywords[i:i + 200]).execute()
 
+                            ok_n = process_in_chunks('auth_ments', ments_records, errors=sync_errors)
+                            has_one = '1' in new_keywords
+                            sync_reports.append(f"• 멘트: {ok_n}/{len(ments_records)}개 반영 (삭제 {len(removed_keywords)}개, 키워드 '1' {'있음' if has_one else '없음'})")
+                            
                 # B. '방관리' 시트 동기화
                 if room_manage_sheet:
                     room_data = room_manage_sheet.get_all_records()
