@@ -826,7 +826,7 @@ def _year_label(y):
 # ✨ FLIRTY 새 양식/표시명용 헬퍼
 # ==========================================
 _SUPERSCRIPT_TABLE = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-FEMALE_NAME_SUFFIX = "͙͘͡✿"   # 여자 표시명 뒤에 붙는 장식 (복사한 문자열 그대로)
+FEMALE_NAME_SUFFIX = "  \u0359\u0358\u0361\u273f"   # 여자 표시명 뒤 장식: 공백 2칸 + 결합문자 + ✿ (결합문자가 숫자에 붙지 않고 공백에 붙음)
 
 
 def to_superscript(s):
@@ -991,7 +991,7 @@ def apply_nickname_change(source_id, sender_user_id, new_nick):
         return [TextMessage(text="❌ 해당 유저의 인증 정보를 DB에서 찾을 수 없습니다.")]
 
     # 표시명 전체('아이언⁸⁶')를 붙여 넣어도 닉네임만 남기기
-    new_nick = re.sub(r"[⁰¹²³⁴⁵⁶⁷⁸⁹\u0358\u0359\u0361✿\uFE0F]+$", "", new_nick).strip()
+    new_nick = re.sub(r"[\s⁰¹²³⁴⁵⁶⁷⁸⁹\u0358\u0359\u0361✿\uFE0F]+$", "", new_nick).strip()
     if not new_nick:
         return [TextMessage(text="사용법: /바뀐닉네임 변경")]
 
