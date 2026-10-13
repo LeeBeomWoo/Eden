@@ -154,26 +154,42 @@ def submit_voice_analysis_job(supabase, configuration, *, message_id, user_id, n
         return
 
     headers = {"X-API-Key": VOICE_SERVICE_API_KEY} if VOICE_SERVICE_API_KEY else {}
-    try:
-        resp = requests.post(
-            f"{target_url}/analyze-async",
-            files={"audio": ("audio", audio_bytes)},
-            data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
-            headers=headers,
-            timeout=(3.0, 15.0),  # 서버는 접수 즉시 202를 반환하므로 짧게 잡아도 됩니다
-        )
+
+    # 배정된 서버를 먼저 시도하고, "연결 자체가 안 될 때"(서버 다운/방화벽)만 다른 서버로 넘어갑니다.
+    # (읽기 타임아웃은 서버가 파일을 이미 받았을 수 있어서 다른 서버로 중복 접수하지 않습니다)
+    candidates = [target_url] + [u for u in VOICE_SERVICE_URLS if u != target_url]
+    last_conn_err = None
+    for url in candidates:
+        try:
+            resp = requests.post(
+                f"{url}/analyze-async",
+                files={"audio": ("audio", audio_bytes)},
+                data={"user_id": user_id, "nickname": nickname, "message_id": message_id},
+                headers=headers,
+                timeout=(3.0, 40.0),  # 접수 응답 대기. 서버가 바쁠 때를 대비해 15초 -> 40초로 완화
+            )
+        except requests.exceptions.ReadTimeout as e:
+            # 서버에 연결은 됐고 파일도 전송했지만 응답만 늦은 상태 → 접수됐을 가능성이 있으므로
+            # '에러'로 단정하지 않고 '처리중'을 유지한다. (서버가 결과를 쓰면 '완료',
+            # 끝내 아무 기록도 없으면 기존 stale 판정이 일정 시간 후 🔴로 처리)
+            print(f"⚠️ 음성분석 접수 응답 지연(처리중 유지): {url} / {e}")
+            return
+        except requests.exceptions.ConnectionError as e:
+            last_conn_err = e
+            print(f"⚠️ 음성분석 서버 연결 실패, 다음 서버 시도: {url} / {e}")
+            continue
+        except Exception as e:
+            mark_voice_analysis_state(supabase, user_id, "에러", error=f"분석 서버 접수 실패: {e}")
+            return
+
         if not resp.ok:
             mark_voice_analysis_state(
                 supabase, user_id, "에러",
                 error=f"분석 서버 접수 실패 ({resp.status_code}): {(resp.text or '')[:200]}",
             )
-            return
-    except Exception as e:
-        mark_voice_analysis_state(supabase, user_id, "에러", error=f"분석 서버 접수 실패: {e}")
-        return
+        return  # 접수 성공 시엔 상태를 그대로 '처리중'으로 둔다 (최종 상태는 서버가 Supabase에 기록)
 
-    # 접수 성공 시엔 상태를 그대로 '처리중'으로 둡니다. 최종 '완료'/'에러'는
-    # 서버가 백그라운드 분석을 마친 뒤 Supabase에 직접 씁니다.
+    mark_voice_analysis_state(supabase, user_id, "에러", error=f"분석 서버 접수 실패(모든 서버 연결 불가): {last_conn_err}")
 
 
 def analyze_audio_via_cloud_run(raw_audio_bytes: bytes, room_id: str = "") -> dict:
