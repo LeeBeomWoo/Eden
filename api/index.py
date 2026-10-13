@@ -42,6 +42,15 @@ app = Flask(__name__)
 # 인증자방(관리자 그룹방) ID 고정 설정
 ADMIN_GROUP_CHAT_ID = "Cc39d1325f15564e1549ee105ca7fdec1"
 
+# ✨ [추가됨] 1:1 대화에서 관리자 명령어를 전부 쓸 수 있는 유저 ID 목록 (쉼표로 여러 명 가능)
+# 코드에 직접 넣거나, 환경변수 SUPER_USER_IDS="Uxxxx,Uyyyy" 로 지정
+SUPER_USER_IDS = {u.strip() for u in os.environ.get("SUPER_USER_IDS", "U6362873054f9e1c52c48e7d725ad56ec").split(",") if u.strip()}
+
+def is_super_dm(event):
+    """1:1 대화(UserSource)이면서 지정된 유저가 보낸 메시지인지 확인"""
+    src = event.source
+    return getattr(src, "type", "") == "user" and getattr(src, "user_id", None) in SUPER_USER_IDS
+
 # ✨ [추가됨] 같은 코드를 여러 클라우드런 인스턴스에 올려서, 인증방별로 처리를 나눠 맡기기 위한 설정.
 # 이 서비스 자신의 클라우드런 URL(예: https://xxxx-uc.a.run.app)을 배포 시 환경변수로 넣어준다.
 # (인스턴스마다 이 값만 다르게 설정하면 됨 — 나머지 코드/환경변수는 동일해도 무방)
@@ -1626,7 +1635,7 @@ def handle_message(event):
     # ("." 초기화, 1번 양식 제출, "완료" 답장 처리)를 전혀 실행/기록하지 않는다.
     # 이 방에서는 관리진 명령어(/인증, /ㅇㅈ, /디비업데이트, /O번방 확인 등)와
     # 그 외 슬래시(/)로 시작하는 일반 명령어(DB 키워드로 등록된 멘트 포함)만 동작한다.
-    is_admin_room = (source_id == ADMIN_GROUP_CHAT_ID)
+    is_admin_room = (source_id == ADMIN_GROUP_CHAT_ID) or is_super_dm(event)
 
     # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
     if not (user_message == "." or user_message.startswith("/")):
@@ -1761,7 +1770,7 @@ def handle_message(event):
             return
 
     # [관리자 전용 명령어]
-    if user_message.startswith("/") and source_id == ADMIN_GROUP_CHAT_ID:
+    if user_message.startswith("/") and is_admin_room:
         command_body = user_message[1:].strip()
 
         # 0) /색상, /색상표, /색깔, /색표 : 중복/블랙 필터링 색상 의미표 (관리자방 전용)
@@ -3325,7 +3334,7 @@ def handle_audio(event):
 
     # ✨ [추가됨] 관리자방에서 '/음성업로드' 명령 직후 온 음성 -> 블랙리스트 수동 등록 플로우로 분기.
     # (신입 검증용 last-joined 체크는 적용하지 않는다 — 운영진 본인이 보내는 음성이므로.)
-    if source_id == ADMIN_GROUP_CHAT_ID:
+    if source_id == ADMIN_GROUP_CHAT_ID or is_super_dm(event):
         # ✨ '/기존멤버등록' 양식 제출 직후의 음성이면 기존 멤버 음성 등록, 아니면 기존 블랙리스트 업로드 플로우
         if handle_member_register_voice(event, user_id):
             return
