@@ -1686,6 +1686,20 @@ def handle_message(event):
         parts = command.split(maxsplit=1)
         cmd_prefix = parts[0]
 
+        # ✨ [추가됨] 내 유저 ID 확인: /내아이디, /내id, /myid (1:1 포함 어느 방에서든 동작)
+        if cmd_prefix.lower() in ("내아이디", "내id", "myid", "아이디"):
+            _kind = getattr(event.source, "type", "")
+            id_reply = (
+                f"내 유저 ID:\n{user_id}\n\n"
+                f"대화 유형: {_kind}\n"
+                f"관리자 권한(1:1): {'O' if is_super_dm(event) else 'X'}"
+            )
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=id_reply)])
+                )
+            return
+
         # ✨ 방(그룹) ID 확인: /방아이디, /방id  (어느 방에서든 동작)
         if cmd_prefix.lower() in ("방아이디", "방id"):
             gid = getattr(event.source, 'group_id', None) or getattr(event.source, 'room_id', None)
