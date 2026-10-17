@@ -51,6 +51,78 @@ def is_super_dm(event):
     src = event.source
     return getattr(src, "type", "") == "user" and getattr(src, "user_id", None) in SUPER_USER_IDS
 
+
+# ✨ [추가됨] /음성학습, /음성재분석 공통 처리 — 작업을 Supabase training_jobs 큐에 넣기만 하고,
+#   실제 작업은 (필요할 때만 켜는) 학습 서버의 워커가 가져가서 처리한다. 결과는 명령을 입력한 채팅방으로 전달된다.
+_JOB_KIND_LABEL = {"train": "음성학습", "reanalyze": "음성 재분석", "reanalyze_all": "음성 재분석(전체)"}
+_JOB_STATUS_ICON = {"queued": "🟡", "running": "🟡", "done": "🔵", "rejected": "🟠", "error": "🔴", "cancelled": "⚪"}
+_JOB_STATUS_LABEL = {"queued": "대기 중 (학습 서버가 켜지면 시작)", "running": "진행 중", "done": "완료",
+                     "rejected": "완료(적용 안 됨)", "error": "실패", "cancelled": "취소됨"}
+
+def handle_training_job_command(event, kind, rest):
+    """kind: 'train' | 'reanalyze'. 사용자에게 보낼 답장 문구를 돌려준다."""
+    cmd_name = "음성학습" if kind == "train" else "음성재분석"
+    try:
+        if rest in ("취소", "취소하기"):
+            cancelled = (supabase.table("training_jobs").update({"status": "cancelled"})
+                         .eq("status", "queued").execute().data or [])
+            return ("🗑️ 대기 중이던 요청을 취소했습니다." if cancelled
+                    else "취소할 대기 중 요청이 없습니다. (이미 진행 중이면 취소할 수 없어요)")
+
+        if rest in ("상태", "결과", "확인"):
+            rows = (supabase.table("training_jobs").select("*")
+                    .order("id", desc=True).limit(1).execute().data or [])
+            if not rows:
+                return "아직 음성학습/재분석 기록이 없습니다."
+            j = rows[0]
+            res = j.get("result") or {}
+            lines = [f"{_JOB_STATUS_ICON.get(j['status'], '⚪')} {_JOB_KIND_LABEL.get(j.get('kind') or 'train', '작업')} "
+                     f"#{j['id']} — {_JOB_STATUS_LABEL.get(j['status'], j['status'])}"]
+            if res.get("n_female") is not None:
+                lines.append(f"- 샘플: 여 {res.get('n_female')} / 남 {res.get('n_male')}")
+            if res.get("cv_accuracy") is not None:
+                lines.append(f"- 교차검증 균형정확도: {res.get('cv_accuracy')}")
+            if res.get("analyzed") is not None:
+                lines.append(f"- 분석 {res.get('analyzed')}건 · 이전과 차이 {res.get('flagged')}건 · 실패 {res.get('failed')}건")
+            if j.get("error"):
+                lines.append(f"- 사유: {str(j['error'])[:200]}")
+            return "\n".join(lines)
+
+        # 요청 접수
+        if kind == "reanalyze":
+            if rest in ("전체", "전부", "all"):
+                kind = "reanalyze_all"
+            elif rest:
+                return "사용법: /음성재분석 (새로 쌓인 것만) · /음성재분석 전체 · /음성재분석 상태 · /음성재분석 취소"
+        elif rest:
+            return "사용법: /음성학습 · /음성학습 상태 · /음성학습 취소"
+
+        # 동시에 1개만 허용 — DB의 부분 유니크 인덱스가 중복 삽입을 막아 준다
+        active = (supabase.table("training_jobs").select("id,status,kind")
+                  .in_("status", ["queued", "running"]).limit(1).execute().data or [])
+        if active:
+            a = active[0]
+            return (f"⏳ 이미 {_JOB_KIND_LABEL.get(a.get('kind') or 'train', '작업')} #{a['id']}이(가) "
+                    f"{'진행' if a['status'] == 'running' else '대기'} 중입니다.\n"
+                    f"끝나면 결과를 알려드려요. (/{cmd_name} 상태, 취소: /{cmd_name} 취소)")
+
+        src = event.source
+        reply_to = (getattr(src, "group_id", None) or getattr(src, "room_id", None) or getattr(src, "user_id", None))
+        ins = (supabase.table("training_jobs")
+               .insert({"kind": kind, "requested_by": getattr(src, "user_id", None), "reply_to": reply_to})
+               .execute().data or [])
+        job_id = ins[0]["id"] if ins else "?"
+        if kind == "train":
+            return (f"🧠 음성학습 요청 접수 (#{job_id})\n"
+                    f"학습 서버가 켜져 있으면 곧 시작하고, 꺼져 있으면 켜질 때 자동으로 시작합니다.\n"
+                    f"완료되면 결과를 알려드릴게요. (취소: /음성학습 취소)")
+        return (f"🔬 음성 정밀 재분석 요청 접수 (#{job_id})\n"
+                f"원본이 저장된 음성을 학습 서버가 다시 분석하고, 이전 결과와 차이 나는 건만 이 채팅으로 알려드립니다.\n"
+                f"학습 서버가 꺼져 있으면 켜질 때 자동으로 시작합니다. (취소: /음성재분석 취소)")
+    except Exception as e:
+        print(f"⚠️ /{cmd_name} 처리 오류: {e}")
+        return "⚠️ 요청 중 오류가 발생했습니다. (training_jobs 테이블이 만들어져 있는지 확인해 주세요)"
+
 # ✨ [추가됨] 같은 코드를 여러 클라우드런 인스턴스에 올려서, 인증방별로 처리를 나눠 맡기기 위한 설정.
 # 이 서비스 자신의 클라우드런 URL(예: https://xxxx-uc.a.run.app)을 배포 시 환경변수로 넣어준다.
 # (인스턴스마다 이 값만 다르게 설정하면 됨 — 나머지 코드/환경변수는 동일해도 무방)
@@ -1986,58 +2058,19 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
 
-        # ✨ [추가됨] /음성학습 — 성별 분류기 재학습을 학습 서버에 요청 (결과는 학습 서버가 알림)
-        #   /음성학습        : 학습 요청 접수 (학습 서버가 켜져 있을 때 처리됨 — 꺼져 있으면 켜질 때까지 대기)
-        #   /음성학습 상태   : 가장 최근 작업의 상태 조회
-        #   /음성학습 취소   : 아직 시작 안 한(대기 중) 요청 취소
+        # ✨ [추가됨] /음성학습 — 성별 분류기 재학습을 학습 서버에 요청 (/음성학습 상태 · /음성학습 취소)
         elif command_body.startswith("음성학습"):
-            rest = command_body[len("음성학습"):].strip()
-            try:
-                if rest in ("취소", "취소하기"):
-                    cancelled = (supabase.table("training_jobs").update({"status": "cancelled"})
-                                 .eq("status", "queued").execute().data or [])
-                    reply_text = ("🗑️ 대기 중이던 음성학습 요청을 취소했습니다." if cancelled
-                                  else "취소할 대기 중 요청이 없습니다. (이미 학습 중이면 취소할 수 없어요)")
-                elif rest in ("상태", "결과", "확인"):
-                    rows = (supabase.table("training_jobs").select("*")
-                            .order("id", desc=True).limit(1).execute().data or [])
-                    if not rows:
-                        reply_text = "아직 음성학습 기록이 없습니다."
-                    else:
-                        j = rows[0]
-                        icon = {"queued": "🟡", "running": "🟡", "done": "🔵",
-                                "rejected": "🟠", "error": "🔴", "cancelled": "⚪"}.get(j["status"], "⚪")
-                        label = {"queued": "대기 중 (학습 서버가 켜지면 시작)", "running": "학습 중", "done": "완료(적용됨)",
-                                 "rejected": "완료(적용 안 됨)", "error": "실패", "cancelled": "취소됨"}.get(j["status"], j["status"])
-                        res = j.get("result") or {}
-                        lines = [f"{icon} 음성학습 #{j['id']} — {label}"]
-                        if res.get("n_female") is not None:
-                            lines.append(f"- 샘플: 여 {res.get('n_female')} / 남 {res.get('n_male')}")
-                        if res.get("cv_accuracy") is not None:
-                            lines.append(f"- 교차검증 균형정확도: {res.get('cv_accuracy')}")
-                        if j.get("error"):
-                            lines.append(f"- 사유: {str(j['error'])[:200]}")
-                        reply_text = "\n".join(lines)
-                else:
-                    # 동시에 1개만 허용 — DB의 부분 유니크 인덱스가 중복 삽입을 막아 준다
-                    active = (supabase.table("training_jobs").select("id,status")
-                              .in_("status", ["queued", "running"]).limit(1).execute().data or [])
-                    if active:
-                        a = active[0]
-                        reply_text = (f"⏳ 이미 음성학습 #{a['id']}이(가) "
-                                      f"{'학습 중' if a['status'] == 'running' else '대기 중'}입니다.\n"
-                                      f"끝나면 이 방으로 알려드려요. (/음성학습 상태, 취소: /음성학습 취소)")
-                    else:
-                        ins = (supabase.table("training_jobs")
-                               .insert({"requested_by": event.source.user_id}).execute().data or [])
-                        job_id = ins[0]["id"] if ins else "?"
-                        reply_text = (f"🧠 음성학습 요청 접수 (#{job_id})\n"
-                                      f"학습 서버가 켜져 있으면 곧 시작하고, 꺼져 있으면 켜질 때 자동으로 시작합니다.\n"
-                                      f"완료되면 결과를 이 방으로 알려드릴게요. (취소: /음성학습 취소)")
-            except Exception as e:
-                print(f"⚠️ /음성학습 처리 오류: {e}")
-                reply_text = "⚠️ 음성학습 요청 중 오류가 발생했습니다. (training_jobs 테이블이 만들어져 있는지 확인해 주세요)"
+            reply_text = handle_training_job_command(event, "train", command_body[len("음성학습"):].strip())
+            if reply_text:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+                return
 
+        # ✨ [추가됨] /음성재분석 — 저장된 음성을 학습 서버가 정밀하게 다시 분석, 이전과 다른 건은 이 채팅으로 전달
+        #   /음성재분석 (새로 쌓인 것만) · /음성재분석 전체 · /음성재분석 상태 · /음성재분석 취소
+        elif command_body.startswith("음성재분석"):
+            reply_text = handle_training_job_command(event, "reanalyze", command_body[len("음성재분석"):].strip())
             if reply_text:
                 with ApiClient(configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
