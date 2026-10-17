@@ -44,7 +44,7 @@ ADMIN_GROUP_CHAT_ID = "Cc39d1325f15564e1549ee105ca7fdec1"
 
 # ✨ [추가됨] 1:1 대화에서 관리자 명령어를 전부 쓸 수 있는 유저 ID 목록 (쉼표로 여러 명 가능)
 # 코드에 직접 넣거나, 환경변수 SUPER_USER_IDS="Uxxxx,Uyyyy" 로 지정
-SUPER_USER_IDS = {u.strip() for u in os.environ.get("SUPER_USER_IDS", "U0819698e89263d8f93e8a58057cc9d84").split(",") if u.strip()}
+SUPER_USER_IDS = {u.strip() for u in os.environ.get("SUPER_USER_IDS", "U16fe24fee6f2bf99681f97b6e1ec1e6f").split(",") if u.strip()}
 
 def is_super_dm(event):
     """1:1 대화(UserSource)이면서 지정된 유저가 보낸 메시지인지 확인"""
