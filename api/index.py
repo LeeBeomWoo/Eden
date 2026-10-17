@@ -1986,6 +1986,64 @@ def handle_message(event):
                     line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=safe_reply_text)]))
                 return
 
+        # ✨ [추가됨] /음성학습 — 성별 분류기 재학습을 학습 서버에 요청 (결과는 학습 서버가 알림)
+        #   /음성학습        : 학습 요청 접수 (학습 서버가 켜져 있을 때 처리됨 — 꺼져 있으면 켜질 때까지 대기)
+        #   /음성학습 상태   : 가장 최근 작업의 상태 조회
+        #   /음성학습 취소   : 아직 시작 안 한(대기 중) 요청 취소
+        elif command_body.startswith("음성학습"):
+            rest = command_body[len("음성학습"):].strip()
+            try:
+                if rest in ("취소", "취소하기"):
+                    cancelled = (supabase.table("training_jobs").update({"status": "cancelled"})
+                                 .eq("status", "queued").execute().data or [])
+                    reply_text = ("🗑️ 대기 중이던 음성학습 요청을 취소했습니다." if cancelled
+                                  else "취소할 대기 중 요청이 없습니다. (이미 학습 중이면 취소할 수 없어요)")
+                elif rest in ("상태", "결과", "확인"):
+                    rows = (supabase.table("training_jobs").select("*")
+                            .order("id", desc=True).limit(1).execute().data or [])
+                    if not rows:
+                        reply_text = "아직 음성학습 기록이 없습니다."
+                    else:
+                        j = rows[0]
+                        icon = {"queued": "🟡", "running": "🟡", "done": "🔵",
+                                "rejected": "🟠", "error": "🔴", "cancelled": "⚪"}.get(j["status"], "⚪")
+                        label = {"queued": "대기 중 (학습 서버가 켜지면 시작)", "running": "학습 중", "done": "완료(적용됨)",
+                                 "rejected": "완료(적용 안 됨)", "error": "실패", "cancelled": "취소됨"}.get(j["status"], j["status"])
+                        res = j.get("result") or {}
+                        lines = [f"{icon} 음성학습 #{j['id']} — {label}"]
+                        if res.get("n_female") is not None:
+                            lines.append(f"- 샘플: 여 {res.get('n_female')} / 남 {res.get('n_male')}")
+                        if res.get("cv_accuracy") is not None:
+                            lines.append(f"- 교차검증 균형정확도: {res.get('cv_accuracy')}")
+                        if j.get("error"):
+                            lines.append(f"- 사유: {str(j['error'])[:200]}")
+                        reply_text = "\n".join(lines)
+                else:
+                    # 동시에 1개만 허용 — DB의 부분 유니크 인덱스가 중복 삽입을 막아 준다
+                    active = (supabase.table("training_jobs").select("id,status")
+                              .in_("status", ["queued", "running"]).limit(1).execute().data or [])
+                    if active:
+                        a = active[0]
+                        reply_text = (f"⏳ 이미 음성학습 #{a['id']}이(가) "
+                                      f"{'학습 중' if a['status'] == 'running' else '대기 중'}입니다.\n"
+                                      f"끝나면 이 방으로 알려드려요. (/음성학습 상태, 취소: /음성학습 취소)")
+                    else:
+                        ins = (supabase.table("training_jobs")
+                               .insert({"requested_by": event.source.user_id}).execute().data or [])
+                        job_id = ins[0]["id"] if ins else "?"
+                        reply_text = (f"🧠 음성학습 요청 접수 (#{job_id})\n"
+                                      f"학습 서버가 켜져 있으면 곧 시작하고, 꺼져 있으면 켜질 때 자동으로 시작합니다.\n"
+                                      f"완료되면 결과를 이 방으로 알려드릴게요. (취소: /음성학습 취소)")
+            except Exception as e:
+                print(f"⚠️ /음성학습 처리 오류: {e}")
+                reply_text = "⚠️ 음성학습 요청 중 오류가 발생했습니다. (training_jobs 테이블이 만들어져 있는지 확인해 주세요)"
+
+            if reply_text:
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)]))
+                return
+
         # ✨ [추가됨] /음성업로드 — 운영진이 임의로 음성을 제출해 블랙리스트에 수동 등록
         elif command_body.startswith("음성업로드"):
             rest = command_body[len("음성업로드"):].strip()
