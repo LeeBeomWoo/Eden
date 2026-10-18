@@ -30,7 +30,7 @@ except ImportError:
     _MENTION_SUPPORTED = False
     print("⚠️ 설치된 line-bot-sdk 버전이 텍스트 메시지 v2(멘션)를 지원하지 않아, 완료 알림 시 멘션 없이 일반 텍스트로 전송됩니다.")
 from linebot.v3.webhooks import (
-    MessageEvent, TextMessageContent, MemberJoinedEvent, MemberLeftEvent, AudioMessageContent
+    MessageEvent, TextMessageContent, MemberJoinedEvent, MemberLeftEvent, AudioMessageContent, FollowEvent
 )
 
 # ✨ [추가됨] 음성 자동분석(성별 추정 / 블랙리스트 화자 유사도 검색) 모듈
@@ -39,8 +39,103 @@ from voice_analysis import submit_voice_analysis_job, process_admin_blacklist_vo
 app = Flask(__name__)
 
 
-# 인증자방(관리자 그룹방) ID 고정 설정
-ADMIN_GROUP_CHAT_ID = "Cc39d1325f15564e1549ee105ca7fdec1"
+# 인증자방(관리자 그룹방) ID — 코드에 고정하지 않고 구글시트 '방관리' 탭에서 읽어옵니다.
+#   '방관리' 탭(= /디비업데이트 후 DB room_management, DB를 먼저 읽음)에 A열(방이름)이 아래 이름 중 하나이고 B열에 방 ID(C로 시작)가 적힌 행이 있으면 그 방을 관리자방으로 사용.
+#   그런 행이 없으면 관리자방 없이 동작합니다. (1:1 슈퍼유저 명령은 그대로 동작)
+ADMIN_ROOM_SHEET_NAMES = {"관리자방", "관리자그룹방", "인증자방", "관리자"}
+ADMIN_ROOM_CACHE_TTL = 60        # 초. 캐시 주기 (DB는 /디비업데이트 후 반영)
+_admin_room_cache = {"id": None, "rooms": set(), "expires": 0.0, "loaded": False}
+
+
+def _read_room_rows_from_db():
+    """DB(room_management)의 (방이름, room_id) 목록. 조회 자체가 실패하면 None."""
+    if not supabase:
+        return None
+    try:
+        res = supabase.table('room_management').select('room_name, room_id').execute()
+        return [(str(r.get('room_name') or ''), str(r.get('room_id') or '').strip()) for r in (res.data or [])]
+    except Exception as e:
+        print(f"방 목록 DB 조회 실패 -> 방관리 시트로 폴백: {e}")
+        return None
+
+
+def _read_room_rows_from_sheet():
+    """'방관리' 시트의 (방이름, room_id) 목록. 시트가 없거나 조회가 실패하면 None."""
+    ws = globals().get("room_manage_sheet")
+    if not ws:
+        return None
+    try:
+        return [(str(r[0]), str(r[1]).strip()) for r in ws.get_all_values()[1:] if len(r) >= 2]
+    except Exception as e:
+        print(f"방관리 시트 조회 실패: {e}")
+        return None
+
+
+def _refresh_room_sheet_cache():
+    """관리자방 ID와 (관리자방을 제외한) 등록된 방 ID 목록을 캐시합니다.
+    DB(room_management)를 먼저 보고, DB 조회가 실패했을 때만 '방관리' 시트를 봅니다.
+    단, DB에 관리자방 행이 아직 없으면(/디비업데이트 전) 관리자방 ID만 시트에서 보충합니다.
+    둘 다 실패하면 직전 값을 유지합니다."""
+    now = time.time()
+    if _admin_room_cache["loaded"] and _admin_room_cache["expires"] > now:
+        return
+
+    def _split(rows):
+        admin_id, rooms = None, set()
+        for name, rid in rows:
+            if not rid:
+                continue
+            if name.replace(" ", "") in ADMIN_ROOM_SHEET_NAMES:
+                admin_id = admin_id or rid
+            else:
+                rooms.add(rid)
+        return admin_id, rooms
+
+    db_rows = _read_room_rows_from_db()
+    if db_rows is not None:
+        admin_id, rooms = _split(db_rows)
+        if not admin_id:
+            sheet_rows = _read_room_rows_from_sheet()
+            if sheet_rows is not None:
+                admin_id = _split(sheet_rows)[0]
+        rooms.discard(admin_id)
+        _admin_room_cache.update(id=admin_id, rooms=rooms, expires=now + ADMIN_ROOM_CACHE_TTL, loaded=True)
+        return
+
+    sheet_rows = _read_room_rows_from_sheet()
+    if sheet_rows is not None:
+        admin_id, rooms = _split(sheet_rows)
+        rooms.discard(admin_id)
+        _admin_room_cache.update(id=admin_id, rooms=rooms, expires=now + ADMIN_ROOM_CACHE_TTL, loaded=True)
+        return
+
+    print("⚠️ 방 목록을 DB/시트 모두에서 읽지 못함(직전 값 유지, 15초 후 재시도)")
+    _admin_room_cache.update(expires=now + 15, loaded=True)
+
+
+def get_admin_group_id():
+    """관리자방 ID를 돌려줍니다. 시트에 없으면 None (= 관리자방 없음)."""
+    _refresh_room_sheet_cache()
+    return _admin_room_cache["id"]
+
+
+def is_registered_room(chat_id):
+    """구글시트 '방관리'에 등록된 방(관리자방 제외)이면 True."""
+    _refresh_room_sheet_cache()
+    return chat_id in _admin_room_cache["rooms"]
+
+
+def is_admin_group(chat_id):
+    """chat_id가 관리자방이면 True. 관리자방이 시트에 없으면 항상 False."""
+    admin_id = get_admin_group_id()
+    return bool(admin_id) and chat_id == admin_id
+
+
+def admin_notify_room_id(event):
+    """관리자 기능(음성 업로드/기존멤버 등록) 결과를 보낼 방. 관리자방이 없으면 명령을 입력한 채팅."""
+    src = event.source
+    return (get_admin_group_id() or getattr(src, "group_id", None)
+            or getattr(src, "room_id", None) or getattr(src, "user_id", None))
 
 # ✨ [추가됨] 1:1 대화에서 관리자 명령어를 전부 쓸 수 있는 유저 ID 목록 (쉼표로 여러 명 가능)
 # 코드에 직접 넣거나, 환경변수 SUPER_USER_IDS="Uxxxx,Uyyyy" 로 지정
@@ -391,6 +486,187 @@ def _init_room_state_sheet():
 room_state_sheet = _init_room_state_sheet()
 
 
+# ==========================================
+# ✨ [추가됨] 제어명령 권한 — 관리자(SUPER_USER_IDS) 또는 구글시트 '인증자' 탭에 등록된 유저ID만 사용 가능
+#   '인증자' 탭: A열 = 닉네임(한글만), B열 = LINE 유저 ID (비워 두면 관리자방에서 말할 때 자동 연결). 1행은 제목줄.
+#   DB(verifiers)를 먼저 읽고 DB 조회가 실패할 때만 시트를 읽습니다. (/디비업데이트로 시트 → DB 반영)
+#   목록이 비어 있으면 SUPER_USER_IDS 외에는 제어명령을 쓸 수 없습니다(안전한 쪽으로 막음).
+# ==========================================
+VERIFIER_SHEET_NAME = "인증자"
+VERIFIER_CACHE_TTL = 60
+VERIFIER_BIND_RETRY_SEC = 600     # 같은 사람의 자동 연결 재시도 간격(프로필 조회 실패/불일치 시)
+_verifier_cache = {"rows": [], "ids": set(), "expires": 0.0}
+_verifier_bind_attempts = {}      # user_id -> 다음 시도 가능 시각
+_USER_ID_RE = re.compile(r"^U[0-9a-fA-F]{32}$")
+
+
+def hangul_only(text):
+    """닉네임에서 완성형 한글만 남깁니다. (숫자/특수기호/이모티콘/윗첨자 제거)  예) '홍길동⁹⁰✿😀' -> '홍길동'"""
+    return "".join(re.findall(r"[가-힣]", str(text or "")))
+
+
+def _init_verifier_sheet():
+    try:
+        try:
+            return spreadsheet.worksheet(VERIFIER_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title=VERIFIER_SHEET_NAME, rows=100, cols=2)
+            ws.update(range_name='A1:B1', values=[["닉네임(한글만)", "user_id"]])
+            return ws
+    except Exception as e:
+        print(f"⚠️ 인증자 시트 연결 실패(관리자 외 제어명령 불가): {e}")
+        return None
+
+
+verifier_sheet = _init_verifier_sheet()
+
+
+def _load_verifiers():
+    """인증자 목록 [{nickname, user_id}] 캐시. DB(verifiers)를 먼저 보고, DB 조회가 실패할 때만 '인증자' 시트를 봅니다.
+    둘 다 실패하면 직전 값을 유지합니다."""
+    now = time.time()
+    if _verifier_cache["expires"] > now:
+        return _verifier_cache["rows"]
+
+    rows = None
+    if supabase:
+        try:
+            res = supabase.table('verifiers').select('nickname, user_id').execute()
+            rows = [{"nickname": str(r.get('nickname') or ''), "user_id": (r.get('user_id') or '').strip() or None}
+                    for r in (res.data or [])]
+        except Exception as e:
+            print(f"인증자 DB 조회 실패 -> 인증자 시트로 폴백: {e}")
+    if rows is None and verifier_sheet:
+        try:
+            rows = []
+            for r in verifier_sheet.get_all_values()[1:]:
+                nick = str(r[0]).strip() if r else ""
+                uid = next((str(c).strip() for c in r[1:] if _USER_ID_RE.match(str(c).strip())), None)
+                if nick or uid:
+                    rows.append({"nickname": nick, "user_id": uid})
+        except Exception as e:
+            print(f"인증자 시트 조회 실패: {e}")
+            rows = None
+
+    if rows is None:
+        print("⚠️ 인증자 목록을 DB/시트 모두에서 읽지 못함(직전 목록 유지, 15초 후 재시도)")
+        _verifier_cache["expires"] = now + 15
+        return _verifier_cache["rows"]
+
+    _verifier_cache.update(rows=rows, ids={r["user_id"] for r in rows if r["user_id"]}, expires=now + VERIFIER_CACHE_TTL)
+    return rows
+
+
+def is_verifier(user_id):
+    """관리자(SUPER_USER_IDS)이거나 인증자(DB verifiers / '인증자' 시트)에 연결된 유저ID인지."""
+    if not user_id:
+        return False
+    if user_id in SUPER_USER_IDS:
+        return True
+    _load_verifiers()
+    return user_id in _verifier_cache["ids"]
+
+
+def try_bind_verifier(user_id, group_id):
+    """관리자방에서 메시지를 보냈거나 입장한 사람의 LINE 표시명에서 한글만 뽑아, 아직 유저ID가 연결되지 않은
+    인증자 닉네임과 '정확히 한 명' 일치하면 그 사람의 유저ID를 자동으로 연결합니다(DB + 시트).
+    - 관리자방 안에서 일어난 이벤트로만 호출되므로 '관리자방 멤버'만 연결 대상입니다.
+    - 이미 연결된 닉네임은 덮어쓰지 않고, 동명이인(한글이 같은 닉네임이 여러 개)이면 연결하지 않습니다.
+    반환: 연결된 닉네임(없으면 None)"""
+    if not user_id or user_id in SUPER_USER_IDS:
+        return None
+    _load_verifiers()
+    if user_id in _verifier_cache["ids"]:
+        return None
+    unbound = [r for r in _verifier_cache["rows"] if r["nickname"] and not r["user_id"]]
+    if not unbound:
+        return None
+    now = time.time()
+    if _verifier_bind_attempts.get(user_id, 0) > now:
+        return None
+    _verifier_bind_attempts[user_id] = now + VERIFIER_BIND_RETRY_SEC
+
+    display = get_current_display_name(group_id, user_id)
+    key = hangul_only(display)
+    if not key:
+        return None
+    cands = [r for r in unbound if hangul_only(r["nickname"]) == key]
+    if len(cands) != 1:
+        if len(cands) > 1:
+            print(f"⚠️ 인증자 자동 연결 보류: 한글 닉네임 '{key}'가 {len(cands)}개 행과 일치(시트에 유저ID 직접 입력 필요)")
+        return None
+    nick = cands[0]["nickname"]
+
+    db_ok = False
+    if supabase:
+        try:
+            kst_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            res = (supabase.table('verifiers').update({"user_id": user_id, "bound_at": kst_iso})
+                   .eq('nickname', nick).is_('user_id', 'null').execute())
+            db_ok = bool(res.data)
+        except Exception as e:
+            print(f"인증자 DB 연결 저장 실패: {e}")
+    sheet_ok = False
+    if verifier_sheet:
+        try:
+            with sheet_sync_lock():
+                for i, row in enumerate(verifier_sheet.get_all_values()[1:], start=2):
+                    if row and hangul_only(row[0]) == hangul_only(nick):
+                        if not any(_USER_ID_RE.match(str(c).strip()) for c in row[1:]):
+                            verifier_sheet.update(range_name=f'B{i}', values=[[user_id]])
+                            sheet_ok = True
+                        break
+        except Exception as e:
+            print(f"인증자 시트 연결 저장 실패: {e}")
+    if not (db_ok or sheet_ok):
+        return None
+
+    cands[0]["user_id"] = user_id
+    _verifier_cache["ids"].add(user_id)
+    print(f"✅ 인증자 자동 연결: {nick}")
+    return nick
+
+
+def sync_verifiers_from_sheet():
+    """'/디비업데이트'용: '인증자' 시트의 닉네임(+이미 적힌 유저ID)을 DB verifiers에 반영.
+    시트에 없는 닉네임은 DB에서 삭제, 시트에 유저ID가 비어 있으면 DB에 연결돼 있던 값은 유지. 보고 문구를 돌려줍니다."""
+    if not supabase:
+        return "• 인증자: 건너뜀 — DB 미연결"
+    if not verifier_sheet:
+        return "• ⚠️ 인증자: 건너뜀 — '인증자' 시트에 연결되지 않았습니다"
+    rows = verifier_sheet.get_all_values()[1:]
+    sheet_map = {}
+    for r in rows:
+        nick = hangul_only(r[0]) if r else ""
+        if not nick:
+            continue
+        uid = next((str(c).strip() for c in r[1:] if _USER_ID_RE.match(str(c).strip())), "")
+        sheet_map[nick] = uid or sheet_map.get(nick, "")
+    existing = {str(x.get('nickname')): x for x in get_all_supabase_data('verifiers') if x.get('nickname')}
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    records = []
+    for nick, uid in sheet_map.items():
+        prev = existing.get(nick) or {}
+        prev_uid = prev.get('user_id')
+        final_uid = uid or prev_uid or None
+        records.append({
+            "nickname": nick,
+            "user_id": final_uid,
+            "bound_at": (now_iso if (final_uid and final_uid != prev_uid) else prev.get('bound_at')),
+        })
+    removed = [n for n in existing if n not in sheet_map]
+    errs = []
+    for i in range(0, len(removed), 200):
+        supabase.table('verifiers').delete().in_('nickname', removed[i:i + 200]).execute()
+    ok_n = process_in_chunks('verifiers', records, errors=errs)
+    _verifier_cache["expires"] = 0.0
+    bound = sum(1 for r in records if r["user_id"])
+    line = f"• 인증자: {ok_n}/{len(records)}명 반영 (유저ID 연결됨 {bound}명, 삭제 {len(removed)}명)"
+    if errs:
+        line += "\n• ⚠️ 인증자 일부 실패:\n   " + "\n   ".join(errs[:3])
+    return line
+
+
 def _room_state_sheet_read(room_id):
     """시트에서 room_id 행의 data(dict)를 반환. 없으면 None. 시트 조회 자체가 실패하면 예외를 그대로 올림."""
     rows = room_state_sheet.get_all_values()
@@ -483,11 +759,115 @@ def del_room_state(room_id):
     _room_state_sheet_delete(room_id)
 
 
+def is_last_joined_user(source_id, user_id):
+    """그룹방에서 메시지를 보낸 유저가 가장 최근에 입장한 유저인지 검증합니다."""
+    if source_id == user_id:
+        return True  # 1:1 개인 대화는 통과
+
+    room_state = get_room_state(source_id)
+    if room_state and room_state.get('user_id'):
+        return room_state.get('user_id') == user_id
+
+    return True
+
+
+def uses_last_joined_rule(source_id):
+    """시트 '방관리'에 등록된 방(관리자방 제외)은 기존처럼 '마지막 입장자' 기준 + '.' 초기화.
+    그 외(1:1, 시트에 없는 그룹)는 양식을 제출한 사람별로 각자 진행."""
+    return is_registered_room(source_id)
+
+
+def passes_last_joined_gate(source_id, user_id):
+    """등록된 방에서만 마지막 입장자 제한을 적용합니다. 그 외에는 항상 통과."""
+    if not uses_last_joined_rule(source_id):
+        return True
+    return is_last_joined_user(source_id, user_id)
+
+
+# ------------------------------------------------------------------
+# ✨ [변경됨] 제출자(신입)별 진행 상태
+#   예전에는 방(room_id)당 상태 1개만 있어서 '마지막 입장자' 한 명만 진행됐습니다.
+#   이제 양식을 제출한(또는 입장한) 사람마다 "<방ID>::<유저ID>" 키로 각자 상태를 따로 저장합니다.
+#   방 단위 상태(room_id 키)는 '가장 최근 대상'을 가리키는 포인터로 남겨 둡니다.
+#   → 'N번방 확인', '/ㅇㅈ 퇴장', '/ㅇㅈ 음성인증', '/닉네임 변경' 같은 기존 관리자 명령이 그대로 동작.
+#   DM(1:1)은 방ID == 유저ID 라서 "<유저ID>::<유저ID>" 로 저장됩니다.
+# ------------------------------------------------------------------
+def _ukey(room_id, user_id):
+    return f"{room_id}::{user_id}"
+
+
+def set_flow_state(room_id, user_id, data, ttl=3600):
+    """이 방에서 이 유저의 진행 상태를 저장하고, 방 단위 '최근 대상' 포인터도 갱신합니다."""
+    data = dict(data)
+    data["user_id"] = user_id
+    data["_ts"] = time.time()
+    if not uses_last_joined_rule(room_id):   # 등록된 방은 예전처럼 방 단위 상태 1개만 사용
+        set_room_state(_ukey(room_id, user_id), data, ttl=ttl)
+    set_room_state(room_id, data, ttl=ttl)
+
+
+def get_user_flow_state(room_id, user_id):
+    """이 방에서 이 유저 본인의 진행 상태. (배포 전에 만들어진 방 단위 상태도 본인 것이면 인정)"""
+    st = get_room_state(_ukey(room_id, user_id))
+    if st:
+        return st
+    legacy = get_room_state(room_id)
+    if legacy and legacy.get('user_id') == user_id:
+        return legacy
+    return None
+
+
+def list_user_flow_states(room_id):
+    """이 방에서 진행 중인 모든 유저의 상태 {user_id: state}."""
+    prefix = f"{room_id}::"
+    found = {}
+    if supabase:
+        try:
+            res = supabase.table('room_states').select('room_id, data').like('room_id', f"{prefix}%").execute()
+            for r in res.data or []:
+                rid = str(r.get('room_id') or '')
+                if rid.startswith(prefix) and r.get('data'):
+                    found[rid[len(prefix):]] = r['data']
+            return found
+        except Exception as e:
+            print(f"room_state 목록 DB 조회 에러 -> 시트로 폴백: {e}")
+    if room_state_sheet:
+        try:
+            for row in room_state_sheet.get_all_values()[1:]:
+                rid = str(row[0]).strip() if row else ""
+                if rid.startswith(prefix) and len(row) > 1 and row[1]:
+                    try:
+                        found[rid[len(prefix):]] = json.loads(row[1])
+                    except Exception:
+                        pass
+            return found
+        except Exception as e:
+            print(f"room_state 목록 시트 조회 에러: {e}")
+    for rid, data in room_states_memory.items():
+        if rid.startswith(prefix) and data:
+            found[rid[len(prefix):]] = data
+    return found
+
+
+def clear_flow_state(room_id, user_id):
+    """이 방에서 이 유저의 진행 상태만 지웁니다. 방 단위 포인터가 이 유저를 가리키고 있었다면
+    남아 있는 다른 유저 중 가장 최근 사람으로 옮깁니다(없으면 포인터 삭제)."""
+    del_room_state(_ukey(room_id, user_id))
+    room_state = get_room_state(room_id)
+    if room_state and room_state.get('user_id') not in (None, user_id):
+        return  # 포인터가 다른 신입을 가리키면 건드리지 않음
+    del_room_state(room_id)
+    remaining = list_user_flow_states(room_id)
+    if remaining:
+        _, nxt = max(remaining.items(), key=lambda kv: (kv[1] or {}).get('_ts', 0))
+        set_room_state(room_id, nxt)
+
+
 def reset_verification_state(source_id, target_user_id=None):
-    """해당 방의 인증 진행 상태(room_state, 세션)만 초기화합니다. (신입 유저 퇴장(MemberLeftEvent)에서 사용)
+    """해당 방에서 해당 유저의 인증 진행 상태(room_state, 세션)만 초기화합니다. (신입 유저 퇴장(MemberLeftEvent)에서 사용)
     - user_validations의 status는 더 이상 건드리지 않습니다. 재입장 시 마지막 status를 기준으로
       대화가 어디서 끊겼는지 안내하는 기능(send_join_welcome)이 이 값을 그대로 활용합니다.
-    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 유저를 대상으로 합니다.
+    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 '최근 대상' 유저를 대상으로 합니다.
     - 반환값: 실제로 초기화된 user_id (없으면 None)
     """
     room_state = get_room_state(source_id)
@@ -496,13 +876,15 @@ def reset_verification_state(source_id, target_user_id=None):
 
     if target_user_id:
         del_user_session(target_user_id)
-
-    del_room_state(source_id)
+        clear_flow_state(source_id, target_user_id)
+    else:
+        del_room_state(source_id)
     return target_user_id
 
 def complete_verification_state(source_id, target_user_id=None):
     """관리자가 '/ㅇㅈ 퇴장' 또는 '/ㅇㅈ ㅌㅈ'을 입력했을 때, 진행 중이던 인증 상태를 '완료'로 종료합니다.
-    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 유저를 대상으로 합니다.
+    - target_user_id를 명시하지 않으면 현재 room_state에 기록된 '최근 대상' 유저를 대상으로 합니다.
+      (같은 방에 진행 중인 사람이 여러 명이면 한 번 입력할 때마다 가장 최근 사람부터 차례로 완료됩니다)
     - 반환값: 실제로 완료 처리된 user_id (없으면 None)
     """
     room_state = get_room_state(source_id)
@@ -525,20 +907,74 @@ def complete_verification_state(source_id, target_user_id=None):
         except Exception as e:
             print(f"유저 상태 완료 처리 중 에러: {e}")
 
-        del_room_state(source_id)
+        clear_flow_state(source_id, target_user_id)
 
     return target_user_id
 
-def is_last_joined_user(source_id, user_id):
-    """그룹방에서 메시지를 보낸 유저가 가장 최근에 입장한 유저인지 검증합니다."""
-    if source_id == user_id:
-        return True  # 1:1 개인 대화는 통과
 
-    room_state = get_room_state(source_id)
-    if room_state and room_state.get('user_id'):
-        return room_state.get('user_id') == user_id
-    
-    return True
+def delete_validation_record(user_id):
+    """이번 인증 시도에서 새로 만들어진 검증 기록을 DB와 구글시트에서 삭제합니다."""
+    if supabase:
+        supabase_execute(
+            lambda: supabase.table('user_validations').delete().eq('user_id', user_id).execute(),
+            label="인증멈춤 - 검증 기록 삭제"
+        )
+    try:
+        with sheet_sync_lock():
+            if validation_sheet:
+                clean_user_ids = [str(uid).strip() for uid in validation_sheet.col_values(5)]
+                if user_id in clean_user_ids:
+                    validation_sheet.delete_rows(clean_user_ids.index(user_id) + 1)
+    except Exception as e:
+        print(f"인증멈춤 - 시트 행 삭제 에러: {e}")
+
+
+def stop_verification_in_chat(source_id):
+    """'/인증멈춤': 이 채팅(방/그룹/1:1)에서 진행 중이던 모든 인증을 멈춥니다.
+    - 이미 '완료'된 사람: 기록은 그대로 두고 진행 상태만 정리
+    - 완료되지 않은 사람:
+        · 이번 시도에서 새로 만들어진 기록(과거 기록 없음)이면 DB/시트에서 삭제
+        · 과거 기록이 있던 사람(재입장 등)은 블랙/이력 정보 보존을 위해 삭제하지 않고 이전 상태로 되돌림
+    반환: 집계 dict(total, deleted, reverted, cleared, kept, failed)
+    """
+    targets = dict(list_user_flow_states(source_id))
+    legacy = get_room_state(source_id)
+    if legacy and legacy.get('user_id') and legacy['user_id'] not in targets:
+        targets[legacy['user_id']] = legacy
+
+    result = {"total": len(targets), "deleted": 0, "reverted": 0, "cleared": 0, "kept": 0, "failed": 0}
+    for uid, st in targets.items():
+        try:
+            st = st or {}
+            info = st.get('stop_info') or {}
+            row = get_validation_row(uid, "status")
+            status = row.get('status') if row else None
+
+            if status == "완료":
+                result["kept"] += 1
+            elif status and info.get("is_new_record"):
+                delete_validation_record(uid)
+                result["deleted"] += 1
+            elif status and info.get("prev_status") is not None:
+                prev_status = info.get("prev_status") or "입장대기"
+                if supabase:
+                    supabase_execute(
+                        lambda: supabase.table('user_validations').update({"status": prev_status}).eq('user_id', uid).execute(),
+                        label="인증멈춤 - 이전 상태로 복구"
+                    )
+                sync_status_to_sheet(uid, prev_status)
+                result["reverted"] += 1
+            else:
+                result["cleared"] += 1   # 양식 제출 전(입장/친구추가 단계)이거나 판단 근거가 없으면 기록은 건드리지 않음
+
+            del_user_session(uid)
+            del_room_state(_ukey(source_id, uid))
+        except Exception as e:
+            print(f"인증멈춤 처리 중 에러(user_id={uid}): {e}")
+            result["failed"] += 1
+
+    del_room_state(source_id)
+    return result
 
 
 def get_room_target_user_id(source_id):
@@ -592,7 +1028,7 @@ def get_forward_target_url(raw_body):
             return None
         source = events[0].get("source") or {}
         group_id = source.get("groupId") or source.get("roomId")
-        if not group_id or group_id == ADMIN_GROUP_CHAT_ID:
+        if not group_id or is_admin_group(group_id):
             # 1:1 대화이거나 관리자방(공통) 이벤트는 라우팅하지 않고 받은 서비스가 그대로 처리
             return None
     except Exception as e:
@@ -781,7 +1217,13 @@ def get_current_display_name(source_id, user_id):
     try:
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            profile = line_bot_api.get_group_member_profile(source_id, user_id)
+            # ✨ [변경됨] 그룹(C…)뿐 아니라 1:1(U…)·멀티룸(R…)에서도 표시명을 조회
+            if source_id == user_id or str(source_id).startswith("U"):
+                profile = line_bot_api.get_profile(user_id)
+            elif str(source_id).startswith("R"):
+                profile = line_bot_api.get_room_member_profile(source_id, user_id)
+            else:
+                profile = line_bot_api.get_group_member_profile(source_id, user_id)
             return getattr(profile, 'display_name', '') or ''
     except Exception as e:
         print(f"닉네임 변경 확인 - 프로필 조회 실패: {e}")
@@ -1472,7 +1914,7 @@ def handle_member_register_voice(event, admin_user_id):
     submit_voice_analysis_job(
         supabase, configuration,
         message_id=event.message.id, user_id=target_uid, nickname=nickname,
-        room_id=ADMIN_GROUP_CHAT_ID,
+        room_id=admin_notify_room_id(event),
     )
     reply_text = (
         f"🎤 [{nickname}] 음성이 접수되었습니다. 분석과 저장은 신입과 같은 방식으로 진행됩니다.\n"
@@ -1703,22 +2145,30 @@ def handle_message(event):
     user_message = event.message.text.strip()
     reply_text = ""
 
-    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)에서는 신입 검증 플로우
+    # ✨ 관리자방에서 말한 사람이 '인증자' 닉네임(한글)과 일치하면 유저ID를 자동 연결
+    if is_admin_group(source_id):
+        try:
+            try_bind_verifier(user_id, source_id)
+        except Exception as e:
+            print(f"인증자 자동 연결 중 예외(무시): {e}")
+
+    # ✨ [추가됨] 인증자방(시트 '방관리'의 관리자방)에서는 신입 검증 플로우
     # ("." 초기화, 1번 양식 제출, "완료" 답장 처리)를 전혀 실행/기록하지 않는다.
     # 이 방에서는 관리진 명령어(/인증, /ㅇㅈ, /디비업데이트, /O번방 확인 등)와
     # 그 외 슬래시(/)로 시작하는 일반 명령어(DB 키워드로 등록된 멘트 포함)만 동작한다.
-    is_admin_room = (source_id == ADMIN_GROUP_CHAT_ID) or is_super_dm(event)
+    is_admin_room = is_admin_group(source_id) or is_super_dm(event)
 
     # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
+    # (시트에 등록된 방은 마지막 입장 유저만, 1:1/미등록 그룹은 제출자 각자 진행)
     if not (user_message == "." or user_message.startswith("/")):
-        if not is_last_joined_user(source_id, user_id):
+        if not passes_last_joined_gate(source_id, user_id):
             return
 
     # 📌 [친구추가 후 재시작] 프로필 조회 실패로 '친구추가+시작'을 안내받은 유저가
     # 실제로 친구추가 후 '시작'을 입력하면, 최초 입장 시 로직(1번 환영 멘트)부터 다시 진행합니다.
     if not is_admin_room and user_message == "시작":
-        room_state = get_room_state(source_id)
-        if room_state and room_state.get('user_id') == user_id and room_state.get('status') == 'pending_friend':
+        room_state = get_user_flow_state(source_id, user_id)
+        if room_state and room_state.get('status') == 'pending_friend':
             send_join_welcome(source_id, user_id, event.reply_token)
             return
 
@@ -1729,12 +2179,22 @@ def handle_message(event):
     if not is_admin_room and user_message == ".":
         room_state = get_room_state(source_id)
         tracked_user_id = room_state.get('user_id') if room_state else None
-        # 신입(인증 진행 중인 본인)이 입력한 '.'은 무시 — 기존 멤버가 입력했을 때만 초기화
-        if tracked_user_id and tracked_user_id == user_id:
-            return
-        if tracked_user_id:
-            del_user_session(tracked_user_id)
-        del_room_state(source_id)
+        if uses_last_joined_rule(source_id):
+            # 등록된 방: 기존 동작 그대로 — 신입(본인)이 입력한 '.'은 무시, 기존 멤버가 입력하면 방 상태 초기화
+            if tracked_user_id and tracked_user_id == user_id:
+                return
+            if tracked_user_id:
+                del_user_session(tracked_user_id)
+            del_room_state(source_id)
+        else:
+            # 1:1/미등록 그룹: 본인이 진행 중이면 무시, 아니면 최근 대상의 진행 상태만 초기화
+            if get_user_flow_state(source_id, user_id):
+                return
+            if tracked_user_id:
+                del_user_session(tracked_user_id)
+                clear_flow_state(source_id, tracked_user_id)
+            else:
+                del_room_state(source_id)
 
         reply_text = "🔄 해당 방의 인증 진행 상태가 초기화되었습니다.\n신입 유저는 양식을 처음부터 다시 작성해 주세요!"
         with ApiClient(configuration) as api_client:
@@ -1783,12 +2243,40 @@ def handle_message(event):
                 )
             return
 
+        # ✨ [추가됨] /인증멈춤 : 누구든 입력 가능. 이 채팅에서 진행 중이던 인증을 모두 멈추고,
+        # 완료되지 않은 것은 삭제(과거 기록이 있던 사람은 이전 상태로 복구)합니다.
+        if command.replace(" ", "") == "인증멈춤":
+            stop_res = stop_verification_in_chat(source_id)
+            if stop_res["total"] == 0:
+                stop_text = "ℹ️ 이 채팅에서 진행 중인 인증이 없습니다."
+            else:
+                lines = [f"🛑 이 채팅의 인증 진행을 멈췄습니다. (대상 {stop_res['total']}명)"]
+                if stop_res["deleted"]:
+                    lines.append(f"- 미완료 기록 삭제: {stop_res['deleted']}명")
+                if stop_res["reverted"]:
+                    lines.append(f"- 과거 기록이 있어 삭제하지 않고 이전 상태로 복구: {stop_res['reverted']}명")
+                if stop_res["cleared"]:
+                    lines.append(f"- 진행 상태만 정리(저장된 기록 없음/그대로 유지): {stop_res['cleared']}명")
+                if stop_res["kept"]:
+                    lines.append(f"- 이미 완료되어 기록 유지: {stop_res['kept']}명")
+                if stop_res["failed"]:
+                    lines.append(f"- ⚠️ 처리 실패: {stop_res['failed']}명 (다시 /인증멈춤을 입력해 주세요)")
+                lines.append("다시 진행하려면 양식을 처음부터 제출해 주세요.")
+                stop_text = "\n".join(lines)
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=stop_text)])
+                )
+            return
+
         # ✨ [추가됨] /바뀐닉 변경 : 신입이 다른 닉네임으로 바꾸기로 했을 때, 운영진이 그 방에서
         # 이 명령을 입력하면 DB의 닉네임 값을 직접 수정한다. (예: "/오브할게요 변경")
         # 인증자방에서는 동작하지 않고, 신입 본인이 입력한 건 무시한다.
         if (not is_admin_room) and command.endswith("변경") and cmd_prefix not in ("인증", "ㅇㅈ", "ㅇㅅㅇㅈ"):
             changed_nick = command[:-2].strip()
             if changed_nick:
+                if not is_verifier(user_id):
+                    return   # 제어명령: 등록된 관리자/인증자만 (그 외에는 무반응)
                 nick_messages = apply_nickname_change(source_id, user_id, changed_nick)
                 if nick_messages:
                     with ApiClient(configuration) as api_client:
@@ -1804,6 +2292,8 @@ def handle_message(event):
             or (cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("음성인증", "음성", "ㅇㅅㅇㅈ"))
         )
         if voice_manual_trigger:
+            if not is_verifier(user_id):
+                return   # 제어명령: 등록된 관리자/인증자만 (그 외에는 무반응)
             voice_target_id = get_room_target_user_id(source_id)
             if voice_target_id:
                 v_success, v_reply_text = start_voice_auth(voice_target_id, require_status=None)
@@ -1821,6 +2311,8 @@ def handle_message(event):
             cmd_prefix in ("인증", "ㅇㅈ") and len(parts) >= 2 and parts[1].strip() in ("퇴장", "ㅌㅈ")
         )
         if complete_trigger:
+            if not is_verifier(user_id):
+                return   # 제어명령: 등록된 관리자/인증자만. (여기서 막지 않으면 아래 키워드 검색으로 '퇴장' 멘트가 나가버림)
             completed_user_id = complete_verification_state(source_id)
             if completed_user_id:
                 reply_text = search_keyword("퇴장") or search_keyword("ㅌㅈ") or "✅ 인증 상태를 완료로 변경했습니다."
@@ -2046,6 +2538,12 @@ def handle_message(event):
                     except Exception as e:
                         sync_reports.append(f"• ⚠️ 룸스테이트: 동기화 실패 — {e}")
 
+                # F. '인증자' 시트 동기화 (닉네임 목록 → DB verifiers)
+                try:
+                    sync_reports.append(sync_verifiers_from_sheet())
+                except Exception as e:
+                    sync_reports.append(f"• ⚠️ 인증자: 동기화 실패 — {e}")
+
                 report_str = "\n".join(sync_reports)
                 reply_text = f"✅ 모든 구글 시트 데이터가 DB에 동기화되었습니다!\n\n{report_str}"
             except Exception as e:
@@ -2126,6 +2624,24 @@ def handle_message(event):
                 )
             return
 
+        # ✨ /인증자 : 인증자 목록과 유저ID 연결 상태 확인 (유저ID 값은 표시하지 않음)
+        elif command_body.replace(" ", "") in ("인증자", "인증자목록"):
+            _vrows = [r for r in _load_verifiers() if r["nickname"]]
+            if not _vrows:
+                reply_text = "📋 등록된 인증자가 없습니다. ('인증자' 시트 A열에 한글 닉네임 입력 → /디비업데이트)"
+            else:
+                _lines = [f"📋 인증자 {len(_vrows)}명 (연결 {sum(1 for r in _vrows if r['user_id'])} / 대기 {sum(1 for r in _vrows if not r['user_id'])})"]
+                for r in _vrows:
+                    _lines.append(f"{'✅' if r['user_id'] else '⏳'} {r['nickname']}")
+                if any(not r['user_id'] for r in _vrows):
+                    _lines.append("\n⏳ = 아직 연결 전 (해당 분이 관리자방에서 한 번 말하면 자동 연결)")
+                reply_text = "\n".join(_lines)
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+                )
+            return
+
         # 2) /O번방 확인 명령어
         elif "확인" in command_body:
             room_name_input = command_body.replace("확인", "").strip()
@@ -2137,33 +2653,48 @@ def handle_message(event):
                     print(f"N번방 확인 - 룸스테이트 시트 조회 실패: {rs_err}")
                     room_state = None
                     reply_text = f"⚠️ [{room_name_input}] 룸스테이트 시트 조회에 실패했습니다. 잠시 후 다시 시도해 주세요."
-                if reply_text:
-                    pass
-                elif not room_state:
-                    reply_text = f"📭 [{room_name_input}] 현재 대기 중인 신규 인증 멤버가 없습니다."
-                else:
-                    status = room_state.get('status')
-                    is_known = room_state.get('is_known', False)
-                    tracked_user_id = room_state.get('user_id')
+                # ✨ [변경됨] 같은 방에 진행 중인 신입이 여러 명이면 전원 상태를 함께 보여준다.
+                _user_states = {}
+                if not reply_text:
+                    _user_states = list_user_flow_states(target_room_id)
+                    if room_state and room_state.get('user_id') and room_state['user_id'] not in _user_states:
+                        _user_states[room_state['user_id']] = room_state   # 배포 전 방 단위 상태도 포함
+
+                def _describe_flow_state(rs):
+                    status = rs.get('status')
+                    is_known = rs.get('is_known', False)
+                    tracked_user_id = rs.get('user_id')
                     if status == 'joined':
                         if is_known:
-                            reply_text = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
+                            txt = f"⚠️ [{room_name_input}]\n기존 방문/블랙리스트 이력이 있는 유저가 방금 입장했습니다!\n(현재 상대방이 양식을 입력 중입니다)"
                         else:
-                            reply_text = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다.\n✅ 현재까지 특이사항(기존 방문/블랙 이력) 없음"
+                            txt = f"⏳ [{room_name_input}]\n완전한 신규 유저가 현재 양식을 입력 중입니다.\n✅ 현재까지 특이사항(기존 방문/블랙 이력) 없음"
                     elif status == 'form_submitted':
-                        alert_report = room_state.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
-                        reply_text = alert_report
+                        txt = rs.get('report', f"[{room_name_input}] 양식이 접수되었습니다.")
                     elif status == 'pending_friend':
-                        reply_text = f"⏳ [{room_name_input}]\n신입이 친구추가 전 단계입니다. (친구추가 후 '시작' 입력 대기 중)"
+                        txt = f"⏳ [{room_name_input}]\n신입이 친구추가 전 단계입니다. (친구추가 후 '시작' 입력 대기 중)"
                     else:
-                        reply_text = f"ℹ️ [{room_name_input}] 현재 진행 상태: {status}"
+                        txt = f"ℹ️ [{room_name_input}] 현재 진행 상태: {status}"
 
-                    # ✨ [추가됨] 음성검증까지 확인되었는지 여부 + 확인된 시점이라면 그 확인 내용을 함께 출력
-                    if reply_text and tracked_user_id:
-                        reply_text = f"{reply_text}\n\n{format_voice_check_status(tracked_user_id)}"
+                    # ✨ 음성검증까지 확인되었는지 여부 + 확인된 시점이라면 그 확인 내용을 함께 출력
+                    if txt and tracked_user_id:
+                        txt = f"{txt}\n\n{format_voice_check_status(tracked_user_id)}"
                         _cn = format_nick_conflict_note(tracked_user_id)
                         if _cn:
-                            reply_text += f"\n\n{_cn}"
+                            txt += f"\n\n{_cn}"
+                    return txt
+
+                if reply_text:
+                    pass
+                elif not _user_states:
+                    reply_text = f"📭 [{room_name_input}] 현재 대기 중인 신규 인증 멤버가 없습니다."
+                else:
+                    _ordered = sorted(_user_states.values(), key=lambda x: (x or {}).get('_ts', 0))
+                    _parts = [_describe_flow_state(rs) for rs in _ordered if rs]
+                    if len(_parts) > 1:
+                        _parts = [f"👥 [{room_name_input}] 진행 중인 신입 {len(_parts)}명 (오래된 순)"] + \
+                                 [f"━━ {i}/{len(_parts)} ━━\n{t}" for i, t in enumerate(_parts, 1)]
+                    reply_text = "\n\n".join(_parts)
             else:
                 # ✨ [추가됨] 방 이름이 아니면 '닉네임'으로 보고 과거 검증 기록 + 음성DB 기록을 조회 (/닉네임 확인)
                 nick_text = format_nickname_history(room_name_input) if room_name_input else None
@@ -2190,9 +2721,10 @@ def handle_message(event):
             return
 
     # 📌 [핵심 검증 1] 1번 양식(FLIRTY) 제출 처리 (마지막 입장 유저만 작동)
+    # 1:1/미등록 그룹은 제출자 각자 진행, 시트에 등록된 방은 마지막 입장 유저만 작동
     if not is_admin_room and all(k in user_message for k in ["닉네임", "년생", "성별", "지역"]):
-        if not is_last_joined_user(source_id, user_id):
-            return 
+        if not passes_last_joined_gate(source_id, user_id):
+            return
 
         extracted_data = parse_signup_form(user_message)
 
@@ -2255,10 +2787,9 @@ def handle_message(event):
 
         # 현재 세션에서 이미 1번 양식을 제출한 뒤, 내용을 고쳐서 재제출하는 것인지 확인
         # (같은 방의 room_state가 이미 form_submitted 상태 + 같은 유저라면 '수정 재제출'로 간주)
-        current_room_state = get_room_state(source_id)
+        current_room_state = get_user_flow_state(source_id, user_id)
         is_edit_resubmission = bool(
             current_room_state
-            and current_room_state.get('user_id') == user_id
             and current_room_state.get('status') == 'form_submitted'
         )
 
@@ -2471,6 +3002,14 @@ def handle_message(event):
             "form_nickname": nickname,
         }
         
+        # ✨ /인증멈춤용: 이번 시도 전에 이 유저의 검증 기록이 DB/시트에 이미 있었는지 기억해 둔다.
+        db_checked = not supabase          # DB를 쓰지 않는 환경이면 확인할 것이 없음
+        db_existed = False
+        prev_db_status = None
+        sheet_checked = not validation_sheet
+        sheet_existed = False
+        prev_sheet_status = None
+
         target_status = "음성대기"     # ✨ [변경됨] 양식 제출 직후 바로 음성 안내 단계로 (기존: "입장대기" → "확인" 답장)
         nickname_to_save = nickname   # ✨ 수정 재제출 시 운영진이 바꿔둔 닉네임을 덮어쓰지 않기 위한 저장용 값
         if supabase:
@@ -2481,7 +3020,10 @@ def handle_message(event):
                 ).eq('user_id', user_id).execute()
                 retry_cnt = 1
                 existing_entry_date = None
+                db_checked = True
                 if user_res.data:
+                    db_existed = True
+                    prev_db_status = user_res.data[0].get('status')
                     retry_cnt = user_res.data[0].get('retry_count', 1) + 1
                     existing_entry_date = user_res.data[0].get('entry_date')
                     # ✨ 인증 진행 중 1번 양식을 '수정 재제출'한 경우, 이미 진행된 단계(음성대기/닉변대기 등)를
@@ -2540,12 +3082,15 @@ def handle_message(event):
                 if validation_sheet:
                     all_data = validation_sheet.get_all_values()
                     clean_user_ids = [str(row[4]).strip() if len(row) > 4 else "" for row in all_data]
+                    sheet_checked = True
                     # M:S = 나이, 결혼, 군필, 초대자, 야방경험, 나온이유, 킥이력 (새 양식에 없는 항목은 공란)
                     details_list = [age, marriage, military, inviter, yadan, leave_reason, kick_reason]
 
                     if user_id in clean_user_ids:
                         found_row_index = clean_user_ids.index(user_id) + 1
                         row_data = all_data[found_row_index - 1]
+                        sheet_existed = True
+                        prev_sheet_status = row_data[11].strip() if len(row_data) > 11 else ""
                         count_val = row_data[7] if len(row_data) >= 8 else "0"
                         current_retry_count = int(count_val) if count_val.isdigit() else 0
 
@@ -2589,7 +3134,19 @@ def handle_message(event):
             state_data["prior_id_lines"] = (prior_id_lines + id_match_lines)[:5]
             state_data["prior_id_level"] = max(prior_id_level, id_match_level)
 
-            set_room_state(source_id, state_data, ttl=7200)
+            # ✨ /인증멈춤용 정보: 수정 재제출이면 처음 제출 때 기록해 둔 값을 그대로 이어받는다.
+            if is_edit_resubmission and (current_room_state or {}).get('stop_info'):
+                state_data["stop_info"] = current_room_state['stop_info']
+            else:
+                _existence_known = db_checked and sheet_checked
+                _had_record = db_existed or sheet_existed
+                state_data["stop_info"] = {
+                    "is_new_record": bool(_existence_known and not _had_record),
+                    # 기존 기록이 있었으면 그 상태(없으면 None=확인 불가 → 멈춤 시 상태를 건드리지 않음)
+                    "prev_status": ((prev_db_status if db_existed else prev_sheet_status) or "") if (_existence_known and _had_record) else None,
+                }
+
+            set_flow_state(source_id, user_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname_to_save, "gender": gender})
 
             if is_edit_resubmission:
@@ -2614,7 +3171,7 @@ def handle_message(event):
     # (기존의 "확인" / "문제없음" / "변경완료" / 헤르페스 "없다" 단계는 새 흐름에서 삭제됨)
     if (not is_admin_room and not user_message.startswith("/")
             and re.sub(r"[\s\.\!~]", "", user_message) in ("완료", "완료했습니다", "완료했어요", "완료요")):
-        if not is_last_joined_user(source_id, user_id):
+        if not passes_last_joined_gate(source_id, user_id):
             return
         if get_validation_row(user_id, "status").get('status') == "닉변대기":
             finalize_after_nickname_check(source_id, user_id, event.reply_token)
@@ -2641,8 +3198,7 @@ def send_friend_add_guide(source_id, user_id, reply_token=None):
     진행되도록 room_state를 pending_friend로 세팅합니다.
     - 먼저 reply로 시도하고, 실패하면 그룹으로 push(마지막 수단)로 보냅니다.
     반환값: 안내 발송 성공 여부"""
-    set_room_state(source_id, {
-        "user_id": user_id,
+    set_flow_state(source_id, user_id, {
         "status": "pending_friend"
     }, ttl=3600)
 
@@ -2699,8 +3255,7 @@ def send_join_welcome(source_id, user_id, reply_token):
     nickname = (existing or {}).get('nickname') or ""
     name_prefix = f"{nickname}님, " if nickname else ""
 
-    set_room_state(source_id, {
-        "user_id": user_id,
+    set_flow_state(source_id, user_id, {
         "status": "joined",
         "is_known": is_known
     }, ttl=3600)
@@ -2725,7 +3280,8 @@ def send_join_welcome(source_id, user_id, reply_token):
     # last_status가 "완료"이거나, 기록이 없거나, 위에서 안내문을 못 만든 경우 -> 처음 입장한 것처럼 1번 멘트부터 진행
 
     if not welcome_message:
-        welcome_message = search_keyword("1") or search_keyword("1번")
+        # 첫 인사 멘트 = '/ㅇㅈ 1번'을 입력했을 때 나오는 멘트 (DB 키워드 '1번'). 없으면 예전 키워드 '1'로 대체
+        welcome_message = search_keyword("1번") or search_keyword("1")
     if not welcome_message:
         welcome_message = "인증봇을 추가해주세요\nhttps://lin.ee/ttJ0cUk"
 
@@ -2754,15 +3310,29 @@ def fetch_member_profile(line_bot_api, source, user_id):
     return None
 
 
+@handler.add(FollowEvent)
+def handle_follow(event):
+    """봇을 친구추가해서 1:1 대화가 새로 시작될 때도 '/ㅇㅈ 1번' 인사 멘트를 보냅니다."""
+    user_id = getattr(event.source, 'user_id', None)
+    if not user_id:
+        return
+    send_join_welcome(user_id, user_id, event.reply_token)
+
+
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
     source_id = getattr(event.source, 'group_id', getattr(event.source, 'room_id', None))
     if not source_id:
         return
 
-    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)은 신입 검증 대상 방이 아니므로,
+    # ✨ [추가됨] 인증자방(시트 '방관리'의 관리자방)은 신입 검증 대상 방이 아니므로,
     # 여기서 누가 입장하든 환영 멘트/프로필 조회/room_state 기록을 하지 않는다.
-    if source_id == ADMIN_GROUP_CHAT_ID:
+    if is_admin_group(source_id):
+        for _m in event.joined.members:
+            try:
+                try_bind_verifier(getattr(_m, 'user_id', None), source_id)
+            except Exception as e:
+                print(f"인증자 자동 연결 중 예외(무시): {e}")
         return
 
     joined_members = event.joined.members
@@ -2794,24 +3364,30 @@ def handle_member_left(event):
     if not source_id:
         return
 
-    # ✨ [추가됨] 인증자방(ADMIN_GROUP_CHAT_ID)은 신입 검증 대상 방이 아니므로,
+    # ✨ [추가됨] 인증자방(시트 '방관리'의 관리자방)은 신입 검증 대상 방이 아니므로,
     # 여기서 누가 나가든 room_state/인증 상태를 건드리지 않는다.
-    if source_id == ADMIN_GROUP_CHAT_ID:
+    if is_admin_group(source_id):
         return
 
     left_user_ids = {m.user_id for m in event.left.members if getattr(m, 'user_id', None)}
 
     room_state = get_room_state(source_id)
     tracked_user_id = room_state.get('user_id') if room_state else None
+    user_states = list_user_flow_states(source_id)
 
-    if tracked_user_id and tracked_user_id in left_user_ids:
+    handled = False
+    for left_uid in left_user_ids:
+        if left_uid not in user_states and left_uid != tracked_user_id:
+            continue   # 인증과 무관한 다른 멤버가 나간 경우 -> 진행 중인 신입의 상태를 건드리지 않음
+        handled = True
+
         # ✨ '완료' 입력 → 최종 판정까지 통과해서 자동으로 '/ㅇㅈ 퇴장' 멘트가 나간 뒤
         # 신입이 실제로 나간 경우인지 확인
-        leave_row = get_validation_row(tracked_user_id, "status")
+        leave_row = get_validation_row(left_uid, "status")
         was_auto_completed = leave_row.get('status') == "퇴장대기"
 
-        # 인증 진행 중이던 신입이 실제로 나간 경우 -> room_state/세션 초기화
-        reset_verification_state(source_id, tracked_user_id)
+        # 인증 진행 중이던 신입이 실제로 나간 경우 -> 그 사람의 room_state/세션만 초기화
+        reset_verification_state(source_id, left_uid)
 
         if was_auto_completed:
             # ✨ [변경됨] 완료멘션(@전체)은 이제 push가 아니라, 퇴장 안내를 보내는 시점
@@ -2820,14 +3396,14 @@ def handle_member_left(event):
             # 이 시점에는 애초에 reply를 보낼 수 없음)
             if supabase:
                 supabase_execute(
-                    lambda: supabase.table('user_validations').update({"status": "완료"}).eq('user_id', tracked_user_id).execute(),
+                    lambda: supabase.table('user_validations').update({"status": "완료"}).eq('user_id', left_uid).execute(),
                     label="자동 인증완료 상태 반영"
                 )
-            sync_status_to_sheet(tracked_user_id, "완료")
-    elif not left_user_ids or tracked_user_id is None:
+            sync_status_to_sheet(left_uid, "완료")
+
+    if not handled and not user_states and (not left_user_ids or tracked_user_id is None):
         # 누가 나갔는지 알 수 없거나, 추적 중인 인증 대상이 없는 경우에는 기존처럼 room_state만 정리
         del_room_state(source_id)
-    # else: 인증과 무관한 다른 멤버가 나간 경우 -> 진행 중인 신입의 room_state를 건드리지 않음
 
 
 # ==========================================
@@ -3383,7 +3959,7 @@ def handle_admin_blacklist_voice_upload(event, admin_user_id):
         supabase, configuration,
         message_id=event.message.id, nickname=nickname, gender=gender,
         black_reason=reason, registered_by=admin_user_id,
-        room_id=ADMIN_GROUP_CHAT_ID,   # ✨ 추가
+        room_id=admin_notify_room_id(event),
     )
 
     if result.get("error"):
@@ -3439,14 +4015,14 @@ def handle_audio(event):
 
     # ✨ [추가됨] 관리자방에서 '/음성업로드' 명령 직후 온 음성 -> 블랙리스트 수동 등록 플로우로 분기.
     # (신입 검증용 last-joined 체크는 적용하지 않는다 — 운영진 본인이 보내는 음성이므로.)
-    if source_id == ADMIN_GROUP_CHAT_ID or is_super_dm(event):
+    if is_admin_group(source_id) or is_super_dm(event):
         # ✨ '/기존멤버등록' 양식 제출 직후의 음성이면 기존 멤버 음성 등록, 아니면 기존 블랙리스트 업로드 플로우
         if handle_member_register_voice(event, user_id):
             return
         handle_admin_blacklist_voice_upload(event, user_id)
         return
 
-    if not is_last_joined_user(source_id, user_id):
+    if not passes_last_joined_gate(source_id, user_id):
         return
 
     is_audio_waiting = False
