@@ -506,20 +506,20 @@ def hangul_only(text):
 
 
 def _init_verifier_sheet():
+    import unicodedata
     try:
-        try:
-            return spreadsheet.worksheet(VERIFIER_SHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=VERIFIER_SHEET_NAME, rows=100, cols=2)
-            ws.update(range_name='A1:B1', values=[["닉네임(한글만)", "user_id"]])
-            return ws
+        target = unicodedata.normalize("NFC", VERIFIER_SHEET_NAME)
+        for ws in spreadsheet.worksheets():
+            if unicodedata.normalize("NFC", ws.title).strip() == target:
+                return ws
+        ws = spreadsheet.add_worksheet(title=VERIFIER_SHEET_NAME, rows=100, cols=2)
+        ws.update(range_name='A1:B1', values=[["닉네임(한글만)", "user_id"]])
+        return ws
     except Exception as e:
         print(f"⚠️ 인증자 시트 연결 실패(관리자 외 제어명령 불가): {e}")
         return None
 
-
-verifier_sheet = _init_verifier_sheet()
-
+verifier_sheet = _init_verifier_sheet()   # ← 521행 (이 줄은 그대로 둡니다)
 
 def _load_verifiers():
     """인증자 목록 [{nickname, user_id}] 캐시. DB(verifiers)를 먼저 보고, DB 조회가 실패할 때만 '인증자' 시트를 봅니다.
