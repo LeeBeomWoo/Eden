@@ -777,11 +777,57 @@ def uses_last_joined_rule(source_id):
     return is_registered_room(source_id)
 
 
+# ------------------------------------------------------------------
+# ✨ [추가됨] /인증시작 — 방관리(DB/시트)에 없는 '미등록 그룹'의 인증 시작 스위치
+#   - 미등록 그룹에서는 누군가 /인증시작 을 입력해야만 인증(양식/완료/음성)이 진행됩니다.
+#   - 처음 입력한 사람(starter) 한 명만 인증 대상에서 제외하고, 나머지는 제외하지 않습니다.
+#   - 세션은 "start::<방ID>" 키(room_states)에 {starter, _ts} 로 저장합니다.
+#     ※ list_user_flow_states 가 쓰는 "<방ID>::" 접두어와 겹치지 않도록 앞에 붙였습니다.
+#   - START_SESSION_TTL 이 지나거나 /인증멈춤을 입력하면 세션이 끝납니다.
+#   - DB 조회 절감: 일반 채팅마다 검사하지 않고, 양식 제출/'완료'/음성 메시지에서만 검사합니다.
+# ------------------------------------------------------------------
+START_SESSION_TTL = 7200  # 초 (2시간)
+
+
+def _start_key(room_id):
+    return f"start::{room_id}"
+
+
+def get_start_session(room_id):
+    """진행 중인 /인증시작 세션 {starter, _ts}. 없거나 만료됐으면 None."""
+    st = get_room_state(_start_key(room_id))
+    if not st or time.time() - float(st.get("_ts") or 0) > START_SESSION_TTL:
+        return None
+    return st
+
+
+def begin_or_refresh_start_session(room_id, user_id):
+    """세션이 없으면 user_id를 starter로 새로 만들고, 있으면 starter는 그대로 두고 시간만 연장합니다."""
+    st = get_start_session(room_id)
+    starter = st.get("starter") if st else user_id
+    set_room_state(_start_key(room_id), {"starter": starter, "_ts": time.time()})
+    return starter
+
+
+def clear_start_session(room_id):
+    del_room_state(_start_key(room_id))
+
+
 def passes_last_joined_gate(source_id, user_id):
-    """등록된 방에서만 마지막 입장자 제한을 적용합니다. 그 외에는 항상 통과."""
-    if not uses_last_joined_rule(source_id):
+    """등록된 방: 마지막 입장자만 통과.
+    미등록 그룹: /인증시작 세션이 열려 있어야 하고, 그 세션의 starter(처음 입력한 사람)는 제외.
+                (이미 이 방에서 인증을 진행 중인 사람은 세션 만료와 상관없이 계속 통과)
+    1:1 / 인증자방: 항상 통과."""
+    if uses_last_joined_rule(source_id):
+        return is_last_joined_user(source_id, user_id)
+    if source_id == user_id or is_admin_group(source_id):
         return True
-    return is_last_joined_user(source_id, user_id)
+    if get_user_flow_state(source_id, user_id):
+        return True
+    st = get_start_session(source_id)
+    if not st:
+        return False          # /인증시작을 입력한 적이 없으면 인증 진행 안 함
+    return st.get("starter") != user_id
 
 
 # ------------------------------------------------------------------
@@ -974,6 +1020,7 @@ def stop_verification_in_chat(source_id):
             result["failed"] += 1
 
     del_room_state(source_id)
+    clear_start_session(source_id)   # ✨ /인증시작 세션도 함께 종료
     return result
 
 
@@ -2161,7 +2208,9 @@ def handle_message(event):
     # 관리자 명령어('.', '/')가 아닌 일반 채팅에 한해 검증을 진행합니다.
     # (시트에 등록된 방은 마지막 입장 유저만, 1:1/미등록 그룹은 제출자 각자 진행)
     if not (user_message == "." or user_message.startswith("/")):
-        if not passes_last_joined_gate(source_id, user_id):
+        # ✨ 미등록 그룹은 일반 채팅마다 DB를 조회하지 않도록 여기서는 검사하지 않고,
+        #    양식 제출 / '완료' / 음성 메시지 처리 지점에서만 passes_last_joined_gate 로 검사합니다.
+        if uses_last_joined_rule(source_id) and not passes_last_joined_gate(source_id, user_id):
             return
 
     # 📌 [친구추가 후 재시작] 프로필 조회 실패로 '친구추가+시작'을 안내받은 유저가
@@ -2240,6 +2289,21 @@ def handle_message(event):
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message_with_http_info(
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=id_reply)])
+                )
+            return
+
+        # ✨ [추가됨] /인증시작 : 방관리(DB/시트)에 등록되지 않은 '그룹'에서만 동작. 누구든 입력 가능.
+        # 1번 양식을 출력하고 인증 세션을 엽니다. 세션을 처음 연 사람만 인증 대상에서 제외됩니다.
+        if command.replace(" ", "") == "인증시작":
+            if (getattr(event.source, "type", "") not in ("group", "room")
+                    or is_admin_room or is_registered_room(source_id)):
+                return   # 1:1 / 인증자방 / 등록된 방에서는 무반응
+            begin_or_refresh_start_session(source_id, user_id)
+            start_text = (search_keyword("1번") or search_keyword("1")
+                          or "인증봇을 추가해주세요\nhttps://lin.ee/ttJ0cUk")
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message_with_http_info(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=start_text)])
                 )
             return
 
@@ -3333,6 +3397,10 @@ def handle_member_joined(event):
                 try_bind_verifier(getattr(_m, 'user_id', None), source_id)
             except Exception as e:
                 print(f"인증자 자동 연결 중 예외(무시): {e}")
+        return
+
+    # ✨ 미등록 그룹은 /인증시작 을 입력해야만 인증이 시작되므로 입장 이벤트로는 시작하지 않는다.
+    if not is_registered_room(source_id):
         return
 
     joined_members = event.joined.members
