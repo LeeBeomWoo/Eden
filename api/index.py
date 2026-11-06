@@ -2797,14 +2797,18 @@ def handle_message(event):
         gender = normalize_gender(extracted_data.get("성별", ""))
         region = extracted_data.get("지역", "").strip()
         marriage = _pick_field(extracted_data, contains=("기혼", "결혼"))
-        yadan = _clean_yes_no(extracted_data.get("야방경험", ""))
-        yadan_room = _pick_field(extracted_data, contains=("방이름",))
-        prev_nick = _pick_field(extracted_data, contains=("쓰던닉",))
+        # ✨ [변경됨] 새 양식은 '야단라경험유무(방 이름, 임티, 기존에 썻던 닉): 유,반하' 한 줄에 전부 적는다.
+        #   → 맨 앞 유/무는 야방경험, 그 뒤 내용은 방 이름/쓰던닉으로 저장한다. (예전 양식의 별도 항목도 그대로 인식)
+        yadan_raw = _pick_field(extracted_data, exact="야방경험", contains=("야단라경험", "야방경험"))
+        yadan = _clean_yes_no(yadan_raw)
+        yadan_detail = re.sub(r"^\s*(유|있음|있어요|있습니다)\s*[,，/·:\-]?\s*", "", yadan_raw) if yadan == "유" else ""
+        yadan_room = _pick_field(extracted_data, contains=("방이름",)) or yadan_detail
+        prev_nick = _pick_field(extracted_data, contains=("쓰던닉",)) or yadan_detail
 
         # 새 양식에 없는 기존 항목은 공란으로 저장
         age = ""
-        military = ""
-        inviter = ""
+        military = ""     # 군필여부 항목은 양식에서 삭제 예정 → 저장하지 않음
+        inviter = _pick_field(extracted_data, contains=("초대",))   # '초대자/ 초대경로' → 키가 '초대자'로 파싱됨
         leave_reason = ""
         kick_reason = ""
 
@@ -2822,11 +2826,11 @@ def handle_message(event):
         if not marriage:
             missing_fields.append("기혼,미혼,돌싱")
         if not yadan:
-            missing_fields.append("야방경험(유/무)")
+            missing_fields.append("야단라경험유무(유/무)")
         elif yadan == "유" and not yadan_room:
-            missing_fields.append("야방경험 있을시 방이름")
-        if not prev_nick:
-            missing_fields.append("FLIRTY방에 온경험 있음 쓰던닉 (없으면 '없음')")
+            missing_fields.append("야단라경험 있을시 방 이름/임티/기존에 쓰던 닉 (예: 유,방이름,쓰던닉)")
+        if not inviter:
+            missing_fields.append("초대자/초대경로")
 
         if missing_fields:
             reply_text = f"⚠️ 양식 작성 내용 중 다음 항목이 누락되었거나 수정이 필요합니다:\n- {', '.join(missing_fields)}\n\n해당 항목을 빠짐없이 작성 후 다시 제출해 주세요!"
@@ -3022,11 +3026,17 @@ def handle_message(event):
 
                 # ✨ [추가됨] 쓰던닉(FLIRTY방에 온 경험 있음)이 적혀 있으면 그 닉네임으로도 기존 기록을 조회
                 if prev_nick and not _is_none_word(prev_nick):
-                    for _line in find_nickname_conflicts(prev_nick, user_id):
-                        found_duplicates.append(f"📍 [쓰던닉 '{prev_nick}' 조회]\n{_line}")
-                        if highest_alert_level < 2:
-                            highest_alert_level = 2
-                            alert_status_text, color_emoji = "⚠️ [황색 경고] 쓰던닉과 일치하는 기존 기록", "🟡"
+                    _pn_cands = []
+                    for _c in [prev_nick] + re.split(r"[,，/·\s]+", prev_nick):
+                        _c = _c.strip()
+                        if _c and _c not in _pn_cands and not _is_none_word(_c):
+                            _pn_cands.append(_c)
+                    for _pn in _pn_cands:
+                        for _line in find_nickname_conflicts(_pn, user_id):
+                            found_duplicates.append(f"📍 [쓰던닉 '{_pn}' 조회]\n{_line}")
+                            if highest_alert_level < 2:
+                                highest_alert_level = 2
+                                alert_status_text, color_emoji = "⚠️ [황색 경고] 쓰던닉과 일치하는 기존 기록", "🟡"
 
                 if is_edit_resubmission and (prior_id_lines or prior_id_level > 0):
                     carried_level = max(prior_id_level, 3)
@@ -3060,6 +3070,7 @@ def handle_message(event):
         # B. DB 업서트(Upsert) 저장
         update_data_details = {
             "marriage": marriage, "yadan": yadan, "yadan_room": yadan_room, "prev_nick": prev_nick,
+            "inviter": inviter,   # ✨ 초대자/초대경로
             # ✨ 마지막 '퇴장' 멘트 직전에 확인하는 값: 중복/블랙 이력이 없는 깨끗한 신규 유저인지
             "dup_clean": bool(dup_check_ok and not alert_text and not is_yadan_none(yadan)),
             # ✨ 양식에 적은 닉네임 (운영진이 '/새닉 변경'으로 DB 닉네임을 바꿔도 이 값은 보존됨)
@@ -3191,6 +3202,7 @@ def handle_message(event):
                     + format_form_basic_info(
                         nickname=nickname, birth_year=birth_year, gender=gender, region=region,
                         marriage=marriage, yadan=yadan, yadan_room=yadan_room, prev_nick=prev_nick,
+                        inviter=inviter,
                     )
                 )
                 state_data = {"user_id": user_id, "status": "form_submitted", "report": clean_report}
@@ -3741,7 +3753,7 @@ COLOR_LEGEND_TEXT = (
 
 
 def format_form_basic_info(*, nickname, birth_year, gender, region, marriage,
-                           yadan, yadan_room, prev_nick):
+                           yadan, yadan_room, prev_nick, inviter=""):
     """'N번방 확인' 리포트에 붙이는 1번 양식 기본 정보 블록.
     값이 입력된 항목만 한 줄씩 보여준다 (빈 항목은 줄 자체를 생략)."""
     rows = [
@@ -3753,6 +3765,7 @@ def format_form_basic_info(*, nickname, birth_year, gender, region, marriage,
         ("야방경험", yadan),
         ("야방 방이름", yadan_room),
         ("쓰던닉", prev_nick),
+        ("초대자", inviter),
     ]
     lines = ["👤 [기본 정보]"]
     for label, val in rows:
