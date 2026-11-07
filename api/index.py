@@ -1443,7 +1443,6 @@ def build_voice_instruction(nickname):
     today = datetime.datetime.now(kst)
     return (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
-        "( ex : 7월 20일 모모 )\n\n"
         f"👉 \"{today.month}월 {today.day}일 {nickname}\" 이라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
