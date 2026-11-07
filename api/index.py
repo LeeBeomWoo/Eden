@@ -1443,6 +1443,7 @@ def build_voice_instruction(nickname):
     today = datetime.datetime.now(kst)
     return (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
+        "( ex : 7월 20일 모모 )\n\n"
         f"👉 \"{today.month}월 {today.day}일 {nickname}\" 이라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
@@ -4145,6 +4146,9 @@ def handle_audio(event):
                 ReplyMessageRequest(reply_token=event.reply_token, messages=build_nickchange_messages(user_id))
             )
 
+        # ✨ 안내 답장을 이미 보낸 뒤에, 쌓인 음성 시간 로그가 기준 이상이면 구글시트로 옮긴다.
+        archive_voice_timing_logs_if_needed()
+
 
 def format_voice_analysis_reply_text(user_id):
     """신입이 '완료'를 입력했을 때(finalize_after_nickname_check) 호출된다.
@@ -4211,6 +4215,89 @@ def format_voice_analysis_reply_text(user_id):
 
     # 🟡 처리중이거나 아직 기록 자체가 없는 경우(레이스 컨디션 등)
     return PENDING_TEXT_FOR_MEMBER, claimed_gender
+
+
+# ==========================================
+# ✨ [추가됨] 음성분석 단계별 소요 시간 로그 → 일정량 쌓이면 구글시트로 이동
+#   - 오라클 VM(voice-service/app.py)이 분석을 마칠 때마다 시간 정보만 voice_timing_logs 테이블에 남긴다.
+#     (유저ID/닉네임 등 개인 식별 정보는 저장하지 않는다)
+#   - 음성 접수 직후(안내 답장을 보낸 뒤) 쌓인 개수를 확인하고, VOICE_TIMING_ARCHIVE_THRESHOLD 이상이면
+#     구글시트 '음성시간로그' 탭에 옮기고 DB에서는 지운다.
+#   - 먼저 DB에서 행을 "지우면서 가져온" 요청(delete ... returning)을 한 쪽만 시트에 쓰므로
+#     동시에 여러 번 실행돼도 중복으로 옮겨지지 않는다. 시트 쓰기에 실패하면 가져온 행을 DB에 되돌려 놓는다.
+# ==========================================
+VOICE_TIMING_TABLE = "voice_timing_logs"
+VOICE_TIMING_SHEET_NAME = "음성시간로그"
+VOICE_TIMING_ARCHIVE_THRESHOLD = int(os.environ.get("VOICE_TIMING_ARCHIVE_THRESHOLD", "200"))
+VOICE_TIMING_ARCHIVE_BATCH = 1000   # 한 번에 옮길 최대 행 수
+_VOICE_TIMING_HEADERS = ["id", "시각(KST)", "결과", "접수시 대기건수", "대기(초)", "변환(초)", "피치(초)",
+                         "임베딩(초)", "성별(초)", "대조(초)", "저장(초)", "기록(초)", "총(초)"]
+_VOICE_TIMING_KEYS = [None, None, "state", "pending", "wait_s", "convert_s", "pitch_s",
+                      "embed_s", "gender_s", "match_s", "save_s", "record_s", "total_s"]
+
+
+def _get_voice_timing_sheet():
+    try:
+        return spreadsheet.worksheet(VOICE_TIMING_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=VOICE_TIMING_SHEET_NAME, rows=1000, cols=len(_VOICE_TIMING_HEADERS))
+        ws.update(range_name="A1", values=[_VOICE_TIMING_HEADERS])
+        return ws
+
+
+def _voice_timing_sheet_row(r):
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    try:
+        created = datetime.datetime.fromisoformat(str(r.get("created_at")).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=datetime.timezone.utc)
+        created_str = created.astimezone(kst).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        created_str = str(r.get("created_at") or "")
+    out = []
+    for key in _VOICE_TIMING_KEYS:
+        if key is None:
+            out.append(r.get("id") if not out else created_str)
+        else:
+            v = r.get(key)
+            out.append("" if v is None else v)
+    return out
+
+
+def archive_voice_timing_logs_if_needed():
+    """쌓인 시간 로그가 기준 개수 이상이면 구글시트로 옮기고 DB에서 지운다. 실패해도 예외를 던지지 않는다."""
+    if not supabase or not client:
+        return
+    try:
+        cnt = supabase.table(VOICE_TIMING_TABLE).select("id", count="exact").limit(1).execute()
+        if (cnt.count or 0) < VOICE_TIMING_ARCHIVE_THRESHOLD:
+            return
+
+        ids = (supabase.table(VOICE_TIMING_TABLE).select("id").order("id")
+               .limit(VOICE_TIMING_ARCHIVE_BATCH).execute().data or [])
+        if not ids:
+            return
+        # ① 먼저 DB에서 "지우면서" 가져온다 → 동시에 실행된 다른 요청은 빈 결과를 받아 그대로 끝난다.
+        claimed = (supabase.table(VOICE_TIMING_TABLE).delete().lte("id", ids[-1]["id"]).execute().data or [])
+    except Exception as e:
+        print(f"⚠️ 음성 시간 로그 정리(조회/확보) 실패: {e}")
+        return
+    if not claimed:
+        return
+
+    claimed.sort(key=lambda r: r.get("id") or 0)
+    try:
+        # ② 시트에 한 번에 추가
+        ws = _get_voice_timing_sheet()
+        ws.append_rows([_voice_timing_sheet_row(r) for r in claimed], value_input_option="USER_ENTERED")
+        print(f"✅ 음성 시간 로그 {len(claimed)}건을 '{VOICE_TIMING_SHEET_NAME}' 시트로 이동")
+    except Exception as e:
+        # ③ 시트 쓰기가 실패하면 가져온 행을 DB에 되돌려 놓는다 (다음 기회에 다시 시도).
+        print(f"⚠️ 음성 시간 로그 시트 이동 실패 → DB에 되돌림: {e}")
+        try:
+            supabase.table(VOICE_TIMING_TABLE).insert(claimed).execute()
+        except Exception as e2:
+            print(f"⚠️ 되돌리기도 실패(아래 로그 값은 로그에서만 복구 가능): {e2} / {claimed}")
 
 
 if __name__ == "__main__":
