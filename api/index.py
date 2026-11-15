@@ -1442,7 +1442,7 @@ def build_voice_instruction(nickname):
     today = datetime.datetime.now(kst)
     return (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
-        "( ex : 7월 20일 모모 )\n\n"
+        "( ex : 7월 20일 르페 )\n\n"
         f"👉 \"{today.month}월 {today.day}일 {nickname}\" 이라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
@@ -2096,12 +2096,61 @@ def check_voice_gate(user_id):
 #             )
 #         sync_status_to_sheet(user_id, "닉변대기")
 
+# ==========================================
+# ✨ [추가됨] 닉변 확인 후 '규정 안내 → "확인" 입력 → 나이별 안내' 단계
+#   닉변대기 --("완료")--> 규정확인대기 --("확인")--> 관리자검토대기
+#   - "확인" 시점에 나이(올해 연도 - 출생연도, 년생 기준)에 따라 안내 멘트가 달라진다.
+#       21~23세 : 신분증 인증 안내 (성/생년 제외 가리고 사진 전송 → 인증자 확인)
+#       40세 이상 : 영통인증 예정, 인증자가 진행을 도와준다는 멘트
+#       그 외   : 기존 기본 멘트
+# ==========================================
+COMMUNITY_RULES_TEXT = (
+    "저희 커뮤니티 내부규정상 내부자료(앨범을 비롯 노트내용들이나 대화내용에 대해 내부인원들의 동의없이 "
+    "무단 유출은 개인정보보호법에 의거하여 추후 처벌대상이 될수도 있으니 꼭 유의하여 주세요\n\n"
+    "방에 불편한분이 계시면 예고없이 강퇴당할수있으니 참고바랍니다\n\n"
+    "읽고 확인해주세요"
+)
+RULES_CONFIRM_WORDS = ("확인", "확인했습니다", "확인했어요", "확인요", "확인함", "확인해요", "확인합니다")
+
+AGE_ID_CHECK_RANGE = (21, 23)   # 신분증 인증 안내 대상 (이상, 이하)
+AGE_VIDEO_CALL_MIN = 40         # 영통인증 안내 대상 (이상)
+
+ID_CHECK_GUIDE_TEXT = (
+    "신분증 인증을 위해 성과 생년을 제외한 나머지 정보를 모자이크 혹은 가리고 "
+    "사진을 보내주시면 인증자가 확인하고 진행해 드리겠습니다."
+)
+VIDEO_CALL_GUIDE_TEXT = "영통인증예정이니 인증자가 진행을 도와줄겁니다."
+DEFAULT_REVIEW_GUIDE_TEXT = "기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다."
+
+
+def calc_age_from_birth_year(birth_year):
+    """출생연도(2자리/4자리/'96년생' 모두 가능)로 현재 나이(올해 연도 - 출생연도)를 계산. 알 수 없으면 None.
+    2자리 연도는 올해 연도 뒤 2자리 이하이면 2000년대, 초과하면 1900년대로 본다."""
+    yy = _norm_year(birth_year)
+    if not yy:
+        return None
+    this_year = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).year
+    n = int(yy)
+    full_year = 2000 + n if n <= this_year % 100 else 1900 + n
+    return this_year - full_year
+
+
+def pick_post_rules_guide_text(age):
+    """나이에 맞는 '규정 확인 이후' 안내 문구를 고른다."""
+    if age is not None:
+        if AGE_ID_CHECK_RANGE[0] <= age <= AGE_ID_CHECK_RANGE[1]:
+            return ID_CHECK_GUIDE_TEXT
+        if age >= AGE_VIDEO_CALL_MIN:
+            return VIDEO_CALL_GUIDE_TEXT
+    return DEFAULT_REVIEW_GUIDE_TEXT
+
+
 def finalize_after_nickname_check(source_id, user_id, reply_token):
     """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 처리.
 
     1) 표시명(생년 윗첨자 + 닉네임 + 여🥨/남🧂) 변경 확인 — 미변경이면 재안내
     2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내
-    3) 이상 유무와 상관없이 항상 '기본 인증 완료, 인증자 확인 후 진행' 안내 (관리자검토대기)
+    3) 통과하면 '규정확인대기'로 전환하고 내부규정 안내를 보낸다 (이후 신입의 "확인" → finalize_after_rules_confirm)
        (퇴장 멘트/@전체 완료멘션은 더 이상 자동으로 보내지 않음)
     """
     row = get_validation_row(user_id, "nickname, birth_year, gender")
@@ -2130,6 +2179,13 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
     if gate == "wait":
         _reply("음성 분석을 마무리하는 중이에요. 잠시 후 다시 \"완료\"라고 입력해 주세요.")
         return
+
+    # 3) 중복 '완료' 입력(웹훅 중복)에 대비해 '닉변대기 → 규정확인대기' 전환에 성공한 한 건만 처리
+    if not cas_update_status(user_id, "닉변대기", "규정확인대기", label="닉변 확인(규정확인대기 전환)"):
+        return
+    sync_status_to_sheet(user_id, "규정확인대기")
+    print(f"[완료 처리] user_id={user_id} gate={gate} -> 규정확인대기")
+
     if gate == "ok":
         try:
             # 부수효과 목적: 운영진방 참고 알림 + voice_check_report 저장 (반환 문구는 사용 안 함)
@@ -2137,15 +2193,28 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
         except Exception as e:
             print(f"음성분석 결과 알림/저장 중 예외(무시): {e}")
 
-    # 3) 문제 유무와 상관없이 항상 운영진 확인 대기로 전환
-    print(f"[완료 처리] user_id={user_id} gate={gate} -> 관리자검토대기")
-    if supabase:
-        supabase_execute(
-            lambda: supabase.table('user_validations').update({"status": "관리자검토대기"}).eq('user_id', user_id).execute(),
-            label="관리자검토대기 상태 전환"
-        )
+    # 4) 내부규정 안내 → 신입이 "확인"을 입력하면 finalize_after_rules_confirm 에서 다음 단계 진행
+    _reply(COMMUNITY_RULES_TEXT)
+
+
+def finalize_after_rules_confirm(source_id, user_id, reply_token):
+    """'규정확인대기' 상태에서 신입이 "확인"을 입력했을 때의 처리.
+    나이(21~23 / 40 이상 / 그 외)에 맞는 안내 멘트를 보내고, 항상 운영진 확인 대기(관리자검토대기)로 전환한다."""
+    row = get_validation_row(user_id, "birth_year")
+    age = calc_age_from_birth_year(row.get('birth_year'))
+    guide_text = pick_post_rules_guide_text(age)
+
+    # 중복 입력 방지: '규정확인대기 → 관리자검토대기' 전환에 성공한 한 건만 안내를 보낸다.
+    if not cas_update_status(user_id, "규정확인대기", "관리자검토대기", label="규정 확인(관리자검토대기 전환)"):
+        return
     sync_status_to_sheet(user_id, "관리자검토대기")
-    _reply("기본 인증절차가 완료되었습니다. 인증자의 추가 확인 후 입장 진행하겠습니다.")
+    print(f"[규정 확인] user_id={user_id} age={age} -> 관리자검토대기")
+
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=guide_text)])
+        )
+
 
 @app.route("/api", methods=['POST'])
 def callback():
@@ -3253,6 +3322,16 @@ def handle_message(event):
             finalize_after_nickname_check(source_id, user_id, event.reply_token)
         return
 
+    # 📌 [핵심 검증 3] 신입이 규정 안내를 읽고 "확인" 입력 시 ('규정확인대기' 상태, 마지막 입장 유저만 작동)
+    #   → 나이별 안내(21~23 신분증 / 40 이상 영통인증 / 그 외 기본)를 보내고 관리자검토대기로 전환
+    if (not is_admin_room and not user_message.startswith("/")
+            and re.sub(r"[\s\.\!~]", "", user_message) in RULES_CONFIRM_WORDS):
+        if not passes_last_joined_gate(source_id, user_id):
+            return
+        if get_validation_row(user_id, "status").get('status') == "규정확인대기":
+            finalize_after_rules_confirm(source_id, user_id, event.reply_token)
+        return
+
     # 3. 일반 DB 키워드 검색 — 봇 명령어는 반드시 '/'로 시작해야 하므로, 슬래시 없는 채팅에는 반응하지 않음
     if user_message.startswith("/"):
         matched_reply = search_keyword(user_message)
@@ -3353,6 +3432,9 @@ def send_join_welcome(source_id, user_id, reply_token):
         # 상태가 닉변대기가 아니면 맞춰준다
         if last_status != "닉변대기":
             cas_update_status(user_id, last_status, "닉변대기", label="재입장 닉변대기 전환")
+    elif last_status == "규정확인대기":
+        # 닉네임 변경 확인 후 [규정 확인] 단계에서 끊긴 경우 → 규정 안내를 다시 보내고 "확인"을 기다린다
+        welcome_message = f"🔄 {name_prefix}이전 대화가 [규정 확인] 단계에서 끊겼어요.\n\n{COMMUNITY_RULES_TEXT}"
     # last_status가 "완료"이거나, 기록이 없거나, 위에서 안내문을 못 만든 경우 -> 처음 입장한 것처럼 1번 멘트부터 진행
 
     if not welcome_message:
@@ -3994,6 +4076,7 @@ def format_voice_check_status(user_id):
         "승인대기": "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (운영진 최종 승인 대기 중)",
         "완료": "🎙️ 음성검증: ✅ 음성 파일 제출 + 운영진 최종 승인까지 완료",
         "닉변대기": "🎙️ 음성검증: ✅ 음성 파일 제출 완료 (신입 닉네임 변경 대기 중)",
+        "규정확인대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (신입 규정 확인 대기 중)",
         "헤르페스확인대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (헤르페스 질문 답변 대기 중)",
         "퇴장대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (퇴장 안내 발송됨, 신입 퇴장 대기 중)",
         "관리자검토대기": "🎙️ 음성검증: ✅ 음성 확인 완료 (운영진 추가 확인 대기 중)",
