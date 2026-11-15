@@ -501,7 +501,7 @@ _USER_ID_RE = re.compile(r"^U[0-9a-fA-F]{32}$")
 
 
 def hangul_only(text):
-    """닉네임에서 완성형 한글만 남깁니다. (숫자/특수기호/이모티콘/윗첨자 제거)  예) '홍길동⁹⁰✿😀' -> '홍길동'"""
+    """닉네임에서 완성형 한글만 남깁니다. (숫자/특수기호/이모티콘/윗첨자 제거)  예) '⁹⁰홍길동🥨' -> '홍길동'"""
     return "".join(re.findall(r"[가-힣]", str(text or "")))
 
 
@@ -1278,7 +1278,7 @@ def get_current_display_name(source_id, user_id):
 
 
 def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname, gender=""):
-    """LINE 표시명에 닉네임 + 생년 윗첨자(+여자는 ✿)가 반영됐는지 느슨하게 확인합니다."""
+    """LINE 표시명에 생년 윗첨자 + 닉네임 + 성별 이모지(여 🥨 / 남 🧂)가 반영됐는지 느슨하게 확인합니다."""
     current_name = get_current_display_name(source_id, user_id)
     short_year = _norm_year(birth_year)
     if not current_name or not short_year or not nickname:
@@ -1288,7 +1288,8 @@ def is_nickname_changed_correctly(source_id, user_id, birth_year, nickname, gend
         return False
     if to_superscript(short_year) not in cur:
         return False
-    if normalize_gender(gender) == "여" and "✿" not in cur:
+    emoji = GENDER_NAME_EMOJI.get(normalize_gender(gender))
+    if emoji and emoji not in cur:
         return False
     return True
 
@@ -1342,7 +1343,7 @@ def build_nickchange_text(user_id):
 
 def build_nickchange_parts(user_id):
     """(변경할 닉네임 단독 문자열, 안내 문구) — 닉네임을 먼저, 안내는 그 다음 메시지로 보낸다.
-    남자: 닉네임 + 생년2자리 윗첨자 / 여자: 닉네임 + 생년2자리 윗첨자 + ✿ 장식"""
+    여자: ⁸⁶철이🥨 / 남자: ⁸⁶철이🧂  (생년2자리 윗첨자 + 닉네임 + 성별 이모지)"""
     row = get_validation_row(user_id, "nickname, birth_year, gender")
     nickname = row.get('nickname') or ""
     nick_only = build_display_name(nickname, row.get('birth_year'), row.get('gender')) if nickname else ""
@@ -1396,7 +1397,7 @@ def _year_label(y):
 # ✨ FLIRTY 새 양식/표시명용 헬퍼
 # ==========================================
 _SUPERSCRIPT_TABLE = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-FEMALE_NAME_SUFFIX = "  \u0359\u0358\u0361\u273f"   # 여자 표시명 뒤 장식: 공백 2칸 + 결합문자 + ✿ (결합문자가 숫자에 붙지 않고 공백에 붙음)
+GENDER_NAME_EMOJI = {"여": "🥨", "남": "🧂"}   # 표시명 뒤 이모지: 여자 🥨 / 남자 🧂
 
 
 def to_superscript(s):
@@ -1404,11 +1405,9 @@ def to_superscript(s):
 
 
 def build_display_name(nickname, birth_year, gender):
-    """남: 닉네임 + 생년2자리 윗첨자 / 여: 거기에 ✿ 장식 추가"""
-    name = f"{str(nickname or '').strip()}{to_superscript(_norm_year(birth_year))}"
-    if normalize_gender(gender) == "여":
-        name += FEMALE_NAME_SUFFIX
-    return name
+    """생년2자리 윗첨자 + 닉네임 + 성별 이모지.  예) 여: ⁸⁶철이🥨 / 남: ⁸⁶철이🧂"""
+    emoji = GENDER_NAME_EMOJI.get(normalize_gender(gender), "")
+    return f"{to_superscript(_norm_year(birth_year))}{str(nickname or '').strip()}{emoji}"
 
 
 def _pick_field(data, exact=None, contains=()):
@@ -1560,8 +1559,9 @@ def apply_nickname_change(source_id, sender_user_id, new_nick):
     if not row:
         return [TextMessage(text="❌ 해당 유저의 인증 정보를 DB에서 찾을 수 없습니다.")]
 
-    # 표시명 전체('아이언⁸⁶')를 붙여 넣어도 닉네임만 남기기
-    new_nick = re.sub(r"[\s⁰¹²³⁴⁵⁶⁷⁸⁹\u0358\u0359\u0361✿\uFE0F]+$", "", new_nick).strip()
+    # 표시명 전체('⁸⁶아이언🥨')를 붙여 넣어도 닉네임만 남기기
+    new_nick = re.sub(r"^[\s⁰¹²³⁴⁵⁶⁷⁸⁹]+", "", new_nick)
+    new_nick = re.sub(r"[\s⁰¹²³⁴⁵⁶⁷⁸⁹\u0358\u0359\u0361✿🥨🧂\uFE0F]+$", "", new_nick).strip()
     if not new_nick:
         return [TextMessage(text="사용법: /바뀐닉네임 변경")]
 
@@ -2021,7 +2021,7 @@ def check_voice_gate(user_id):
 # def finalize_after_nickname_check(source_id, user_id, reply_token):
 #     """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 판정.
 
-#     1) 닉네임(+생년 윗첨자, 여자는 ✿) 변경 확인 — 미변경이면 재안내
+#     1) 표시명(생년 윗첨자 + 닉네임 + 여🥨/남🧂) 변경 확인 — 미변경이면 재안내
 #     2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내 / 에러·멈춤이면 운영진 검토
 #     3) 이상 없음(깨끗한 신규) → '/ㅇㅈ 퇴장' 멘트 + @전체 완료멘션 (퇴장대기)
 #        이상 있음 → 운영진 확인 대기 안내 (관리자검토대기)
@@ -2099,7 +2099,7 @@ def check_voice_gate(user_id):
 def finalize_after_nickname_check(source_id, user_id, reply_token):
     """'닉변대기' 상태에서 신입이 '완료'를 입력했을 때의 최종 처리.
 
-    1) 닉네임(+생년 윗첨자, 여자는 ✿) 변경 확인 — 미변경이면 재안내
+    1) 표시명(생년 윗첨자 + 닉네임 + 여🥨/남🧂) 변경 확인 — 미변경이면 재안내
     2) 음성 자동분석 상태 확인 — 진행 중이면 잠시 후 다시 입력하게 안내
     3) 이상 유무와 상관없이 항상 '기본 인증 완료, 인증자 확인 후 진행' 안내 (관리자검토대기)
        (퇴장 멘트/@전체 완료멘션은 더 이상 자동으로 보내지 않음)
