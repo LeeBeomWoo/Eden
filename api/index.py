@@ -1144,6 +1144,23 @@ def get_cell(row, idx, default=""):
         return default
     return str(row[idx]).strip()
 
+
+# ✨ [추가됨] 유저ID를 모르는 수동 블랙/이력 행 보완용 헬퍼
+MANUAL_ID_PREFIX = "BL_"
+
+def _nick_key(s):
+    """닉네임 비교용 키: 유니코드 정규화(NFC) + 모든 공백 제거 + 대소문자 무시."""
+    import unicodedata as _ud
+    return re.sub(r"\s+", "", _ud.normalize("NFC", str(s or ""))).casefold()
+
+def make_manual_user_id(nickname, seen_counter):
+    """'검증' 시트에 유저ID 칸이 비어 있는 행에 붙일 가짜 ID. 닉네임 기반이라 동기화를 여러 번 해도 같은 행으로 덮어써집니다.
+    같은 닉네임이 여러 줄이면 BL_닉, BL_닉_2, BL_닉_3 … 순서로 구분합니다."""
+    base = f"{MANUAL_ID_PREFIX}{_nick_key(nickname)}"
+    seen_counter[base] = seen_counter.get(base, 0) + 1
+    n = seen_counter[base]
+    return base if n == 1 else f"{base}_{n}"
+
 def get_recording_ments():
     if supabase:
         try:
@@ -2593,10 +2610,18 @@ def handle_message(event):
                             # (시트에 열이 삽입/삭제/이동돼도 엉뚱한 필드에 값이 들어가지 않도록)
                             grouped_records = {}
                             skipped_short_rows = 0
+                            manual_id_counter = {}
+                            manual_id_rows = 0
                             for row in all_val_data[1:]:
                                 u_id = get_cell(row, col_map["user_id"])
                                 if not u_id:
-                                    continue
+                                    # ✨ [변경됨] 유저ID를 모르는 수동 추가 행도 버리지 않고 닉네임 기반 가짜 ID로 DB에 넣는다.
+                                    # (닉네임까지 비어 있으면 대조할 방법이 없으니 건너뜀)
+                                    _nick_for_id = get_cell(row, col_map["nickname"])
+                                    if not _nick_key(_nick_for_id):
+                                        continue
+                                    u_id = make_manual_user_id(_nick_for_id, manual_id_counter)
+                                    manual_id_rows += 1
 
                                 record = {
                                     "user_id": u_id,
@@ -2635,12 +2660,16 @@ def handle_message(event):
                                 grouped_records.setdefault(sig, []).append(record)
 
                             total_synced = 0
+                            sync_errors = []
                             if supabase:
                                 for records in grouped_records.values():
-                                    process_in_chunks('user_validations', records, is_insert=False)
-                                    total_synced += len(records)
+                                    total_synced += process_in_chunks('user_validations', records, is_insert=False, errors=sync_errors)
 
                             report_line = f"• 검증이력: {total_synced}명 유저 데이터"
+                            if manual_id_rows:
+                                report_line += f" (유저ID 없는 행 {manual_id_rows}건은 닉네임 기준 임시ID로 등록)"
+                            if sync_errors:
+                                report_line += "\n  ⚠️ 일부 저장 실패: " + " / ".join(sync_errors[:3])
                             if skipped_short_rows:
                                 report_line += f" (재시도횟수/상태 정보가 없어 기존 값을 유지한 행 {skipped_short_rows}건 포함)"
                             sync_reports.append(report_line)
@@ -2980,9 +3009,10 @@ def handle_message(event):
                     # 처음 양식에 적었던 닉네임(form_nickname)으로 닉네임 일치를 잡을 수 있게 함께 비교한다.
                     rec_form_nick = str(rec_details.get('form_nickname', '')).strip() if isinstance(rec_details, dict) else ""
                     is_id_matched = (rec_id == str(user_id).strip() and rec_id != "")
-                    is_name_matched = (
-                        (rec_name == nickname and rec_name != "")
-                        or (rec_form_nick == nickname and rec_form_nick != "")
+                    _nk = _nick_key(nickname)
+                    is_name_matched = bool(_nk) and (
+                        _nick_key(rec_name) == _nk
+                        or _nick_key(rec_form_nick) == _nk
                     )
 
                     if is_id_matched or is_name_matched:
@@ -3066,7 +3096,7 @@ def handle_message(event):
                         continue
 
                     vp_id_matched = (vp_uid != "" and vp_uid == str(user_id).strip())
-                    vp_name_matched = (vp_name != "" and vp_name == nickname)
+                    vp_name_matched = (vp_name != "" and _nick_key(vp_name) == _nick_key(nickname))
                     if not (vp_id_matched or vp_name_matched):
                         continue
 
@@ -3892,10 +3922,6 @@ def format_nickname_history(nickname):
     try:
         res = supabase.table('user_validations').select(val_cols).eq('nickname', name).execute()
         rows = res.data or []
-        if not rows and "%" not in name and "_" not in name:
-            res = supabase.table('user_validations').select(val_cols).ilike('nickname', f"%{name}%").limit(10).execute()
-            rows = res.data or []
-            partial = bool(rows)
     except Exception as e:
         print(f"닉네임 확인 - user_validations 조회 실패: {e}")
         return "⚠️ 닉네임 기록 조회에 실패했습니다. 잠시 후 다시 시도해 주세요."
@@ -3908,6 +3934,40 @@ def format_nickname_history(nickname):
         rows += [r for r in (res2.data or []) if str(r.get('user_id')) not in have]
     except Exception as e:
         print(f"닉네임 확인 - form_nickname 조회 실패(무시): {e}")
+
+    # ✨ [추가됨] 띄어쓰기/대소문자/유니코드 차이로 완전일치에 안 걸린 기록(예: 시트에 수동 추가한 블랙)도 찾는다.
+    # 중복/블랙 필터링(신입 양식 제출 시)과 같은 기준(_nick_key)으로 비교한다.
+    try:
+        _nk = _nick_key(name)
+        if _nk:
+            have = {str(r.get('user_id')) for r in rows}
+            light = get_all_supabase_data('user_validations', 'user_id, nickname, details')
+            extra_ids = []
+            for r in light:
+                uid_ = str(r.get('user_id') or '')
+                if not uid_ or uid_ in have:
+                    continue
+                det_ = r.get('details') or {}
+                if isinstance(det_, str):
+                    try: det_ = json.loads(det_)
+                    except Exception: det_ = {}
+                form_nick_ = str(det_.get('form_nickname', '')) if isinstance(det_, dict) else ''
+                if _nick_key(r.get('nickname')) == _nk or (form_nick_ and _nick_key(form_nick_) == _nk):
+                    extra_ids.append(uid_)
+            for i in range(0, len(extra_ids), 100):
+                res3 = supabase.table('user_validations').select(val_cols).in_('user_id', extra_ids[i:i + 100]).execute()
+                rows += res3.data or []
+    except Exception as e:
+        print(f"닉네임 확인 - 정규화 닉네임 조회 실패(무시): {e}")
+
+    # 그래도 없으면 부분일치로 한 번 더
+    if not rows and "%" not in name and "_" not in name:
+        try:
+            res = supabase.table('user_validations').select(val_cols).ilike('nickname', f"%{name}%").limit(10).execute()
+            rows = res.data or []
+            partial = bool(rows)
+        except Exception as e:
+            print(f"닉네임 확인 - 부분일치 조회 실패(무시): {e}")
 
     # 음성DB: 닉네임 일치 + 위에서 찾은 유저ID 일치 (임베딩 등 무거운 컬럼은 가져오지 않음)
     uids = [str(r.get('user_id')).strip() for r in rows if r.get('user_id')]
@@ -3954,7 +4014,7 @@ def format_nickname_history(nickname):
             except Exception: details = {}
         lines = [
             f"\n[{i}] {r.get('nickname') or '-'} / {_year_label(r.get('birth_year'))}년생 / {r.get('gender') or '-'} / {r.get('region') or '-'}",
-            f" - 유저ID: {uid or '-'}",
+            f" - 유저ID: {('미상 (수동 등록 · 임시ID)' if uid.startswith(MANUAL_ID_PREFIX) else uid) or '-'}",
             f" - 상태: {r.get('status') or '-'} / 재시도 {r.get('retry_count') or 1}회 / 입장일: {r.get('entry_date') or '-'}",
         ]
         if str(r.get('black_reason') or '').strip():
