@@ -1173,6 +1173,35 @@ def get_recording_ments():
             print(f"녹음 멘트 DB 조회 실패: {e}")
     return [], []
 
+
+# ✨ [추가됨] 녹음 멘트(DB recording_ments) 성별별 랜덤 1개 선택
+#   - 시트 '인증봇' > '녹음' 탭(A열=남, B열=여)은 /디비업데이트 때 recording_ments 테이블로 복사됩니다.
+#   - 신입이 올 때마다 DB 전체를 읽지 않도록 잠깐(RECORDING_MENT_CACHE_TTL초) 메모리에 캐시합니다.
+#     (/디비업데이트 직후 반영이 늦으면 TTL이 지난 뒤 반영됩니다)
+RECORDING_MENT_CACHE_TTL = 300
+_recording_ment_cache = {"male": [], "female": [], "expires": 0.0}
+
+
+def get_random_recording_ment(gender):
+    """gender: '남'/'여'/'male'/'female' 등 아무 표기. 해당 성별의 녹음 멘트 중 랜덤 1개를 돌려줍니다.
+    성별을 모르거나 멘트가 없거나 DB 조회가 실패하면 빈 문자열('') → 호출한 쪽에서 그냥 기본 안내만 보냅니다."""
+    g = normalize_gender(gender)
+    key = "male" if g == "남" else "female" if g == "여" else None
+    if key is None:
+        return ""
+
+    now = time.time()
+    if _recording_ment_cache["expires"] <= now:
+        males, females = get_recording_ments()
+        if males or females:
+            _recording_ment_cache.update(male=males, female=females, expires=now + RECORDING_MENT_CACHE_TTL)
+        else:
+            # 조회 실패/빈 테이블이면 15초 뒤 재시도 (직전 캐시는 유지)
+            _recording_ment_cache["expires"] = now + 15
+
+    pool = _recording_ment_cache[key]
+    return random.choice(pool) if pool else ""
+
 def search_keyword(keyword):
     if supabase:
         try:
@@ -1220,7 +1249,7 @@ def start_voice_auth(user_id, require_status='입장대기'):
         return False, None
 
     user_nickname = u_data.get('nickname', '신입')
-    reply_text = build_voice_instruction(user_nickname)
+    reply_text = build_voice_instruction(user_nickname, u_data.get('gender'))
 
     try:
         supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
@@ -1454,13 +1483,18 @@ def _is_none_word(v):
     return t in ("", "없음", "없다", "없어요", "없습니다", "무", "x", "no", "none", "해당없음")
 
 
-def build_voice_instruction(nickname):
+def build_voice_instruction(nickname, gender=None):
     kst = datetime.timezone(datetime.timedelta(hours=9))
     today = datetime.datetime.now(kst)
+    # ✨ [변경됨] '녹음' 시트(DB recording_ments)의 성별별 멘트를 랜덤 1개 뽑아 "...{닉네임} 입니다" 바로 뒤에 이어서 읽게 함
+    ment = get_random_recording_ment(gender)
+    script = f"안녕하세요 오늘은 {today.month}월 {today.day}일 {nickname} 입니다"
+    if ment:
+        script += f" {ment}"
     return (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
         "( ex : 안녕하세요 오늘은 7월 20일 르페 입니다 )\n\n"
-        f"👉 \"안녕하세요 오늘은 {today.month}월 {today.day}일 {nickname} 입니다\" 라고 녹음해 주세요.\n\n"
+        f"👉 \"{script}\" 라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
 
@@ -3329,7 +3363,7 @@ def handle_message(event):
                 reply_text = f"✏️ [{nickname}]님, 수정하신 내용이 반영되었습니다."
             else:
                 # ✨ [변경됨] 양식 접수 직후 바로 "오늘 날짜 + 닉네임" 음성 녹음 안내
-                reply_text = build_voice_instruction(nickname)
+                reply_text = build_voice_instruction(nickname, gender)
             # 관리자방 리포트와 같은 기준(블랙수준별 색)의 동그라미만 신입방 응답 맨 앞에 붙인다.
             # 일치 내역/블랙사유 같은 상세 내용은 신입에게 노출하지 않는다.
             if color_emoji:
