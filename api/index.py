@@ -1173,35 +1173,6 @@ def get_recording_ments():
             print(f"녹음 멘트 DB 조회 실패: {e}")
     return [], []
 
-
-# ✨ [추가됨] 녹음 멘트(DB recording_ments) 성별별 랜덤 1개 선택
-#   - 시트 '인증봇' > '녹음' 탭(A열=남, B열=여)은 /디비업데이트 때 recording_ments 테이블로 복사됩니다.
-#   - 신입이 올 때마다 DB 전체를 읽지 않도록 잠깐(RECORDING_MENT_CACHE_TTL초) 메모리에 캐시합니다.
-#     (/디비업데이트 직후 반영이 늦으면 TTL이 지난 뒤 반영됩니다)
-RECORDING_MENT_CACHE_TTL = 300
-_recording_ment_cache = {"male": [], "female": [], "expires": 0.0}
-
-
-def get_random_recording_ment(gender):
-    """gender: '남'/'여'/'male'/'female' 등 아무 표기. 해당 성별의 녹음 멘트 중 랜덤 1개를 돌려줍니다.
-    성별을 모르거나 멘트가 없거나 DB 조회가 실패하면 빈 문자열('') → 호출한 쪽에서 그냥 기본 안내만 보냅니다."""
-    g = normalize_gender(gender)
-    key = "male" if g == "남" else "female" if g == "여" else None
-    if key is None:
-        return ""
-
-    now = time.time()
-    if _recording_ment_cache["expires"] <= now:
-        males, females = get_recording_ments()
-        if males or females:
-            _recording_ment_cache.update(male=males, female=females, expires=now + RECORDING_MENT_CACHE_TTL)
-        else:
-            # 조회 실패/빈 테이블이면 15초 뒤 재시도 (직전 캐시는 유지)
-            _recording_ment_cache["expires"] = now + 15
-
-    pool = _recording_ment_cache[key]
-    return random.choice(pool) if pool else ""
-
 def search_keyword(keyword):
     if supabase:
         try:
@@ -1249,7 +1220,7 @@ def start_voice_auth(user_id, require_status='입장대기'):
         return False, None
 
     user_nickname = u_data.get('nickname', '신입')
-    reply_text = build_voice_instruction(user_nickname, u_data.get('gender'))
+    reply_text = build_voice_instruction(user_nickname)
 
     try:
         supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
@@ -1483,18 +1454,13 @@ def _is_none_word(v):
     return t in ("", "없음", "없다", "없어요", "없습니다", "무", "x", "no", "none", "해당없음")
 
 
-def build_voice_instruction(nickname, gender=None):
+def build_voice_instruction(nickname):
     kst = datetime.timezone(datetime.timedelta(hours=9))
     today = datetime.datetime.now(kst)
-    # ✨ [변경됨] '녹음' 시트(DB recording_ments)의 성별별 멘트를 랜덤 1개 뽑아 "...{닉네임} 입니다" 바로 뒤에 이어서 읽게 함
-    ment = get_random_recording_ment(gender)
-    script = f"안녕하세요 오늘은 {today.month}월 {today.day}일 {nickname} 입니다"
-    if ment:
-        script += f" {ment}"
     return (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
         "( ex : 안녕하세요 오늘은 7월 20일 르페 입니다 )\n\n"
-        f"👉 \"{script}\" 라고 녹음해 주세요.\n\n"
+        f"👉 \"안녕하세요 오늘은 {today.month}월 {today.day}일 {nickname} 입니다\" 라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
 
@@ -2151,7 +2117,7 @@ def check_voice_gate(user_id):
 # ✨ [추가됨] 닉변 확인 후 '규정 안내 → "확인" 입력 → 나이별 안내' 단계
 #   닉변대기 --("완료")--> 규정확인대기 --("확인")--> 관리자검토대기
 #   - "확인" 시점에 나이(올해 연도 - 출생연도, 년생 기준)에 따라 안내 멘트가 달라진다.
-#       21~23세 : 신분증 인증 안내 (성/생년 제외 가리고 사진 전송 → 인증자 확인)
+#       20~23세 : 신분증 인증 안내 (성/생년 제외 가리고 사진 전송 → 인증자 확인)
 #       40세 이상 : 영통인증 예정, 인증자가 진행을 도와준다는 멘트
 #       그 외   : 기존 기본 멘트
 # ==========================================
@@ -2163,7 +2129,7 @@ COMMUNITY_RULES_TEXT = (
 )
 RULES_CONFIRM_WORDS = ("확인", "확인했습니다", "확인했어요", "확인요", "확인함", "확인해요", "확인합니다")
 
-AGE_ID_CHECK_RANGE = (21, 23)   # 신분증 인증 안내 대상 (이상, 이하)
+AGE_ID_CHECK_RANGE = (20, 23)   # 신분증 인증 안내 대상 (이상, 이하)
 AGE_VIDEO_CALL_MIN = 40         # 영통인증 안내 대상 (이상)
 
 ID_CHECK_GUIDE_TEXT = (
@@ -2250,7 +2216,7 @@ def finalize_after_nickname_check(source_id, user_id, reply_token):
 
 def finalize_after_rules_confirm(source_id, user_id, reply_token):
     """'규정확인대기' 상태에서 신입이 "확인"을 입력했을 때의 처리.
-    나이(21~23 / 40 이상 / 그 외)에 맞는 안내 멘트를 보내고, 항상 운영진 확인 대기(관리자검토대기)로 전환한다."""
+    나이(20~23 / 40 이상 / 그 외)에 맞는 안내 멘트를 보내고, 항상 운영진 확인 대기(관리자검토대기)로 전환한다."""
     row = get_validation_row(user_id, "birth_year")
     age = calc_age_from_birth_year(row.get('birth_year'))
     guide_text = pick_post_rules_guide_text(age)
@@ -3220,6 +3186,8 @@ def handle_message(event):
 
         target_status = "음성대기"     # ✨ [변경됨] 양식 제출 직후 바로 음성 안내 단계로 (기존: "입장대기" → "확인" 답장)
         nickname_to_save = nickname   # ✨ 수정 재제출 시 운영진이 바꿔둔 닉네임을 덮어쓰지 않기 위한 저장용 값
+        nick_changed_in_edit = False  # ✨ [추가됨] 인증 진행 중 양식 수정으로 '닉네임 자체'가 바뀌었는지
+        old_form_nickname = ""        # ✨ [추가됨] 수정 전 양식 닉네임 (안내 문구용)
         if supabase:
             try:
                 # ✨ 이력 비교/보존을 위해 기존 닉네임/성별/지역/년생/details도 함께 조회
@@ -3240,6 +3208,15 @@ def handle_message(event):
                     if is_edit_resubmission and _existing_status and _existing_status not in ("입장대기", "완료"):
                         target_status = _existing_status
                         retry_cnt = user_res.data[0].get('retry_count', 1)  # 수정 재제출은 재시도 횟수에 포함하지 않음
+
+                        # ✨ [추가됨] 수정 재제출로 '양식 닉네임'이 바뀌었다면, 이미 한 음성 녹음("오늘은 ○월 ○일 [옛 닉네임] 입니다")과
+                        #   닉변 안내/음성분석 결과는 새 닉네임에 맞지 않으므로 나머지 진행 과정을 처음(음성대기)부터 다시 한다.
+                        #   (비교 기준은 운영진이 DB 닉네임을 바꿔둔 값이 아니라, 신입이 양식에 적었던 값 form_nickname)
+                        _prev_details = _load_details(user_res.data[0].get('details'))
+                        old_form_nickname = str(_prev_details.get('form_nickname') or user_res.data[0].get('nickname') or '').strip()
+                        if old_form_nickname and old_form_nickname != nickname:
+                            nick_changed_in_edit = True
+                            target_status = "음성대기"
 
                     # ✨ 이력 누적: details를 통째로 덮어쓰는 구조라, 이전 history/nick_changes를 반드시 이어받는다.
                     prev = user_res.data[0]
@@ -3267,7 +3244,7 @@ def handle_message(event):
                 # 기존 입장일 기록에 이번 날짜를 콤마로 이어붙임 (덮어쓰지 않고 누적)
                 entry_date_to_save = f"{existing_entry_date},{current_date}" if existing_entry_date else current_date
 
-                supabase.table('user_validations').upsert({
+                upsert_row = {
                     "user_id": user_id,
                     "nickname": nickname_to_save,
                     "gender": gender,
@@ -3279,7 +3256,18 @@ def handle_message(event):
                     "details": update_data_details,
                     "prev_nick": prev_nick,        # ✨ 쓰던닉 (DB에 prev_nick 컬럼 필요)
                     "yadan_room": yadan_room,      # ✨ 야방 방이름 (DB에 yadan_room 컬럼 필요)
-                }).execute()
+                }
+                if nick_changed_in_edit:
+                    # ✨ [추가됨] 옛 닉네임으로 녹음한 음성의 분석 상태/결과를 비워, 새 녹음 전에 '완료'로 통과되지 않게 한다.
+                    upsert_row.update({
+                        "voice_analysis_state": None,
+                        "voice_analysis_result": None,
+                        "voice_analysis_error": None,
+                        "voice_analysis_synced_at": None,
+                        "voice_check_report": None,
+                        "voice_checked_at": None,
+                    })
+                supabase.table('user_validations').upsert(upsert_row).execute()
                 save_success = True
             except Exception as e:
                 print(f"Supabase 유저 저장 에러: {e}")
@@ -3358,12 +3346,20 @@ def handle_message(event):
             set_flow_state(source_id, user_id, state_data, ttl=7200)
             set_user_session(user_id, {"nickname": nickname_to_save, "gender": gender})
 
-            if is_edit_resubmission:
+            if is_edit_resubmission and nick_changed_in_edit:
+                # ✨ [추가됨] 닉네임이 바뀐 수정 재제출: 음성 녹음부터 새 닉네임으로 다시 진행
+                reply_text = (
+                    f"✏️ 닉네임이 [{old_form_nickname}] → [{nickname}](으)로 수정되었습니다.\n"
+                    "닉네임이 바뀌어 음성 녹음부터 다시 진행합니다.\n"
+                    "(앞서 보내신 음성은 사용되지 않아요)\n\n"
+                    + build_voice_instruction(nickname)
+                )
+            elif is_edit_resubmission:
                 # 이미 1번 양식을 제출한 상태에서 내용만 고쳐서 재제출한 경우: DB만 갱신하고 음성 안내는 다시 보내지 않음
                 reply_text = f"✏️ [{nickname}]님, 수정하신 내용이 반영되었습니다."
             else:
                 # ✨ [변경됨] 양식 접수 직후 바로 "오늘 날짜 + 닉네임" 음성 녹음 안내
-                reply_text = build_voice_instruction(nickname, gender)
+                reply_text = build_voice_instruction(nickname)
             # 관리자방 리포트와 같은 기준(블랙수준별 색)의 동그라미만 신입방 응답 맨 앞에 붙인다.
             # 일치 내역/블랙사유 같은 상세 내용은 신입에게 노출하지 않는다.
             if color_emoji:
@@ -3387,7 +3383,7 @@ def handle_message(event):
         return
 
     # 📌 [핵심 검증 3] 신입이 규정 안내를 읽고 "확인" 입력 시 ('규정확인대기' 상태, 마지막 입장 유저만 작동)
-    #   → 나이별 안내(21~23 신분증 / 40 이상 영통인증 / 그 외 기본)를 보내고 관리자검토대기로 전환
+    #   → 나이별 안내(20~23 신분증 / 40 이상 영통인증 / 그 외 기본)를 보내고 관리자검토대기로 전환
     if (not is_admin_room and not user_message.startswith("/")
             and re.sub(r"[\s\.\!~]", "", user_message) in RULES_CONFIRM_WORDS):
         if not passes_last_joined_gate(source_id, user_id):
