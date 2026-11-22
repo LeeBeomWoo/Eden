@@ -1220,7 +1220,7 @@ def start_voice_auth(user_id, require_status='입장대기'):
         return False, None
 
     user_nickname = u_data.get('nickname', '신입')
-    reply_text = build_voice_instruction(user_nickname)
+    reply_text = build_voice_instruction(user_nickname, u_data.get('gender'))
 
     try:
         supabase.table('user_validations').update({"status": "음성대기"}).eq('user_id', user_id).execute()
@@ -1454,15 +1454,36 @@ def _is_none_word(v):
     return t in ("", "없음", "없다", "없어요", "없습니다", "무", "x", "no", "none", "해당없음")
 
 
-def build_voice_instruction(nickname):
+def pick_extra_recording_ment(gender):
+    g = str(gender or "").strip().lower()
+    if g in ("남", "남자", "남성", "male", "m"):
+        pool_idx = 0
+    elif g in ("여", "여자", "여성", "female", "f"):
+        pool_idx = 1
+    else:
+        return None
+    try:
+        pools = get_recording_ments()
+        pool = [str(m).strip() for m in pools[pool_idx] if m and str(m).strip()]
+    except Exception as e:
+        print(f"추가 녹음 멘트 조회 실패(기본 멘트만 발송): {e}")
+        return None
+    return random.choice(pool) if pool else None
+
+
+def build_voice_instruction(nickname, gender=None):
     kst = datetime.timezone(datetime.timedelta(hours=9))
     today = datetime.datetime.now(kst)
-    return (
+    text = (
         "🎤 라인에서 음성 녹음 하셔야합니다.\n"
         "( ex : 안녕하세요 오늘은 7월 20일 르페 입니다 )\n\n"
         f"👉 \"안녕하세요 오늘은 {today.month}월 {today.day}일 {nickname} 입니다\" 라고 녹음해 주세요.\n\n"
         "조용한 곳에서 천천히 또박또박 부탁드립니다."
     )
+    extra = pick_extra_recording_ment(gender)
+    if extra:
+        text += f"\n\n{extra}"
+    return text
 
 
 NICKCHANGE_GUIDE_TEXT = (
@@ -3352,14 +3373,14 @@ def handle_message(event):
                     f"✏️ 닉네임이 [{old_form_nickname}] → [{nickname}](으)로 수정되었습니다.\n"
                     "닉네임이 바뀌어 음성 녹음부터 다시 진행합니다.\n"
                     "(앞서 보내신 음성은 사용되지 않아요)\n\n"
-                    + build_voice_instruction(nickname)
+                    + build_voice_instruction(nickname, gender)
                 )
             elif is_edit_resubmission:
                 # 이미 1번 양식을 제출한 상태에서 내용만 고쳐서 재제출한 경우: DB만 갱신하고 음성 안내는 다시 보내지 않음
                 reply_text = f"✏️ [{nickname}]님, 수정하신 내용이 반영되었습니다."
             else:
                 # ✨ [변경됨] 양식 접수 직후 바로 "오늘 날짜 + 닉네임" 음성 녹음 안내
-                reply_text = build_voice_instruction(nickname)
+                reply_text = build_voice_instruction(nickname, gender)
             # 관리자방 리포트와 같은 기준(블랙수준별 색)의 동그라미만 신입방 응답 맨 앞에 붙인다.
             # 일치 내역/블랙사유 같은 상세 내용은 신입에게 노출하지 않는다.
             if color_emoji:
